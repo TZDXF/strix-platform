@@ -1,0 +1,13 @@
+# Phase 0 验证目标清单示例：每行一个 <label>|<mode>|<source>[|<url>]
+# 复制为 targets.txt 后按团队实际修改。建议组合：
+#   1. 标准靶场（有已知漏洞，用于验证引擎发现能力）
+#   2~3. 内部典型应用（有真实部署的测试地址最佳）
+#
+# 示例（Juice Shop 本地起: docker run --rm -p 3000:3000 bkimminich/juice-shop）
+# 注意: strix 的 -t 只接受目录/git地址/URL，不接受 zip——压缩包先解压到 targets/ 下再填路径
+#       （平台 MVP 会自动做解压，Phase 0 手工解压）
+juice-quick|quick|https://github.com/juice-shop/juice-shop|http://127.0.0.1:3000
+juice-standard|standard|https://github.com/juice-shop/juice-shop|http://127.0.0.1:3000
+app-a-quick|quick|https://git.company.internal/team/app-a.git
+app-a-standard|standard|https://git.company.internal/team/app-a.git|https://app-a.test.company.internal
+app-b-standard|standard|./targets/app-b

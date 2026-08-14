@@ -1,0 +1,26 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+frontend/dist/
+
+# Environment / secrets
+.env
+*.env
+!.env.example
+!.env.deploy.example
+
+# Runtime data (scan workspaces, experiment runs, cloned targets)
+workspaces/
+phase0/work/
+phase0/targets/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,190 @@
+{
+  "label": "juice-quick-free",
+  "scan_mode": "quick",
+  "source": "targets/juice-shop (local clone)",
+  "url": "http://host.docker.internal:3000",
+  "start_iso": "2026-08-14T08:30:32Z",
+  "end_iso": "2026-08-14T09:47:13Z",
+  "duration_sec": 4601,
+  "timed_out": false,
+  "exit_code": 2,
+  "strix_version": "strix 1.5.3",
+  "model": "free (gateway alias -> deepseek-v4-flash)",
+  "run_dir_name": "juice-shop_e209",
+  "run_record": {
+    "status": "completed",
+    "scan_mode": "quick"
+  },
+  "findings": {
+    "total": 10,
+    "by_severity": {
+      "critical": 5,
+      "high": 4,
+      "medium": 1,
+      "low": 0,
+      "info": 0
+    },
+    "items": [
+      {
+        "id": "vuln-0001",
+        "title": "SQL Injection in Login Endpoint — Authentication Bypass",
+        "severity": "critical",
+        "cvss": 9.8,
+        "cwe": "CWE-89",
+        "cve": null,
+        "endpoint": "/rest/user/login",
+        "target": "http://host.docker.internal:3000",
+        "has_poc": true,
+        "has_fix": false,
+        "verdict": "true_positive",
+        "verdict_note": "Juice Shop 官方 challenge：admin 登录绕过"
+      },
+      {
+        "id": "vuln-0002",
+        "title": "SQL Injection in Product Search Endpoint — Full Database Exfiltration",
+        "severity": "critical",
+        "cvss": 9.1,
+        "cwe": "CWE-89",
+        "cve": null,
+        "endpoint": "/rest/products/search",
+        "target": "http://host.docker.internal:3000",
+        "has_poc": true,
+        "has_fix": false,
+        "verdict": "true_positive",
+        "verdict_note": "Juice Shop 已知 SQLi 端点"
+      },
+      {
+        "id": "vuln-0003",
+        "title": "Null Byte Injection Bypasses File Extension Allowlist in FTP File Server",
+        "severity": "high",
+        "cvss": 7.5,
+        "cwe": "CWE-22",
+        "cve": null,
+        "endpoint": null,
+        "target": "http://host.docker.internal:3000",
+        "has_poc": true,
+        "has_fix": false,
+        "verdict": "true_positive",
+        "verdict_note": "Juice Shop 官方 challenge：文件上传扩展名白名单绕过"
+      },
+      {
+        "id": "vuln-0004",
+        "title": "Path Traversal in Access Log File Server Discloses Arbitrary Server Files",
+        "severity": "high",
+        "cvss": 7.5,
+        "cwe": "CWE-22",
+        "cve": null,
+        "endpoint": null,
+        "target": "http://host.docker.internal:3000",
+        "has_poc": true,
+        "has_fix": false,
+        "verdict": "true_positive",
+        "verdict_note": "Juice Shop 已知日志文件暴露问题"
+      },
+      {
+        "id": "vuln-0005",
+        "title": "JWT Authentication Bypass via Hardcoded RSA Private Key and `alg: none` Acceptance",
+        "severity": "critical",
+        "cvss": 9.8,
+        "cwe": "CWE-798",
+        "cve": null,
+        "endpoint": null,
+        "target": "http://host.docker.internal:3000",
+        "has_poc": true,
+        "has_fix": false,
+        "verdict": "true_positive",
+        "verdict_note": "Juice Shop 官方 challenge：forged JWT（公开密钥/none 算法）"
+      },
+      {
+        "id": "vuln-0006",
+        "title": "Node.js VM Sandbox Escape / RCE in B2B Order Endpoint (`POST /b2b/v2/orders`)",
+        "severity": "critical",
+        "cvss": 9.9,
+        "cwe": "CWE-95",
+        "cve": null,
+        "endpoint": "/b2b/v2/orders",
+        "target": "http://host.docker.internal:3000",
+        "has_poc": true,
+        "has_fix": true,
+        "verdict": "true_positive",
+        "verdict_note": "Juice Shop 官方 challenge：B2B 订单 RCE"
+      },
+      {
+        "id": "vuln-0007",
+        "title": "IDOR on GET /rest/basket/:id exposes other users shopping baskets",
+        "severity": "medium",
+        "cvss": 4.3,
+        "cwe": "CWE-639",
+        "cve": null,
+        "endpoint": "/rest/basket/:id",
+        "target": "http://host.docker.internal:3000",
+        "has_poc": true,
+        "has_fix": false,
+        "verdict": "true_positive",
+        "verdict_note": "Juice Shop 官方 challenge：查看他人购物篮"
+      },
+      {
+        "id": "vuln-0008",
+        "title": "Unauthenticated write to POST /api/SecurityAnswers enables account takeover for any user",
+        "severity": "high",
+        "cvss": 7.5,
+        "cwe": "CWE-639",
+        "cve": null,
+        "endpoint": "/api/SecurityAnswers",
+        "target": "http://host.docker.internal:3000",
+        "has_poc": true,
+        "has_fix": false,
+        "verdict": "needs_review",
+        "verdict_note": "疑似真实但未在官方 challenge 清单中直接对应"
+      },
+      {
+        "id": "vuln-0009",
+        "title": "DOM-based Cross-Site Scripting (XSS) in product search endpoint via unsafe `bypassSecurityTrustHtml`",
+        "severity": "high",
+        "cvss": 8.3,
+        "cwe": "CWE-79",
+        "cve": null,
+        "endpoint": "/#/search?q=",
+        "target": "http://host.docker.internal:3000",
+        "has_poc": true,
+        "has_fix": false,
+        "verdict": "true_positive",
+        "verdict_note": "Juice Shop 官方 challenge：搜索页 DOM XSS"
+      },
+      {
+        "id": "vuln-0010",
+        "title": "Server-Side Code Injection via `eval()` on User-Controlled Username in `/profile`",
+        "severity": "critical",
+        "cvss": 9.9,
+        "cwe": "CWE-94",
+        "cve": null,
+        "endpoint": "/profile",
+        "target": "http://host.docker.internal:3000",
+        "has_poc": true,
+        "has_fix": true,
+        "verdict": "needs_review",
+        "verdict_note": "存疑：与官方 challenge 清单对应关系不明，需人工复现"
+      }
+    ]
+  },
+  "llm_usage": {
+    "requests": 1461,
+    "input_tokens": 81196304,
+    "output_tokens": 568810,
+    "total_tokens": 81765114,
+    "cost_est_usd": 0.0,
+    "note": "cost_est_usd 为 litellm 估算；走自定义网关模型可能为 0，成本以网关账单为准",
+    "agents": 13
+  },
+  "artifacts": {
+    "report_md": true,
+    "vulns_json": true,
+    "vulns_csv": true,
+    "vulns_md_dir": true,
+    "sarif_files": [
+      "findings.sarif"
+    ],
+    "pdf_files": []
+  },
+  "parse_warnings": []
+}
