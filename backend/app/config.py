@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     strix_llm: str = "free"
 
+    # 可选的免费模型列表（逗号分隔，提交任务时下拉选择；STRIX_LLM 为未指定时的默认）
+    free_models: str = "free"
+
     # 对象存储（RustFS，S3 API）；未启用时产物留在本地磁盘
     s3_enabled: bool = False
     s3_endpoint: str = ""

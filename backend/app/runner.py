@@ -19,7 +19,7 @@ from .config import get_settings
 RETRY_MARKER = "LLM CONNECTION FAILED"
 
 
-def _strix_env() -> dict[str, str]:
+def _strix_env(model: str = "") -> dict[str, str]:
     s = get_settings()
     env = {**os.environ}
     env["STRIX_TELEMETRY"] = "off"
@@ -27,8 +27,7 @@ def _strix_env() -> dict[str, str]:
         env["LLM_API_BASE"] = s.llm_api_base
     if s.llm_api_key:
         env["LLM_API_KEY"] = s.llm_api_key
-    if s.strix_llm:
-        env["STRIX_LLM"] = s.strix_llm
+    env["STRIX_LLM"] = model or s.strix_llm
     return env
 
 
@@ -45,6 +44,7 @@ def execute_scan(
     test_url: str,
     scan_mode: str,
     log: Callable[[str], None],
+    model: str = "",
 ) -> dict:
     """运行 strix，返回 {exit_code, timed_out, run_dir_name, attempts}。"""
     s = get_settings()
@@ -59,7 +59,7 @@ def execute_scan(
     timeout_sec = {"quick": s.timeout_quick, "standard": s.timeout_standard, "deep": s.timeout_deep}.get(
         scan_mode, s.timeout_standard
     )
-    env = _strix_env()
+    env = _strix_env(model)
     scan_log = work_dir / "scan.log"
 
     exit_code: int | None = None

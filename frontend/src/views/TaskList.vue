@@ -15,7 +15,25 @@ const form = ref({
   fileName: '',
   scanMode: 'quick',
   testUrl: '',
+  model: '',
 })
+const models = ref([])
+const defaultModel = ref('')
+const modelsError = ref('')
+
+async function loadModels() {
+  try {
+    const data = await api.listModels()
+    models.value = data.items || []
+    defaultModel.value = data.default || 'free'
+    modelsError.value = ''
+  } catch (e) {
+    models.value = []
+    defaultModel.value = ''
+    modelsError.value = e.message
+  }
+  if (!form.value.model) form.value.model = defaultModel.value || models.value[0] || 'free'
+}
 
 async function refresh() {
   try {
@@ -45,6 +63,7 @@ async function submit() {
       testUrl: form.value.testUrl.trim(),
       gitUrl: form.value.sourceKind === 'git' ? form.value.gitUrl.trim() : '',
       file: form.value.sourceKind === 'zip' ? form.value.file : null,
+      model: form.value.model,
     })
     submitted.value = res.id
     form.value.gitUrl = ''
@@ -82,7 +101,7 @@ function sevCounts(t) {
 }
 function open(id) { location.hash = `#/task/${id}` }
 
-onMounted(() => { refresh(); timer = setInterval(refresh, 5000) })
+onMounted(() => { refresh(); loadModels(); timer = setInterval(refresh, 5000) })
 onUnmounted(() => clearInterval(timer))
 </script>
 
@@ -104,6 +123,16 @@ onUnmounted(() => clearInterval(timer))
           <option value="standard">standard（0.5~1 小时+）</option>
           <option value="deep">deep（1~4 小时+）</option>
         </select>
+      </div>
+      <div>
+        <label>模型（网关 free 池，默认 {{ defaultModel || 'free' }}）</label>
+        <select v-if="models.length" v-model="form.model">
+          <option v-for="m in models" :key="m" :value="m">{{ m }}</option>
+        </select>
+        <template v-else>
+          <input v-model="form.model" type="text" placeholder="free" />
+          <div class="hint">{{ modelsError || '未获取到模型列表，将使用平台默认模型' }}</div>
+        </template>
       </div>
       <div class="full" v-if="form.sourceKind === 'git'">
         <label>代码仓库地址（白盒源码扫描，必填）</label>
@@ -135,7 +164,7 @@ onUnmounted(() => clearInterval(timer))
     <table v-if="tasks.length">
       <thead>
         <tr>
-          <th>任务</th><th>状态</th><th>模式</th><th>来源</th><th>发现</th>
+          <th>任务</th><th>状态</th><th>模式</th><th>模型</th><th>来源</th><th>发现</th>
           <th>耗时</th><th>tokens</th><th>提交时间</th>
         </tr>
       </thead>
@@ -144,6 +173,7 @@ onUnmounted(() => clearInterval(timer))
           <td style="font-family: monospace">{{ t.id.slice(0, 10) }}…</td>
           <td><span class="badge" :class="'st-' + t.status">{{ t.status }}</span></td>
           <td>{{ t.scan_mode }}</td>
+          <td>{{ t.model || '-' }}</td>
           <td style="max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap">
             {{ t.source_type === 'git' ? t.source_ref : t.source_ref }}
           </td>

@@ -49,7 +49,7 @@ def run_scan(self, task_id: str) -> dict:
     src_dir = task_ws / "src"
     scan_dir = task_ws / "scan"
     artifacts_dir = ws / "artifacts"
-    task.model = s.strix_llm
+    task.model = task.model or s.strix_llm
     task.strix_version = s.strix_version
     task.attempts = 0
 
@@ -73,11 +73,13 @@ def run_scan(self, task_id: str) -> dict:
 
         # ---- Stage 2: strix 扫描 ----
         _set_status(db, task, "scanning")
+        _log(task, f"[scan] 模型: {task.model}")
         result = execute_scan(
             work_dir=scan_dir,
             src_dir=src_dir,
             test_url=task.test_url or "",
             scan_mode=task.scan_mode,
+            model=task.model or "",
             log=lambda m: (_log(task, m), db.commit()),
         )
         task.exit_code = result["exit_code"]

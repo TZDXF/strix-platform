@@ -41,6 +41,7 @@ services:
       WORKSPACE_ROOT: /data/workspaces
       STRIX_BIN: strix
       STRIX_LLM: ${STRIX_LLM:-free}
+      FREE_MODELS: ${FREE_MODELS:-free}
       LLM_API_BASE: ${LLM_API_BASE:?must set LLM_API_BASE}
       LLM_API_KEY: ${LLM_API_KEY:?must set LLM_API_KEY}
       S3_ENABLED: "true"

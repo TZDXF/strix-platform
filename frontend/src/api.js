@@ -29,13 +29,15 @@ async function request(method, url, { json, form } = {}) {
 export const api = {
   health: () => request('GET', '/api/health'),
   listTasks: () => request('GET', '/api/tasks?limit=100'),
+  listModels: () => request('GET', '/api/models'),
   getTask: (id) => request('GET', `/api/tasks/${id}`),
   getLog: (id) => request('GET', `/api/tasks/${id}/log`),
-  submit: ({ scanMode, testUrl, gitUrl, file }) => {
+  submit: ({ scanMode, testUrl, gitUrl, file, model }) => {
     const form = new FormData()
     form.append('scan_mode', scanMode)
     if (testUrl) form.append('test_url', testUrl)
     if (gitUrl) form.append('git_url', gitUrl)
+    if (model) form.append('model', model)
     if (file) form.append('file', file)
     return request('POST', '/api/tasks', { form })
   },

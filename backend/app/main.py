@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -14,6 +15,7 @@ from sqlalchemy.orm import Session
 from .artifacts import artifact_response_path, presigned_artifact_url
 from .config import get_settings
 from .db import get_db, init_db
+from .llm_models import free_models
 from .models import AuditEntry, Finding, Task
 from .runner import read_run_artifacts  # noqa: F401（契约复用说明）
 from .security import client_ip, require_token
@@ -58,6 +60,7 @@ def _task_summary(t: Task) -> dict:
         "source_type": t.source_type,
         "source_ref": t.source_ref,
         "test_url": t.test_url,
+        "model": t.model or "",
         "findings_count": t.findings_count,
         "severity_counts": json.loads(t.severity_counts) if t.severity_counts else {},
         "duration_sec": t.duration_sec,
@@ -68,6 +71,12 @@ def _task_summary(t: Task) -> dict:
     }
 
 
+@app.get("/api/models", dependencies=[Depends(require_token)])
+def list_models() -> dict:
+    """任务提交时可选的免费模型列表（来自环境变量 FREE_MODELS）。"""
+    return {"default": settings.strix_llm, "items": free_models()}
+
+
 @app.post("/api/tasks", dependencies=[Depends(require_token)])
 async def create_task(
     request: Request,
@@ -75,10 +84,21 @@ async def create_task(
     scan_mode: str = Form("quick"),
     test_url: str = Form(""),
     git_url: str = Form(""),
+    model: str = Form(""),
     file: UploadFile | None = File(default=None),
 ):
     if scan_mode not in ("quick", "standard", "deep"):
         raise HTTPException(400, "scan_mode 必须是 quick/standard/deep")
+
+    # 模型可选：留空用平台默认；指定则必须在免费模型列表内
+    model = (model or "").strip()
+    if model:
+        if len(model) > 64 or not re.fullmatch(r"[A-Za-z0-9._/-]+", model):
+            raise HTTPException(400, "model 不合法")
+        free = free_models()
+        if free and model not in free:
+            raise HTTPException(400, f"model 必须是 free 模型之一：{', '.join(free)}")
+
 
     # 黑盒目标允许清单校验（护栏③）
     if test_url:
@@ -116,11 +136,11 @@ async def create_task(
 
     task = Task(
         id=task_id, scan_mode=scan_mode, source_type=source_type,
-        source_ref=source_ref, test_url=test_url, status="pending",
+        source_ref=source_ref, test_url=test_url, model=model, status="pending",
     )
     db.add(task)
     db.commit()
-    _audit(db, request, "task.submit", f"id={task_id} mode={scan_mode} source={source_type}:{source_ref[:200]} url={test_url}")
+    _audit(db, request, "task.submit", f"id={task_id} mode={scan_mode} model={model or 'default'} source={source_type}:{source_ref[:200]} url={test_url}")
     run_scan.delay(task_id)
     return {"id": task_id, "status": "pending"}
 

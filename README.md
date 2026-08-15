@@ -27,12 +27,12 @@ docker-compose.yml  postgres + redis + rustfs + api + worker + frontend
 docker run -d --name strix-pg -e POSTGRES_USER=strix -e POSTGRES_PASSWORD=strix -e POSTGRES_DB=strix -p 5432:5432 postgres:16-alpine
 docker run -d --name strix-redis -p 6379:6379 redis:7-alpine
 
-# 后端（Python 3.12+，含 strix-agent==1.5.3）
+# 后端（uv 管理，Python 3.12+，含 strix-agent==1.5.3）
 cd backend
-pip install -r requirements.txt
+uv sync
 cp ../phase0/.env .env   # 或按下表配置；STRIX_BIN 指向 venv 里的 strix 可执行文件
-uvicorn app.main:app --port 8000
-celery -A app.celery_app.celery_app worker --pool=solo --loglevel=info   # Windows 必须 --pool=solo
+uv run uvicorn app.main:app --port 8000
+uv run celery -A app.celery_app.celery_app worker --pool=solo --loglevel=info   # Windows 必须 --pool=solo
 
 # 前端
 cd frontend && npm install && npm run dev   # http://localhost:5173
@@ -66,8 +66,9 @@ c.create_bucket(Bucket=os.environ['S3_BUCKET'])"
 | `API_TOKEN` | 共享访问令牌（必填） | - |
 | `DATABASE_URL` / `REDIS_URL` | 依赖连接 | 本机默认 |
 | `LLM_API_BASE` / `LLM_API_KEY` / `STRIX_LLM` | 公司 LLM 网关（OpenAI 兼容）与模型（决策 #7：仅 free 档） | `free` |
+| `FREE_MODELS` | 提交任务时可选的免费模型列表（逗号分隔） | `free` |
 | `WORKSPACE_ROOT` | 任务源码/工作区/上传目录 | `./workspaces` |
-| `STRIX_BIN` | strix 可执行文件路径（dev 为 venv 内路径） | `strix` |
+| `STRIX_BIN` | strix 可执行文件路径（dev 为 `backend/.venv` 内路径） | `strix` |
 | `S3_ENABLED` / `S3_ENDPOINT` / `S3_*` | RustFS 对象存储；false 时产物留本地磁盘 | false |
 | `TARGET_ALLOWLIST` | 黑盒目标允许清单（域名后缀/CIDR，逗号分隔） | 空=仅内网/回环 |
 | `MAX_UPLOAD_MB` | zip 上限 | 500 |

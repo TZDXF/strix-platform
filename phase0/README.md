@@ -25,7 +25,7 @@
 ```bash
 cd phase0
 cp .env.example .env      # 填 LLM_API_BASE / LLM_API_KEY / STRIX_LLM
-pip install strix-agent==1.5.3   # 版本 pin，与平台集成版保持一致
+uv venv && uv pip install strix-agent==1.5.3   # 版本 pin，与平台集成版保持一致
 strix --version           # 确认输出 strix 1.5.3
 cp targets.example.txt targets.txt   # 按团队实际修改
 ```
