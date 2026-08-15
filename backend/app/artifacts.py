@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 import zipfile
 from pathlib import Path
 
@@ -31,12 +32,12 @@ def archive_run(work_dir: Path, run_dir_name: str, task_id: str, artifacts_dir: 
     return str(zip_path)
 
 
-def _upload_s3(zip_path: Path, key: str) -> None:
+def _s3_client():
     import boto3
     from botocore.client import Config as BotoConfig
 
     s = get_settings()
-    client = boto3.client(
+    return boto3.client(
         "s3",
         endpoint_url=s.s3_endpoint,
         aws_access_key_id=s.s3_access_key,
@@ -44,7 +45,41 @@ def _upload_s3(zip_path: Path, key: str) -> None:
         config=BotoConfig(signature_version="s3v4"),
         region_name="us-east-1",
     )
-    client.upload_file(str(zip_path), s.s3_bucket, key)
+
+
+def ensure_bucket(retries: int = 10, delay_sec: float = 3.0) -> bool:
+    """幂等确保归档桶存在（部署时免手动建桶）。
+
+    RustFS 随 compose 与 api 同时启动，可能短暂未就绪，故带重试；
+    失败不影响扫描本身，仅任务归档阶段会报错。
+    """
+    s = get_settings()
+    if not s.s3_enabled:
+        return False
+    for attempt in range(1, retries + 1):
+        try:
+            client = _s3_client()
+            if s.s3_bucket in [b["Name"] for b in client.list_buckets()["Buckets"]]:
+                return True
+            client.create_bucket(Bucket=s.s3_bucket)
+            return True
+        except Exception:
+            if attempt == retries:
+                return False
+            time.sleep(delay_sec)
+    return False
+
+
+def _upload_s3(zip_path: Path, key: str) -> None:
+    s = get_settings()
+    try:
+        _s3_client().upload_file(str(zip_path), s.s3_bucket, key)
+    except Exception as e:
+        # 启动期建桶失败的兜底：上传时桶仍缺失则现场补建一次
+        if "NoSuchBucket" in str(e) and ensure_bucket(retries=3, delay_sec=1.0):
+            _s3_client().upload_file(str(zip_path), s.s3_bucket, key)
+        else:
+            raise
 
 
 def artifact_response_path(artifacts_ref: str) -> Path | None:

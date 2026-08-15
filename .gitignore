@@ -24,3 +24,5 @@ phase0/targets/
 # OS
 .DS_Store
 Thumbs.db
+
+.playwright-cli/

@@ -2,8 +2,14 @@ FROM python:3.12-slim
 
 COPY --from=ghcr.io/astral-sh/uv:0.10.11 /uv /uvx /bin/
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    git ca-certificates curl \
+# docker-cli：strix 沙箱通过宿主机 docker.sock 启动分析容器（socket 由 compose 挂载）
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+    && install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
+    && . /etc/os-release \
+    && echo "deb [signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian ${VERSION_CODENAME} stable" > /etc/apt/sources.list.d/docker.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    git fonts-noto-cjk docker-cli \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

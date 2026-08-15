@@ -1,18 +1,17 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import { api, setSession, type User } from '../api'
-import { btn, err as errCls, input, label } from '../ui'
+import { btn, input, label } from '../ui'
+import { toast } from '../toast'
 
 const emit = defineEmits<{ 'logged-in': [user: User] }>()
 const username = ref('')
 const password = ref('')
-const error = ref('')
 const busy = ref(false)
 
 async function submit() {
-  error.value = ''
   if (!username.value.trim() || !password.value) {
-    error.value = '请输入用户名和密码'
+    toast.error('请输入用户名和密码')
     return
   }
   busy.value = true
@@ -21,7 +20,7 @@ async function submit() {
     setSession(res.token, res.user)
     emit('logged-in', res.user)
   } catch (e) {
-    error.value = (e as Error).message
+    toast.error((e as Error).message)
   } finally {
     busy.value = false
   }
@@ -37,8 +36,6 @@ async function submit() {
       <label :class="[label, 'mt-3']">密码</label>
       <input v-model="password" type="password" autocomplete="current-password" placeholder="密码" :class="input" />
       <button :class="[btn, 'mt-4.5 w-full']" :disabled="busy">{{ busy ? '登录中…' : '登 录' }}</button>
-      <div v-if="error" :class="errCls">{{ error }}</div>
-      <div class="mt-3 text-xs text-muted">账号由平台管理员创建，如需开通请联系超管。</div>
     </form>
   </div>
 </template>

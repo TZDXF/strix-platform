@@ -14,7 +14,8 @@ from .artifacts import archive_run
 from .celery_app import celery_app
 from .config import get_settings
 from .db import SessionLocal
-from .models import Finding, Project, ProjectUpload, Task
+from .llm_models import default_model
+from .models import Finding, Project, ProjectUpload, Task, User
 from .runner import execute_scan, read_run_artifacts
 from .sources import SourceError, clone_git, du_mb, safe_extract_zip
 from .translate import translate_findings_task
@@ -52,13 +53,22 @@ def run_scan(self, task_id: str) -> dict:
         return {"error": "task not found"}
 
     project = db.get(Project, task.project_id) if task.project_id else None
+    creator = db.get(User, task.created_by) if task.created_by else None
+    user_llm_key = (creator.llm_api_key or "") if creator else ""
+    if not user_llm_key:
+        task.error = "创建者未配置个人 AI 密钥，无法执行扫描；请先在「设置」中配置后再提交任务"
+        _log(task, f"[fail] {task.error}")
+        task.finished_at = datetime.now(timezone.utc)
+        _set_status(db, task, "failed")
+        db.close()
+        return {"task_id": task_id, "error": task.error}
 
     ws = Path(s.workspace_root)
     task_ws = ws / task_id
     src_dir = task_ws / "src"
     scan_dir = task_ws / "scan"
     artifacts_dir = ws / "artifacts"
-    task.model = task.model or s.strix_llm
+    task.model = task.model or default_model(db)  # 平台默认模型（platform_models 表，超管维护）
     task.strix_version = s.strix_version
     task.attempts = 0
 
@@ -78,7 +88,6 @@ def run_scan(self, task_id: str) -> dict:
                 branch=task.branch or "",
                 auth_type=(project.git_auth_type if project else ""),
                 token=(project.git_token if project else ""),
-                ssh_key=(project.git_ssh_key if project else ""),
             )
         else:
             upload = db.get(ProjectUpload, task.upload_id) if task.upload_id else None
@@ -91,16 +100,18 @@ def run_scan(self, task_id: str) -> dict:
             )
         _log(task, f"[fetch] 源码就绪（{du_mb(src_dir)}MB）")
 
-        # ---- Stage 2: strix 扫描（中文报告通过 --instruction 提示词注入）----
+        # ---- Stage 2: strix 扫描（用户自定义指令 + 中文报告提示词均通过 --instruction 注入）----
         _set_status(db, task, "scanning")
-        _log(task, f"[scan] 模型: {task.model}" + ("（中文报告）" if task.report_lang == "zh" else ""))
+        _log(task, f"[scan] 模型: {task.model}（中文报告）")
+        instruction = f"{task.instruction or ''}\n{ZH_INSTRUCTION}".strip()
         result = execute_scan(
             work_dir=scan_dir,
             src_dir=src_dir,
             test_url=task.test_url or "",
             scan_mode=task.scan_mode,
             model=task.model or "",
-            instruction=ZH_INSTRUCTION if task.report_lang == "zh" else "",
+            instruction=instruction,
+            llm_api_key=user_llm_key,
             log=lambda m: (_log(task, m), db.commit()),
         )
         task.exit_code = result["exit_code"]
@@ -170,8 +181,8 @@ def run_scan(self, task_id: str) -> dict:
         )
         _set_status(db, task, "done")
 
-        # ---- Stage 5: 中文翻译（report_lang=zh；提示词失败时的兜底）----
-        if task.report_lang == "zh" and task.findings_count > 0:
+        # ---- Stage 5: 中文翻译（提示词要求中文撰写失败时的兜底）----
+        if task.findings_count > 0:
             task.zh_status = "pending"
             db.commit()
             _log(task, "[translate] 调度中文翻译任务")

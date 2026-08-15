@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -15,7 +16,7 @@ from pydantic import BaseModel
 from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
-from .artifacts import artifact_response_path, presigned_artifact_url
+from .artifacts import artifact_response_path, ensure_bucket, presigned_artifact_url
 from .auth import (
     bootstrap_admin,
     client_ip,
@@ -27,11 +28,12 @@ from .auth import (
 )
 from .config import get_settings
 from .db import get_db, init_db
-from .llm_models import free_models
-from .models import AuditEntry, Finding, Project, ProjectUpload, Task, User
+from .gitlab import GitLabError, list_projects as gitlab_list_projects, normalize_base_url, same_host, verify_token
+from .llm_models import default_model, discover_models, platform_models, seed_platform_models, valid_model_name
+from .models import AuditEntry, Finding, GitConfig, PlatformModel, Project, ProjectUpload, Task, User
 from .runner import read_run_artifacts  # noqa: F401（契约复用说明）
 from .sources import SourceError, list_branches
-from .targets import check_target_allowed
+from .targets import check_target_allowed, probe_target
 from .tasks import new_task_id, run_scan
 
 settings = get_settings()
@@ -59,8 +61,11 @@ def _startup() -> None:
     db = SessionLocal()
     try:
         bootstrap_admin(db)
+        seed_platform_models(db)  # 首次启动用 FREE_MODELS 播种平台模型表，之后以表内数据为准
     finally:
         db.close()
+    if not ensure_bucket():
+        print("[startup] S3 归档桶不可用（RustFS 未就绪或密钥错误），任务归档将失败；不影响扫描本身")
 
 
 def _audit(db: Session, request: Request, action: str, detail: str = "", user=None) -> None:
@@ -102,11 +107,60 @@ def _user_out(u: User) -> dict:
         "is_active": u.is_active,
         "created_at": u.created_at.isoformat() if u.created_at else None,
         "last_login_at": u.last_login_at.isoformat() if u.last_login_at else None,
+        "has_llm_key": bool(u.llm_api_key),
     }
 
 
 @app.get("/api/auth/me", dependencies=[Depends(require_user)])
 def me(user: User = Depends(require_user)):
+    return _user_out(user)
+
+
+# ===================== 个人设置（登录用户自助） =====================
+
+
+class ChangePasswordBody(BaseModel):
+    old_password: str
+    new_password: str
+
+
+@app.post("/api/auth/change-password", dependencies=[Depends(require_user)])
+def change_password(body: ChangePasswordBody, request: Request, db: Session = Depends(get_db), user: User = Depends(require_user)):
+    if not verify_password(body.old_password, user.password_hash or ""):
+        _audit(db, request, "auth.change_password_failed", f"username={user.username}", user=user)
+        raise HTTPException(400, "原密码不正确")
+    if len(body.new_password) < 8:
+        raise HTTPException(400, "新密码至少 8 位")
+    if body.new_password == body.old_password:
+        raise HTTPException(400, "新密码不能与原密码相同")
+    user.password_hash = hash_password(body.new_password)
+    db.commit()
+    _audit(db, request, "auth.change_password", f"username={user.username}", user=user)
+    return {"ok": True}
+
+
+class LlmKeyBody(BaseModel):
+    api_key: str
+
+
+@app.put("/api/me/llm-key", dependencies=[Depends(require_user)])
+def set_llm_key(body: LlmKeyBody, request: Request, db: Session = Depends(get_db), user: User = Depends(require_user)):
+    key = body.api_key.strip()
+    if not key:
+        raise HTTPException(400, "密钥不能为空")
+    if len(key) > 512:
+        raise HTTPException(400, "密钥过长")
+    user.llm_api_key = key
+    db.commit()
+    _audit(db, request, "me.llm_key_set", f"username={user.username}", user=user)  # 不记录密钥内容
+    return _user_out(user)
+
+
+@app.delete("/api/me/llm-key", dependencies=[Depends(require_user)])
+def clear_llm_key(request: Request, db: Session = Depends(get_db), user: User = Depends(require_user)):
+    user.llm_api_key = ""
+    db.commit()
+    _audit(db, request, "me.llm_key_clear", f"username={user.username}", user=user)
     return _user_out(user)
 
 
@@ -138,8 +192,8 @@ def create_user(body: UserCreateBody, request: Request, db: Session = Depends(ge
         raise HTTPException(400, "用户名需为 2-64 位字母/数字/_.-")
     if len(body.password) < 8:
         raise HTTPException(400, "密码至少 8 位")
-    if body.role not in ("admin", "user"):
-        raise HTTPException(400, "role 必须是 admin 或 user")
+    if body.role != "user":
+        raise HTTPException(400, "不允许创建超管账号，超管只能由系统初始化")
     if db.execute(select(func.count(User.id)).where(User.username == username)).scalar():
         raise HTTPException(400, "用户名已存在")
     user = User(
@@ -168,11 +222,8 @@ def patch_user(user_id: int, body: UserPatchBody, request: Request, db: Session 
         if len(body.password) < 8:
             raise HTTPException(400, "密码至少 8 位")
         user.password_hash = hash_password(body.password)
-    if body.role:
-        if body.role not in ("admin", "user"):
-            raise HTTPException(400, "role 必须是 admin 或 user")
-        _guard_last_admin(db, user, role=body.role)
-        user.role = body.role
+    if body.role and body.role != user.role:
+        raise HTTPException(400, "系统不允许修改用户角色")
     if body.display_name:
         user.display_name = body.display_name.strip()[:128]
     if body.is_active is not None:
@@ -211,6 +262,254 @@ def _guard_last_admin(db: Session, user: User, role: str = "", is_active: bool |
         raise HTTPException(400, "系统至少需要一个可用的超管账号")
 
 
+# ===================== 平台模型管理（仅超管） =====================
+
+
+def _model_out(m: PlatformModel) -> dict:
+    return {
+        "id": m.id,
+        "name": m.name,
+        "is_default": bool(m.is_default),
+        "created_at": m.created_at.isoformat() if m.created_at else None,
+    }
+
+
+def _all_models(db: Session) -> list[PlatformModel]:
+    return db.execute(select(PlatformModel).order_by(PlatformModel.id)).scalars().all()
+
+
+@app.get("/api/admin/models", dependencies=[Depends(require_admin)])
+def admin_list_models(db: Session = Depends(get_db)):
+    return {"items": [_model_out(m) for m in _all_models(db)]}
+
+
+class ModelDiscoverBody(BaseModel):
+    api_key: str
+
+
+@app.post("/api/admin/models/discover", dependencies=[Depends(require_admin)])
+def admin_discover_models(
+    body: ModelDiscoverBody, request: Request,
+    db: Session = Depends(get_db), admin: User = Depends(require_admin),
+):
+    """超管用网关密钥查询可用模型列表（OpenAI 兼容 /models），密钥仅本次使用、不落库。"""
+    key = body.api_key.strip()
+    if not key:
+        raise HTTPException(400, "密钥不能为空")
+    if len(key) > 512:
+        raise HTTPException(400, "密钥过长")
+    try:
+        names = discover_models(key)
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(502, f"网关查询失败：{exc}")
+    _audit(db, request, "model.discover", f"found={len(names)}", user=admin)  # 不记录密钥内容
+    return {"items": names}
+
+
+class ModelAddBody(BaseModel):
+    names: list[str]
+    default: str = ""  # 可选：把本次添加的某个模型设为平台默认
+
+
+@app.post("/api/admin/models", dependencies=[Depends(require_admin)])
+def admin_add_models(
+    body: ModelAddBody, request: Request,
+    db: Session = Depends(get_db), admin: User = Depends(require_admin),
+):
+    names = [n.strip() for n in body.names if n.strip()]
+    if not names:
+        raise HTTPException(400, "未选择任何模型")
+    for name in names:
+        if not valid_model_name(name):
+            raise HTTPException(400, f"模型名不合法：{name}")
+    default_name = (body.default or "").strip()
+    if default_name and default_name not in names:
+        raise HTTPException(400, "default 必须是本次添加的模型之一")
+    existing = set(platform_models(db))
+    has_default = db.execute(
+        select(func.count(PlatformModel.id)).where(PlatformModel.is_default == True)  # noqa: E712
+    ).scalar() or 0
+    added: list[PlatformModel] = []
+    for name in names:
+        if name in existing:
+            continue
+        m = PlatformModel(name=name, created_by=admin.id)
+        db.add(m)
+        added.append(m)
+        existing.add(name)
+    if not added:
+        db.rollback()
+        raise HTTPException(400, "所选模型均已存在")
+    if not has_default and not default_name:
+        added[0].is_default = True  # 首次添加时自动指定默认，保证任务下拉可用
+    db.commit()
+    if default_name:
+        row = db.execute(select(PlatformModel).where(PlatformModel.name == default_name)).scalar_one()
+        for m in _all_models(db):
+            m.is_default = m.id == row.id
+        db.commit()
+    _audit(db, request, "model.add", f"added={[m.name for m in added]} default={default_name or 'auto'}", user=admin)
+    return {"items": [_model_out(m) for m in _all_models(db)]}
+
+
+class ModelPatchBody(BaseModel):
+    is_default: bool | None = None
+
+
+@app.patch("/api/admin/models/{model_id}", dependencies=[Depends(require_admin)])
+def admin_patch_model(
+    model_id: int, body: ModelPatchBody, request: Request,
+    db: Session = Depends(get_db), admin: User = Depends(require_admin),
+):
+    m = db.get(PlatformModel, model_id)
+    if m is None:
+        raise HTTPException(404, "模型不存在")
+    if body.is_default:
+        for row in _all_models(db):
+            row.is_default = row.id == m.id
+        db.commit()
+        _audit(db, request, "model.default", f"name={m.name}", user=admin)
+    return _model_out(m)
+
+
+@app.delete("/api/admin/models/{model_id}", dependencies=[Depends(require_admin)])
+def admin_delete_model(
+    model_id: int, request: Request,
+    db: Session = Depends(get_db), admin: User = Depends(require_admin),
+):
+    m = db.get(PlatformModel, model_id)
+    if m is None:
+        raise HTTPException(404, "模型不存在")
+    name, was_default = m.name, bool(m.is_default)
+    db.delete(m)
+    db.commit()
+    if was_default:  # 删除默认后由剩余第一个接替，保持默认始终存在
+        first = db.execute(select(PlatformModel).order_by(PlatformModel.id).limit(1)).scalar_one_or_none()
+        if first:
+            first.is_default = True
+            db.commit()
+    _audit(db, request, "model.delete", f"name={name} was_default={was_default}", user=admin)
+    return {"ok": True}
+
+
+# ===================== 个人 Git 配置（GitLab） =====================
+
+
+def _git_config_out(c: GitConfig) -> dict:
+    return {
+        "id": c.id,
+        "name": c.name or c.base_url,
+        "base_url": c.base_url,
+        "has_token": bool(c.token),
+        "created_at": c.created_at.isoformat() if c.created_at else None,
+    }
+
+
+def _get_git_config_checked(db: Session, config_id: str, user: User) -> GitConfig:
+    config = db.get(GitConfig, config_id)
+    if config is None or (user.role != "admin" and config.user_id != user.id):
+        raise HTTPException(404, "Git 配置不存在")
+    return config
+
+
+@app.get("/api/git-configs", dependencies=[Depends(require_user)])
+def list_git_configs(user: User = Depends(require_user), db: Session = Depends(get_db)):
+    rows = db.execute(select(GitConfig).where(GitConfig.user_id == user.id).order_by(GitConfig.id)).scalars().all()
+    return {"items": [_git_config_out(c) for c in rows]}
+
+
+class GitConfigCreateBody(BaseModel):
+    name: str = ""
+    base_url: str
+    token: str
+
+
+@app.post("/api/git-configs", dependencies=[Depends(require_user)])
+def create_git_config(body: GitConfigCreateBody, request: Request, user: User = Depends(require_user), db: Session = Depends(get_db)):
+    """保存个人 Git 服务配置；保存前真实验证令牌（调 /api/v4/user），无效直接报错。"""
+    token = body.token.strip()
+    if not token:
+        raise HTTPException(400, "访问令牌不能为空")
+    if len(token) > 512:
+        raise HTTPException(400, "令牌过长")
+    try:
+        base_url = normalize_base_url(body.base_url)
+    except GitLabError as exc:
+        raise HTTPException(400, str(exc))
+    try:
+        info = verify_token(base_url, token)
+    except GitLabError as exc:
+        raise HTTPException(400, str(exc))
+    config = GitConfig(
+        id=uuid.uuid4().hex, user_id=user.id,
+        name=(body.name.strip() or info.get("username", ""))[:128],
+        base_url=base_url, token=token,
+    )
+    db.add(config)
+    db.commit()
+    _audit(db, request, "git_config.create", f"id={config.id} base_url={base_url} user={info.get('username')}", user=user)
+    return _git_config_out(config)
+
+
+class GitConfigPatchBody(BaseModel):
+    name: str = ""
+    base_url: str = ""
+    token: str = ""
+
+
+@app.patch("/api/git-configs/{config_id}", dependencies=[Depends(require_user)])
+def patch_git_config(config_id: str, body: GitConfigPatchBody, request: Request, user: User = Depends(require_user), db: Session = Depends(get_db)):
+    config = _get_git_config_checked(db, config_id, user)
+    base_url = config.base_url
+    if body.base_url.strip():
+        try:
+            base_url = normalize_base_url(body.base_url)
+        except GitLabError as exc:
+            raise HTTPException(400, str(exc))
+    token = body.token.strip()
+    if len(token) > 512:
+        raise HTTPException(400, "令牌过长")
+    if body.name.strip():
+        config.name = body.name.strip()[:128]
+    if base_url != config.base_url or token:
+        # 地址或令牌有变化时，用新令牌（未填则用旧令牌）对新地址做真实验证
+        try:
+            info = verify_token(base_url, token or config.token)
+        except GitLabError as exc:
+            raise HTTPException(400, str(exc))
+        config.base_url = base_url
+        if token:
+            config.token = token
+        _audit(db, request, "git_config.token_update", f"id={config_id} base_url={base_url} user={info.get('username')}", user=user)
+    db.commit()
+    _audit(db, request, "git_config.patch", f"id={config_id}", user=user)
+    return _git_config_out(config)
+
+
+@app.delete("/api/git-configs/{config_id}", dependencies=[Depends(require_user)])
+def delete_git_config(config_id: str, request: Request, user: User = Depends(require_user), db: Session = Depends(get_db)):
+    """删除 Git 配置；已用它创建的项目凭据已单独保存，不受影响。"""
+    config = _get_git_config_checked(db, config_id, user)
+    db.delete(config)
+    db.commit()
+    _audit(db, request, "git_config.delete", f"id={config_id}", user=user)
+    return {"ok": True}
+
+
+@app.get("/api/git-configs/{config_id}/projects", dependencies=[Depends(require_user)])
+def git_config_projects(config_id: str, request: Request, user: User = Depends(require_user), db: Session = Depends(get_db)):
+    """列出该 Git 服务下当前用户可见的仓库（带组织/命名空间信息），供创建项目时选择。"""
+    config = _get_git_config_checked(db, config_id, user)
+    try:
+        items = gitlab_list_projects(config.base_url, config.token)
+    except GitLabError as exc:
+        raise HTTPException(400, str(exc))
+    _audit(db, request, "git_config.list_projects", f"id={config_id} count={len(items)}", user=user)
+    return {"items": items}
+
+
 # ===================== 项目 =====================
 
 
@@ -224,9 +523,11 @@ def _project_out(p: Project, db: Session) -> dict:
         "description": p.description or "",
         "source_type": p.source_type,
         "git_url": p.git_url or "",
-        "git_auth_type": p.git_auth_type or "",
-        "has_credentials": bool(p.git_token or p.git_ssh_key),
+        # 仅支持 PAT；存量 ssh 配置一律视为未配置凭据
+        "git_auth_type": "token" if p.git_auth_type == "token" else "",
+        "has_credentials": bool(p.git_token),
         "default_test_url": p.default_test_url or "",
+        "is_archived": bool(p.is_archived),
         "created_by": p.created_by,
         "created_by_name": creator.username if creator else "-",
         "created_at": p.created_at.isoformat() if p.created_at else None,
@@ -260,7 +561,7 @@ class ProjectCreateBody(BaseModel):
     git_url: str = ""
     git_auth_type: str = ""
     git_token: str = ""
-    git_ssh_key: str = ""
+    git_config_id: str = ""  # 从个人 Git 配置导入时填写：凭据取自该配置
     default_test_url: str = ""
 
 
@@ -271,15 +572,21 @@ def create_project(body: ProjectCreateBody, request: Request, user: User = Depen
         raise HTTPException(400, "项目名需为 1-128 个字符")
     if body.source_type not in ("git", "zip"):
         raise HTTPException(400, "source_type 必须是 git 或 zip")
+    git_auth_type = body.git_auth_type
+    git_token = body.git_token.strip()
     if body.source_type == "git":
         if not body.git_url.strip():
             raise HTTPException(400, "Git 项目必须填写仓库地址")
-        if body.git_auth_type not in ("", "token", "ssh"):
-            raise HTTPException(400, "git_auth_type 必须是 token / ssh / 留空")
-        if body.git_auth_type == "token" and not body.git_token.strip():
+        if git_auth_type not in ("", "token"):
+            raise HTTPException(400, "git_auth_type 必须是 token / 留空（仅支持 Personal Access Token）")
+        if git_auth_type == "token" and not git_token:
             raise HTTPException(400, "选择 token 认证时必须填写 token")
-        if body.git_auth_type == "ssh" and not body.git_ssh_key.strip():
-            raise HTTPException(400, "选择 SSH 认证时必须填写私钥")
+        if body.git_config_id:
+            # 从个人 Git 配置导入：校验归属与服务地址，凭据复制自配置
+            config = _get_git_config_checked(db, body.git_config_id, user)
+            if not same_host(config.base_url, body.git_url):
+                raise HTTPException(400, "仓库地址与所选 Git 配置的服务地址不一致")
+            git_auth_type, git_token = "token", config.token
     if body.default_test_url:
         ok, reason = check_target_allowed(body.default_test_url)
         if not ok:
@@ -287,8 +594,8 @@ def create_project(body: ProjectCreateBody, request: Request, user: User = Depen
     project = Project(
         id=uuid.uuid4().hex, name=name, description=body.description.strip()[:2000],
         source_type=body.source_type, git_url=body.git_url.strip(),
-        git_auth_type=body.git_auth_type, git_token=body.git_token.strip(),
-        git_ssh_key=body.git_ssh_key, default_test_url=body.default_test_url.strip(),
+        git_auth_type=git_auth_type, git_token=git_token,
+        default_test_url=body.default_test_url.strip(),
         created_by=user.id,
     )
     db.add(project)
@@ -301,9 +608,8 @@ class ProjectPatchBody(BaseModel):
     name: str = ""
     description: str = ""
     git_url: str = ""
-    git_auth_type: str = ""
+    git_auth_type: str | None = None  # None=不修改，""=清除凭据
     git_token: str = ""
-    git_ssh_key: str = ""
     default_test_url: str = ""
 
 
@@ -321,21 +627,24 @@ def patch_project(project_id: str, body: ProjectPatchBody, request: Request, use
         if not ok:
             raise HTTPException(400, reason)
         project.default_test_url = body.default_test_url.strip()
-    if body.git_auth_type:
-        if body.git_auth_type not in ("", "token", "ssh"):
-            raise HTTPException(400, "git_auth_type 必须是 token / ssh / 留空")
+    if body.git_auth_type is not None:
+        if body.git_auth_type not in ("", "token"):
+            raise HTTPException(400, "git_auth_type 必须是 token / 留空（仅支持 Personal Access Token）")
+        if body.git_auth_type == "token" and not (body.git_token.strip() or project.git_token):
+            raise HTTPException(400, "选择 token 认证时必须填写 token")
         project.git_auth_type = body.git_auth_type
+        if body.git_auth_type != "token":
+            project.git_token = ""
     if body.git_token:
         project.git_token = body.git_token.strip()
-    if body.git_ssh_key:
-        project.git_ssh_key = body.git_ssh_key
     db.commit()
     _audit(db, request, "project.patch", f"id={project_id}", user=user)
     return _project_out(project, db)
 
 
-@app.delete("/api/projects/{project_id}", dependencies=[Depends(require_user)])
-def delete_project(project_id: str, request: Request, user: User = Depends(require_user), db: Session = Depends(get_db)):
+@app.post("/api/projects/{project_id}/archive", dependencies=[Depends(require_user)])
+def archive_project(project_id: str, request: Request, user: User = Depends(require_user), db: Session = Depends(get_db)):
+    """归档项目（软删除）：保留全部数据，仅不能再发起新任务，可随时恢复。"""
     project = _get_project_checked(db, project_id, user)
     running = db.execute(
         select(func.count(Task.id)).where(
@@ -344,13 +653,20 @@ def delete_project(project_id: str, request: Request, user: User = Depends(requi
         )
     ).scalar() or 0
     if running:
-        raise HTTPException(400, "项目下还有执行中的任务，无法删除")
-    db.execute(Task.__table__.delete().where(Task.project_id == project_id))  # 历史任务归属项目，随项目删除
-    db.execute(ProjectUpload.__table__.delete().where(ProjectUpload.project_id == project_id))
-    db.delete(project)
+        raise HTTPException(400, "项目下还有执行中的任务，待完成后再归档")
+    project.is_archived = True
     db.commit()
-    _audit(db, request, "project.delete", f"id={project_id} name={project.name}", user=user)
-    return {"ok": True}
+    _audit(db, request, "project.archive", f"id={project_id} name={project.name}", user=user)
+    return _project_out(project, db)
+
+
+@app.post("/api/projects/{project_id}/unarchive", dependencies=[Depends(require_user)])
+def unarchive_project(project_id: str, request: Request, user: User = Depends(require_user), db: Session = Depends(get_db)):
+    project = _get_project_checked(db, project_id, user)
+    project.is_archived = False
+    db.commit()
+    _audit(db, request, "project.unarchive", f"id={project_id} name={project.name}", user=user)
+    return _project_out(project, db)
 
 
 @app.get("/api/projects/{project_id}", dependencies=[Depends(require_user)])
@@ -383,7 +699,7 @@ def project_branches(project_id: str, user: User = Depends(require_user), db: Se
     try:
         branches = list_branches(
             project.git_url, auth_type=project.git_auth_type,
-            token=project.git_token, ssh_key=project.git_ssh_key,
+            token=project.git_token,
         )
     except SourceError as exc:
         raise HTTPException(400, str(exc))
@@ -479,6 +795,7 @@ def _task_summary(t: Task, db: Session) -> dict:
         "source_ref": t.source_ref,
         "branch": t.branch or "",
         "test_url": t.test_url,
+        "instruction": t.instruction or "",
         "report_lang": t.report_lang,
         "zh_status": t.zh_status or "",
         "model": t.model or "",
@@ -493,9 +810,65 @@ def _task_summary(t: Task, db: Session) -> dict:
 
 
 @app.get("/api/models", dependencies=[Depends(require_user)])
-def list_models() -> dict:
-    """任务提交时可选的免费模型列表（来自环境变量 FREE_MODELS）。"""
-    return {"default": settings.strix_llm, "items": free_models()}
+def list_models(db: Session = Depends(get_db)) -> dict:
+    """任务提交时可选的模型列表（platform_models 表，超管在设置页维护）。"""
+    return {"default": default_model(db), "items": platform_models(db)}
+
+
+# ===================== 黑盒测试地址探测 =====================
+
+
+class TargetCheckBody(BaseModel):
+    url: str
+
+
+@app.post("/api/targets/check", dependencies=[Depends(require_user)])
+def check_target(body: TargetCheckBody, request: Request, db: Session = Depends(get_db), user: User = Depends(require_user)):
+    """对黑盒测试地址做一次真实访问探测：先过允许清单，再发 HTTP GET 判断可达性。"""
+    url = body.url.strip()
+    if not url:
+        raise HTTPException(400, "地址不能为空")
+    ok, reason = check_target_allowed(url)
+    if not ok:
+        return {"allowed": False, "reason": reason, "reachable": None, "status_code": None, "latency_ms": None, "detail": ""}
+    probe = probe_target(url)
+    _audit(
+        db, request, "target.check",
+        f"url={url} reachable={probe['reachable']} status={probe['status_code']} latency={probe['latency_ms']}ms",
+        user=user,
+    )
+    return {"allowed": True, "reason": "", **probe}
+
+
+# ===================== Git 仓库地址探测 =====================
+
+
+class GitRepoCheckBody(BaseModel):
+    git_url: str
+    auth_type: str = ""
+    token: str = ""
+
+
+@app.post("/api/sources/check", dependencies=[Depends(require_user)])
+def check_git_repo(
+    body: GitRepoCheckBody,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_user),
+):
+    """手动输入的 Git 仓库地址测试：git ls-remote 验证地址与凭据可访问，顺带返回分支列表。"""
+    url = body.git_url.strip()
+    if not url:
+        raise HTTPException(400, "仓库地址不能为空")
+    started = time.monotonic()
+    try:
+        branches = list_branches(url, body.auth_type, body.token)
+    except SourceError as exc:
+        _audit(db, request, "git.check", f"url={url} ok=False", user=user)
+        return {"reachable": False, "detail": str(exc), "branches": [], "latency_ms": None}
+    latency_ms = int((time.monotonic() - started) * 1000)
+    _audit(db, request, "git.check", f"url={url} ok=True branches={len(branches)} latency={latency_ms}ms", user=user)
+    return {"reachable": True, "detail": "", "branches": branches, "latency_ms": latency_ms}
 
 
 @app.post("/api/projects/{project_id}/tasks", dependencies=[Depends(require_user)])
@@ -505,33 +878,41 @@ async def create_task(
     db: Session = Depends(get_db),
     scan_mode: str = Form("quick"),
     test_url: str = Form(""),
+    instruction: str = Form(""),
     model: str = Form(""),
     branch: str = Form(""),
     upload_id: str = Form(""),
-    report_lang: str = Form("en"),
     file: UploadFile | None = File(default=None),
     user: User = Depends(require_user),
 ):
     project = _get_project_checked(db, project_id, user)
+    if project.is_archived:
+        raise HTTPException(400, "项目已归档，无法发起新任务；请先恢复项目")
+    if not (user.llm_api_key or "").strip():
+        raise HTTPException(400, "尚未配置个人 AI 密钥；请先在「设置」中配置后再提交任务")
     if scan_mode not in ("quick", "standard", "deep"):
         raise HTTPException(400, "scan_mode 必须是 quick/standard/deep")
-    if report_lang not in ("en", "zh"):
-        raise HTTPException(400, "report_lang 必须是 en 或 zh")
 
-    # 模型可选：留空用平台默认；指定则必须在免费模型列表内
+    # 模型可选：留空用平台默认；指定则必须在平台可用模型列表内（超管维护）
     model = (model or "").strip()
     if model:
-        if len(model) > 64 or not re.fullmatch(r"[A-Za-z0-9._/-]+", model):
+        if not valid_model_name(model):
             raise HTTPException(400, "model 不合法")
-        free = free_models()
-        if free and model not in free:
-            raise HTTPException(400, f"model 必须是 free 模型之一：{', '.join(free)}")
+        if model not in platform_models(db):
+            raise HTTPException(400, f"model 必须是平台可用模型之一，请联系超管在「设置」中确认")
+    elif not platform_models(db):
+        raise HTTPException(400, "平台尚未配置可用模型，请联系超管在「设置」中添加")
 
     # 黑盒目标允许清单校验
     if test_url:
         ok, reason = check_target_allowed(test_url)
         if not ok:
             raise HTTPException(400, reason)
+
+    # 自定义测试指令（透传 strix --instruction）
+    instruction = instruction.strip()
+    if len(instruction) > 4000:
+        raise HTTPException(400, "instruction 最长 4000 个字符")
 
     task_id = new_task_id()
     upload_ref: ProjectUpload | None = None
@@ -559,7 +940,7 @@ async def create_task(
         id=task_id, project_id=project_id, created_by=user.id,
         scan_mode=scan_mode, source_type=source_type,
         source_ref=source_ref, branch=branch, upload_id=upload_ref.id if upload_ref else None,
-        test_url=test_url, model=model, report_lang=report_lang, status="pending",
+        test_url=test_url, instruction=instruction, model=model, report_lang="zh", status="pending",
     )
     db.add(task)
     db.commit()
@@ -567,7 +948,7 @@ async def create_task(
         db, request, "task.submit",
         f"id={task_id} project={project_id} mode={scan_mode} model={model or 'default'} "
         f"source={source_type} branch={branch} upload={upload_ref.id if upload_ref else '-'} "
-        f"lang={report_lang} url={test_url}",
+        f"url={test_url} instruction={'yes' if instruction else 'no'}",
         user=user,
     )
     run_scan.delay(task_id)
@@ -610,6 +991,133 @@ def _get_task_checked(db: Session, task_id: str, user: User) -> Task:
     if user.role != "admin" and task.created_by != user.id:
         raise HTTPException(403, "无权访问该任务")
     return task
+
+
+# ===================== 统计汇总 =====================
+
+
+@app.get("/api/stats", dependencies=[Depends(require_user)])
+def stats(db: Session = Depends(get_db), user: User = Depends(require_user)):
+    """统计汇总：普通用户仅统计自己创建的项目与任务，超管统计全平台。"""
+    is_admin = user.role == "admin"
+
+    def scope_tasks(q):
+        return q if is_admin else q.where(Task.created_by == user.id)
+
+    def scope_projects(q):
+        return q if is_admin else q.where(Project.created_by == user.id)
+
+    projects_total = db.execute(
+        scope_projects(select(func.count(Project.id)).where(Project.is_archived.is_(False)))
+    ).scalar() or 0
+    projects_archived = db.execute(
+        scope_projects(select(func.count(Project.id)).where(Project.is_archived.is_(True)))
+    ).scalar() or 0
+
+    tasks_total = db.execute(scope_tasks(select(func.count(Task.id)))).scalar() or 0
+    tasks_by_status = dict(db.execute(
+        scope_tasks(select(Task.status, func.count(Task.id)).group_by(Task.status))
+    ).all())
+    tasks_by_mode = dict(db.execute(
+        scope_tasks(select(Task.scan_mode, func.count(Task.id)).group_by(Task.scan_mode))
+    ).all())
+    tasks_by_model = dict(db.execute(
+        scope_tasks(
+            select(Task.model, func.count(Task.id))
+            .group_by(Task.model)
+            .order_by(desc(func.count(Task.id)))
+        ).limit(6)
+    ).all())
+    avg_duration = db.execute(
+        scope_tasks(select(func.avg(Task.duration_sec)).where(Task.status == "done"))
+    ).scalar()
+    total_tokens = db.execute(
+        scope_tasks(select(func.coalesce(func.sum(Task.total_tokens), 0)))
+    ).scalar() or 0
+
+    # 漏洞严重度分布：以 findings 表为准（历史任务可能只有 severity_counts 汇总）
+    findings_by_severity = dict(db.execute(
+        scope_tasks(
+            select(Finding.severity, func.count(Finding.id))
+            .select_from(Finding)
+            .join(Task, Finding.task_id == Task.id)
+            .group_by(Finding.severity)
+        )
+    ).all())
+    findings_total = db.execute(
+        scope_tasks(select(func.count(Finding.id)).select_from(Finding).join(Task, Finding.task_id == Task.id))
+    ).scalar() or 0
+    if not findings_total:  # 兜底：解析结果落库前的任务只有 Task.severity_counts JSON
+        for t in db.execute(scope_tasks(select(Task.severity_counts).where(Task.findings_count > 0))).scalars():
+            try:
+                for sev, n in (json.loads(t) or {}).items():
+                    findings_by_severity[sev] = findings_by_severity.get(sev, 0) + int(n)
+                    findings_total += int(n)
+            except (ValueError, TypeError):
+                continue
+
+    # 近 14 天任务趋势（按日聚合，缺失日期补零）
+    trend_start = datetime.now(timezone.utc) - timedelta(days=13)
+    trend_counts: dict[str, int] = {}
+    for created in db.execute(
+        scope_tasks(select(Task.created_at).where(Task.created_at >= trend_start))
+    ).scalars():
+        if created is None:
+            continue
+        day = created.astimezone(timezone.utc).strftime("%Y-%m-%d")
+        trend_counts[day] = trend_counts.get(day, 0) + 1
+    today = datetime.now(timezone.utc)
+    trend = [
+        {"date": (day := (today - timedelta(days=13 - i)).strftime("%Y-%m-%d")), "count": trend_counts.get(day, 0)}
+        for i in range(14)
+    ]
+
+    # 项目漏洞 Top 5（按发现漏洞数排序）
+    tasks_per_project = dict(db.execute(
+        scope_tasks(
+            select(Task.project_id, func.count(Task.id)).where(Task.project_id.is_not(None)).group_by(Task.project_id)
+        )
+    ).all())
+    findings_per_project: dict[str, int] = {}
+    findings_sev_per_project: dict[str, dict[str, int]] = {}
+    for pid, sev, n in db.execute(
+        scope_tasks(
+            select(Task.project_id, Finding.severity, func.count(Finding.id))
+            .select_from(Finding)
+            .join(Task, Finding.task_id == Task.id)
+            .where(Task.project_id.is_not(None))
+            .group_by(Task.project_id, Finding.severity)
+        )
+    ).all():
+        findings_per_project[pid] = findings_per_project.get(pid, 0) + n
+        findings_sev_per_project.setdefault(pid, {})[sev] = n
+    top_ids = sorted(tasks_per_project, key=lambda pid: findings_per_project.get(pid, 0), reverse=True)[:5]
+    top_projects = [
+        {
+            "id": pid,
+            "name": (p.name if (p := db.get(Project, pid)) else pid),
+            "tasks": tasks_per_project.get(pid, 0),
+            "findings": findings_per_project.get(pid, 0),
+            "severity_counts": findings_sev_per_project.get(pid, {}),
+        }
+        for pid in top_ids
+    ]
+
+    return {
+        "scope": "all" if is_admin else "mine",
+        "projects_total": projects_total,
+        "projects_archived": projects_archived,
+        "tasks_total": tasks_total,
+        "tasks_by_status": tasks_by_status,
+        "tasks_by_mode": tasks_by_mode,
+        "tasks_by_model": tasks_by_model,
+        "findings_total": findings_total,
+        "findings_by_severity": findings_by_severity,
+        "avg_duration_sec": round(float(avg_duration), 1) if avg_duration is not None else None,
+        "total_tokens": int(total_tokens),
+        "trend": trend,
+        "top_projects": top_projects,
+    }
 
 
 @app.get("/api/tasks/{task_id}", dependencies=[Depends(require_user)])
@@ -683,14 +1191,17 @@ def task_report_pdf(task_id: str, request: Request, db: Session = Depends(get_db
     task = _get_task_checked(db, task_id, user)
     if not task.run_dir_name:
         raise HTTPException(404, "任务还没有可导出的报告")
-    cache_path = Path(settings.workspace_root) / "reports" / f"{task_id}.pdf"
+    # v2: 启用 CJK 字体修复中文乱码；改名以自动失效旧版乱码缓存
+    cache_path = Path(settings.workspace_root) / "reports" / f"{task_id}.v2.pdf"
     if not cache_path.is_file():
         run_dir = Path(settings.workspace_root) / task_id / "scan" / "strix_runs" / task.run_dir_name
         if not run_dir.is_dir():
             raise HTTPException(404, "run 工作区已清理，无法生成 PDF（可下载产物 zip 归档）")
+        from app.pdf_fonts import apply_cjk_fonts
         from strix.interface.viewer.report_pdf import generate_report_pdf
 
         try:
+            apply_cjk_fonts()
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             cache_path.write_bytes(generate_report_pdf(run_dir))
         except Exception as exc:  # noqa: BLE001

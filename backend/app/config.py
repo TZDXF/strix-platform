@@ -8,7 +8,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    # 依次查找：仓库根 .env（docker compose 插值用的同一份），backend/.env 可覆盖
+    model_config = SettingsConfigDict(
+        env_file=("../.env", ".env"), env_file_encoding="utf-8", extra="ignore"
+    )
 
     # 基础设施
     database_url: str = "postgresql+psycopg2://strix:strix@localhost:5432/strix"
@@ -28,12 +31,12 @@ class Settings(BaseSettings):
     strix_bin: str = "strix"
     strix_version: str = "1.5.3"
 
-    # LLM（公司统一网关），worker 注入给 strix 子进程
+    # LLM（公司统一网关），worker 注入给 strix 子进程；密钥由用户个人配置，平台不再持有统一密钥
     llm_api_base: str = ""
-    llm_api_key: str = ""
-    strix_llm: str = "free"
+    strix_llm: str = "free"  # 平台模型表为空时的最终回退
 
-    # 可选的免费模型列表（逗号分隔，提交任务时下拉选择；STRIX_LLM 为未指定时的默认）
+    # 首次启动播种 platform_models 表用的模型列表（逗号分隔）；
+    # 之后模型列表以表内数据为准，由超管在「设置」页通过网关密钥查询并添加
     free_models: str = "free"
 
     # 对象存储（RustFS，S3 API）；未启用时产物留在本地磁盘
@@ -57,6 +60,12 @@ class Settings(BaseSettings):
 
     # LLM 连接失败自动重试次数（决策 #7：free 池有间歇故障）
     max_scan_attempts: int = 3
+
+    # strix 全局附加参数（运维级，所有任务生效）
+    # 单任务预算上限（美元）；>0 时传 --max-budget，strix 超预算即中止
+    strix_max_budget: float = 0.0
+    # 原样追加的额外 CLI 参数（shlex 切分，如 "--scope-mode diff --config /path.json"）
+    strix_extra_args: str = ""
 
 
 @lru_cache

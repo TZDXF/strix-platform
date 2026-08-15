@@ -25,6 +25,7 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         ("report_lang", "VARCHAR(8) DEFAULT 'en'"),
         ("zh_status", "VARCHAR(16) DEFAULT ''"),
         ("report_md", "TEXT DEFAULT ''"),
+        ("instruction", "TEXT DEFAULT ''"),
     ],
     "findings": [
         ("poc_description", "TEXT DEFAULT ''"),
@@ -35,6 +36,12 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
     ],
     "audit_entries": [
         ("user_id", "INTEGER"),
+    ],
+    "users": [
+        ("llm_api_key", "TEXT DEFAULT ''"),
+    ],
+    "projects": [
+        ("is_archived", "BOOLEAN DEFAULT FALSE"),
     ],
 }
 

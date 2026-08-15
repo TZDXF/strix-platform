@@ -15,7 +15,7 @@ from sqlalchemy import select
 from .celery_app import celery_app
 from .config import get_settings
 from .db import SessionLocal
-from .models import Finding, Task
+from .models import Finding, Task, User
 
 SYSTEM_PROMPT = (
     "You are a professional translator for security vulnerability reports. "
@@ -28,15 +28,17 @@ SYSTEM_PROMPT = (
 _MAX_CHARS = 40_000  # 单次请求文本上限，超出分批
 
 
-def _chat(messages: list[dict[str, str]], model: str, timeout: int = 300) -> str:
+def _chat(messages: list[dict[str, str]], model: str, api_key: str = "", timeout: int = 300) -> str:
     s = get_settings()
     if not s.llm_api_base:
         raise RuntimeError("未配置 LLM_API_BASE")
+    if not api_key:
+        raise RuntimeError("任务创建者未配置个人 AI 密钥")
     body = json.dumps({"model": model or s.strix_llm, "messages": messages, "temperature": 0}).encode("utf-8")
     req = urllib.request.Request(
         s.llm_api_base.rstrip("/") + "/chat/completions",
         data=body,
-        headers={"Content-Type": "application/json", **({"Authorization": f"Bearer {s.llm_api_key}"} if s.llm_api_key else {})},
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -63,6 +65,8 @@ def translate_findings(task_id: str) -> int:
         task = db.get(Task, task_id)
         if task is None:
             return 0
+        creator = db.get(User, task.created_by) if task.created_by else None
+        api_key = (creator.llm_api_key or "") if creator else ""
         findings = db.execute(select(Finding).where(Finding.task_id == task_id)).scalars().all()
         todo = [f for f in findings if not f.title_zh]
         done = 0
@@ -88,6 +92,7 @@ def translate_findings(task_id: str) -> int:
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                 ],
                 model=task.model or "",
+                api_key=api_key,
             )
             by_id = {item.get("id"): item for item in _extract_json_array(reply) if isinstance(item, dict)}
             for f in batch:

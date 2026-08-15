@@ -1,8 +1,12 @@
-// 共享 Tailwind 类名：保持各视图样式一致
-export const card = 'mb-[18px] rounded-[10px] border border-border bg-panel p-[18px]'
+// 共享 Tailwind 类名：保持各视图样式一致（亮色为 Calendly 风格：白卡片 + 蓝色调阴影 + 8px 基准圆角）
+export const card = 'mb-[18px] rounded-xl border border-border bg-panel p-[18px] shadow-soft'
+// 更强的悬浮卡片（Hero / KPI 等需要突出的区域）
+export const cardLifted = 'rounded-2xl border border-border bg-panel shadow-card'
 export const h3 = 'mb-3.5 text-sm font-semibold text-muted'
 export const btn =
-  'cursor-pointer rounded-md bg-accent px-5.5 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50'
+  'cursor-pointer rounded-lg bg-accent px-5.5 py-2 text-sm font-semibold text-white shadow-soft transition-colors hover:bg-accent/90 disabled:cursor-not-allowed disabled:opacity-50'
+export const btnDark =
+  'cursor-pointer rounded-lg bg-text px-5.5 py-2 text-sm font-semibold text-panel disabled:cursor-not-allowed disabled:opacity-50'
 export const btnGhost =
   'cursor-pointer rounded-md border border-border bg-transparent px-5 py-2 text-sm font-semibold text-text disabled:cursor-not-allowed disabled:opacity-50'
 export const btnDanger =
@@ -62,19 +66,3 @@ export function findingBarClass(sev: string): string {
     default: return 'border-l-low'
   }
 }
-
-// v-html 渲染的 Markdown 报告样式（内容无法逐元素加类，用任意变体选择器）
-export const mdBody =
-  'text-[13.5px] leading-[1.75] text-[#b9c4da] ' +
-  '[&_h3]:mt-4.5 [&_h3]:mb-2 [&_h3]:text-base [&_h3]:font-semibold [&_h3]:text-text ' +
-  '[&_h4]:mt-4 [&_h4]:mb-2 [&_h4]:text-[14.5px] [&_h4]:font-semibold [&_h4]:text-text ' +
-  '[&_h5]:mt-3 [&_h5]:mb-2 [&_h5]:font-semibold [&_h5]:text-text ' +
-  '[&_h6]:mt-3 [&_h6]:mb-2 [&_h6]:font-semibold [&_h6]:text-text ' +
-  '[&_p]:my-2 [&_ul]:my-2 [&_ul]:pl-6 [&_ol]:my-2 [&_ol]:pl-6 ' +
-  '[&_hr]:my-4 [&_hr]:border-0 [&_hr]:border-t [&_hr]:border-border ' +
-  '[&_code]:rounded [&_code]:bg-[#0b101b] [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:text-[12.5px] [&_code]:text-[#9fb0cd] ' +
-  '[&_pre]:overflow-auto [&_pre]:rounded-lg [&_pre]:border [&_pre]:border-border [&_pre]:bg-[#0b101b] [&_pre]:p-3 ' +
-  '[&_a]:text-accent ' +
-  '[&_.md-table]:my-2.5 [&_.md-table]:border-collapse ' +
-  '[&_.md-table_th]:border [&_.md-table_th]:border-border [&_.md-table_th]:px-3 [&_.md-table_th]:py-1.5 [&_.md-table_th]:text-left ' +
-  '[&_.md-table_td]:border [&_.md-table_td]:border-border [&_.md-table_td]:px-3 [&_.md-table_td]:py-1.5'

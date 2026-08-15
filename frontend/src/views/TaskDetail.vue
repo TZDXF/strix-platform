@@ -2,16 +2,16 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { TabsRoot, TabsList, TabsTrigger, TabsContent, CheckboxRoot, CheckboxIndicator } from 'reka-ui'
 import { api, type TaskDetail as TaskDetailData } from '../api'
-import { mdToHtml } from '../markdown'
+import MarkdownRender from 'markstream-vue'
+import { toast } from '../toast'
 import {
-  btn, btnGhost, card, err as errCls, findingBarClass, hint, logPre, mdBody,
+  btn, btnGhost, card, err as errCls, findingBarClass, hint, logPre,
   sevBadgeClass, sevCellClass, sevLabel, statusBadgeClass,
 } from '../ui'
 
 const props = defineProps<{ taskId: string }>()
 const task = ref<TaskDetailData | null>(null)
 const logText = ref('')
-const error = ref('')
 const expanded = ref<Record<number, boolean>>({})
 const showZh = ref(true)
 const tab = ref('findings')
@@ -19,7 +19,10 @@ let timer: number | undefined
 
 const running = computed(() => ['pending', 'fetching', 'scanning', 'parsing'].includes(task.value?.status || ''))
 const zhReady = computed(() => (task.value?.findings || []).some(f => f.title_zh))
-const reportHtml = computed(() => mdToHtml(task.value?.report_md || ''))
+const reportMd = computed(() => task.value?.report_md || '')
+// 主题在 html.light 类上生效，监听类变化让报告渲染同步亮暗色
+const isDark = ref(!document.documentElement.classList.contains('light'))
+let themeObserver: MutationObserver | undefined
 
 const sevOrder = ['critical', 'high', 'medium', 'low', 'info']
 const sevGrid = computed(() => {
@@ -38,19 +41,16 @@ async function refresh() {
     const [t, l] = await Promise.all([api.getTask(props.taskId), api.getLog(props.taskId)])
     task.value = t
     logText.value = l.log
-    error.value = ''
   } catch (e) {
-    error.value = (e as Error).message
+    toast.error((e as Error).message)
   }
 }
 
 async function downloadArtifacts() {
-  error.value = ''
-  try { await api.downloadArtifacts(props.taskId) } catch (e) { error.value = (e as Error).message }
+  try { await api.downloadArtifacts(props.taskId) } catch (e) { toast.error((e as Error).message) }
 }
 async function downloadPdf() {
-  error.value = ''
-  try { await api.downloadPdf(props.taskId) } catch (e) { error.value = (e as Error).message }
+  try { await api.downloadPdf(props.taskId) } catch (e) { toast.error((e as Error).message) }
 }
 
 function fmtDur(s: number | null) {
@@ -64,14 +64,17 @@ function fmtTokens(n: number | null) { return n != null ? n.toLocaleString() : '
 onMounted(() => {
   refresh()
   timer = window.setInterval(() => { if (running.value || task.value?.zh_status === 'pending') refresh() }, 5000)
+  themeObserver = new MutationObserver(() => {
+    isDark.value = !document.documentElement.classList.contains('light')
+  })
+  themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] })
 })
-onUnmounted(() => clearInterval(timer))
+onUnmounted(() => { clearInterval(timer); themeObserver?.disconnect() })
 </script>
 
 <template>
   <div>
     <a href="#/tasks" class="mb-3.5 inline-block text-accent">&larr; 返回任务列表</a>
-    <div v-if="error && !task" :class="[card, errCls]">{{ error }}</div>
 
     <template v-if="task">
       <!-- 报告头部：概览 + 严重级别统计（对齐 strix 官方报告页结构） -->
@@ -87,6 +90,9 @@ onUnmounted(() => clearInterval(timer))
             <div class="mt-1.5 text-xs text-muted">
               项目「{{ task.project_name }}」 · {{ task.source_type === 'git' ? (task.branch || '默认分支') : task.source_ref }}
               · {{ task.scan_mode }} 模式 · {{ task.model || '-' }} · 提交人 {{ task.created_by_name }} · {{ fmtTime(task.created_at) }}
+            </div>
+            <div v-if="task.instruction" class="mt-2 rounded-md bg-panel2 px-2.5 py-2 text-xs text-muted" style="white-space: pre-wrap">
+              <span class="font-semibold">测试指令：</span>{{ task.instruction }}
             </div>
           </div>
           <div class="flex-1"></div>
@@ -133,7 +139,7 @@ onUnmounted(() => clearInterval(timer))
 
         <!-- 漏洞明细 -->
         <TabsContent value="findings" :class="card" class="mt-0">
-          <div v-if="task.report_lang === 'zh' && task.zh_status === 'pending'" :class="hint">
+          <div v-if="task.zh_status === 'pending'" :class="hint">
             中文翻译进行中，稍后自动刷新；当前可先查看原文。
           </div>
           <div v-if="task.findings.length === 0 && task.status === 'done'" :class="hint">
@@ -147,7 +153,7 @@ onUnmounted(() => clearInterval(timer))
               <span class="text-xs text-muted">CVSS {{ f.cvss ?? '-' }} · {{ f.cwe || '-' }} · {{ f.has_poc ? '有 PoC' : '无 PoC' }}</span>
               <span class="text-xs text-muted">{{ expanded[f.id] ? '收起 ▲' : '展开 ▼' }}</span>
             </div>
-            <div v-if="expanded[f.id]" class="px-4 pt-1 pb-3.5 text-[#b9c4da]">
+            <div v-if="expanded[f.id]" class="px-4 pt-1 pb-3.5 text-body">
               <h4 class="mt-3 mb-1 text-[12.5px] text-muted">端点 / 目标</h4>
               <div class="break-all">{{ f.endpoint || '-' }}</div>
               <template v-if="desc(f)">
@@ -174,9 +180,9 @@ onUnmounted(() => clearInterval(timer))
           </div>
         </TabsContent>
 
-        <!-- 官方执行摘要报告（strix view 同款 penetration_test_report.md） -->
+        <!-- 官方执行摘要报告（strix view 同款 penetration_test_report.md），markstream-vue 渲染 -->
         <TabsContent v-if="task.has_report_md" value="summary" :class="card" class="mt-0">
-          <div :class="mdBody" v-html="reportHtml"></div>
+          <MarkdownRender mode="docs" :content="reportMd" :final="true" :is-dark="isDark" />
         </TabsContent>
 
         <!-- 执行日志 -->
@@ -206,8 +212,6 @@ onUnmounted(() => clearInterval(timer))
           <pre :class="logPre">{{ logText || '（暂无）' }}</pre>
         </TabsContent>
       </TabsRoot>
-
-      <div v-if="error && task" :class="errCls">{{ error }}</div>
     </template>
   </div>
 </template>

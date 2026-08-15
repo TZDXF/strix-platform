@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -18,16 +19,25 @@ from .config import get_settings
 
 RETRY_MARKER = "LLM CONNECTION FAILED"
 
+# strix 对这些前缀有专门路由，不加 openai/ 前缀
+_PASSTHROUGH_PREFIXES = ("openai/", "litellm/", "any-llm/", "ollama/")
 
-def _strix_env(model: str = "") -> dict[str, str]:
+
+def _strix_env(model: str = "", llm_api_key: str = "") -> dict[str, str]:
     s = get_settings()
     env = {**os.environ}
     env["STRIX_TELEMETRY"] = "off"
     if s.llm_api_base:
         env["LLM_API_BASE"] = s.llm_api_base
-    if s.llm_api_key:
-        env["LLM_API_KEY"] = s.llm_api_key
-    env["STRIX_LLM"] = model or s.strix_llm
+    # 仅使用任务创建者的个人密钥（平台不持有统一密钥）
+    if llm_api_key:
+        env["LLM_API_KEY"] = llm_api_key
+    name = (model or s.strix_llm).strip()
+    # 网关模型名如 "free/xxx" 含 "/"，litellm 会把首段当 provider 解析而报错；
+    # 配置了网关时统一加 "openai/" 前缀：strix 会剥掉前缀、把模型名原样发给网关
+    if s.llm_api_base and "/" in name and not name.lower().startswith(_PASSTHROUGH_PREFIXES):
+        name = "openai/" + name
+    env["STRIX_LLM"] = name
     return env
 
 
@@ -46,6 +56,7 @@ def execute_scan(
     log: Callable[[str], None],
     model: str = "",
     instruction: str = "",
+    llm_api_key: str = "",
 ) -> dict:
     """运行 strix，返回 {exit_code, timed_out, run_dir_name, attempts}。"""
     s = get_settings()
@@ -58,11 +69,15 @@ def execute_scan(
     cmd += ["-m", scan_mode]
     if instruction:
         cmd += ["--instruction", instruction]
+    if s.strix_max_budget > 0:
+        cmd += ["--max-budget", str(s.strix_max_budget)]
+    if s.strix_extra_args.strip():
+        cmd += shlex.split(s.strix_extra_args.strip())
 
     timeout_sec = {"quick": s.timeout_quick, "standard": s.timeout_standard, "deep": s.timeout_deep}.get(
         scan_mode, s.timeout_standard
     )
-    env = _strix_env(model)
+    env = _strix_env(model, llm_api_key)
     scan_log = work_dir / "scan.log"
 
     exit_code: int | None = None

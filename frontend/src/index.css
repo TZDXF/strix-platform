@@ -1,12 +1,14 @@
 @import "tailwindcss";
 
 @theme {
+  /* 暗色调色板（默认）；亮色在 html.light 下覆盖同名变量 */
   --color-bg: #0f1420;
   --color-panel: #171e2e;
   --color-panel2: #1e2740;
   --color-border: #2a3550;
   --color-text: #dce3f2;
   --color-muted: #8b96ad;
+  --color-body: #b9c4da;
   --color-accent: #4f8cff;
   --color-crit: #e5484d;
   --color-high: #f5a524;
@@ -14,6 +16,33 @@
   --color-low: #46a758;
   --color-ok: #3dd68c;
 
-  --font-sans: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  /* 卡片层次阴影：暗色下克制，亮色下为蓝色调三层阴影 */
+  --shadow-card: 0 2px 6px rgba(0, 0, 0, .22), 0 12px 32px -12px rgba(0, 0, 0, .38);
+  --shadow-soft: 0 1px 2px rgba(0, 0, 0, .25);
+
+  --font-sans: "Manrope", "Inter", "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
   --font-mono: Consolas, "Courier New", monospace;
+}
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+  html.light {
+    color-scheme: light;
+    /* 亮色：云白画布 + 白纸卡片 + 细线边框 + 墨蓝文字 + 信号蓝主色 */
+    --color-bg: #f8f9fb;
+    --color-panel: #ffffff;
+    --color-panel2: #f0f3f8;
+    --color-border: #d4e0ed;
+    --color-text: #0b3558;
+    --color-muted: #476788;
+    --color-body: #33536f;
+    --color-accent: #006bff;
+    --color-ok: #0f9d63;
+    --color-med: #b07d0a;
+    --shadow-card: 0 1px 2px rgba(11, 53, 88, .04), 0 6px 16px -6px rgba(11, 53, 88, .10),
+      0 20px 44px -16px rgba(0, 107, 255, .12);
+    --shadow-soft: 0 1px 2px rgba(11, 53, 88, .07), 0 2px 8px -2px rgba(11, 53, 88, .06);
+  }
 }

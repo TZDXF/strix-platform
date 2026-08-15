@@ -1,20 +1,19 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
 import { api, type TaskSummary, type User } from '../api'
+import { toast } from '../toast'
 import {
-  badge, card, err as errCls, hint, h3, statusBadgeClass, tableTd, tableTh,
+  badge, card, hint, h3, statusBadgeClass, tableTd, tableTh,
 } from '../ui'
 
 const props = defineProps<{ user: User | null }>()
 const tasks = ref<TaskSummary[]>([])
-const error = ref('')
 let timer: number | undefined
 
 async function refresh() {
   try {
     tasks.value = (await api.listTasks()).items
-    error.value = ''
-  } catch (e) { error.value = (e as Error).message }
+  } catch (e) { toast.error((e as Error).message) }
 }
 
 function fmtDur(s: number | null) {
@@ -40,13 +39,12 @@ onUnmounted(() => clearInterval(timer))
 <template>
   <div :class="card">
     <h3 :class="h3">任务列表（{{ props.user?.role === 'admin' ? '全部用户任务' : '我的任务' }}，每 5 秒自动刷新）</h3>
-    <div v-if="error" :class="errCls">{{ error }}</div>
     <table v-if="tasks.length" class="w-full border-collapse">
       <thead>
         <tr>
           <th :class="tableTh">任务</th><th :class="tableTh">项目</th><th :class="tableTh">状态</th>
           <th :class="tableTh">分支/来源</th><th :class="tableTh">模式</th><th :class="tableTh">模型</th>
-          <th :class="tableTh">语言</th><th :class="tableTh">发现</th><th :class="tableTh">耗时</th>
+          <th :class="tableTh">发现</th><th :class="tableTh">耗时</th>
           <th :class="tableTh">tokens</th><th :class="tableTh">提交人</th><th :class="tableTh">提交时间</th>
         </tr>
       </thead>
@@ -63,7 +61,6 @@ onUnmounted(() => clearInterval(timer))
           </td>
           <td :class="tableTd">{{ t.scan_mode }}</td>
           <td :class="tableTd">{{ t.model || '-' }}</td>
-          <td :class="tableTd">{{ t.report_lang === 'zh' ? '中文' : 'EN' }}</td>
           <td :class="tableTd">{{ t.findings_count > 0 ? sevCounts(t) : (t.status === 'done' ? '无' : '-') }}</td>
           <td :class="tableTd">{{ fmtDur(t.duration_sec) }}</td>
           <td :class="tableTd">{{ fmtTokens(t) }}</td>

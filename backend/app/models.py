@@ -24,6 +24,20 @@ class User(Base):
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), default=_now)
     last_login_at = Column(DateTime(timezone=True), nullable=True)
+    # 个人 AI 网关密钥（必填）：该用户发起的扫描与翻译用它调用 LLM 网关，平台不再持有统一密钥
+    llm_api_key = Column(Text, default="")
+
+
+class PlatformModel(Base):
+    """平台可用模型：超管在设置页维护（通过网关密钥查询后挑选加入），供任务提交时选择。"""
+
+    __tablename__ = "platform_models"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(128), unique=True, nullable=False, index=True)
+    is_default = Column(Boolean, default=False)  # 平台默认模型（全表至多一个）
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_now)
 
 
 class Project(Base):
@@ -36,12 +50,26 @@ class Project(Base):
     description = Column(Text, default="")
     source_type = Column(String(8), default="git")  # git | zip
     git_url = Column(Text, default="")
-    # 访问凭据（仅创建人/超管可写，接口永不回显明文）
-    git_auth_type = Column(String(8), default="")  # "" | token | ssh
-    git_token = Column(Text, default="")  # https token（加密前的明文，仅后端使用）
-    git_ssh_key = Column(Text, default="")  # PEM 私钥
+    # 访问凭据（仅创建人/超管可写，接口永不回显明文）；仅支持 Personal Access Token
+    git_auth_type = Column(String(8), default="")  # "" | token
+    git_token = Column(Text, default="")  # PAT 明文（`token` 或 `user:token`），仅后端使用
     default_test_url = Column(Text, default="")
+    is_archived = Column(Boolean, default=False)  # 归档（软删除）：数据保留，仅不能再发起新任务
     created_by = Column(Integer, ForeignKey("users.id"), index=True)
+    created_at = Column(DateTime(timezone=True), default=_now)
+    updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+
+class GitConfig(Base):
+    """用户个人 Git 服务配置（GitLab）：保存服务地址与访问令牌，创建项目时可拉取仓库列表。"""
+
+    __tablename__ = "git_configs"
+
+    id = Column(String(32), primary_key=True)  # uuid4 hex
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    name = Column(String(128), default="")  # 显示名，如「内网 GitLab」
+    base_url = Column(Text, default="")  # 如 http://192.168.1.3:12580
+    token = Column(Text, default="")  # PAT 明文，仅后端使用，接口永不回显
     created_at = Column(DateTime(timezone=True), default=_now)
     updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now)
 
@@ -79,7 +107,8 @@ class Task(Base):
     branch = Column(String(255), default="")  # git 项目扫描分支
     upload_id = Column(String(32), ForeignKey("project_uploads.id"), nullable=True)
     test_url = Column(Text, default="")  # 用户提供的黑盒测试地址（可选）
-    report_lang = Column(String(8), default="en")  # en | zh（中文报告）
+    instruction = Column(Text, default="")  # 用户自定义测试指令（--instruction，可选）
+    report_lang = Column(String(8), default="zh")  # 固定中文报告；保留字段兼容历史 en 任务
     zh_status = Column(String(16), default="")  # 翻译状态："" | pending | done | failed
 
     # 执行结果

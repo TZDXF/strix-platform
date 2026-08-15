@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import ipaddress
 import socket
+import time
 from urllib.parse import urlparse
+
+import httpx
 
 from .config import get_settings
 
@@ -74,3 +77,29 @@ def resolve_note(host: str) -> str:
         return ""
     except OSError:
         return f"（警告：主机 {host} 当前无法解析）"
+
+
+def probe_target(url: str, timeout: float = 5.0) -> dict:
+    """对已放行的黑盒地址发起一次轻量 HTTP GET 探测，返回可达性结果。
+
+    内网测试环境常配自签名证书，这里与扫描引擎保持一致不校验 TLS。
+    任何 HTTP 状态码（含 4xx/5xx）都算可达，只有连接/超时类错误算不可达。
+    """
+    started = time.monotonic()
+    result: dict = {"reachable": False, "status_code": None, "latency_ms": None, "detail": ""}
+    try:
+        resp = httpx.get(url.strip(), timeout=timeout, follow_redirects=True, verify=False)
+    except httpx.ConnectError:
+        result["detail"] = "连接失败（主机无法解析、不可达或端口未开放）"
+    except httpx.ConnectTimeout:
+        result["detail"] = "连接超时"
+    except httpx.ReadTimeout:
+        result["detail"] = "响应超时（连接已建立但服务未在时限内返回）"
+    except httpx.HTTPError as e:
+        result["detail"] = f"{type(e).__name__}: {e}"
+    else:
+        result["reachable"] = True
+        result["status_code"] = resp.status_code
+        result["detail"] = "目标可达"
+    result["latency_ms"] = round((time.monotonic() - started) * 1000)
+    return result
