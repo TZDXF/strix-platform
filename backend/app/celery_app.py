@@ -8,7 +8,7 @@ settings = get_settings()
 
 celery_app = Celery("strix_platform", broker=settings.redis_url, backend=settings.redis_url)
 celery_app.conf.update(
-    include=["app.tasks"],
+    include=["app.tasks", "app.translate"],
     task_serializer="json",
     accept_content=["json"],
     # 平台级并发限制：共享主机同时只跑 1 个扫描（worker 单进程）

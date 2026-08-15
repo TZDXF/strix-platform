@@ -37,7 +37,8 @@ services:
     environment: &backend_env
       DATABASE_URL: postgresql+psycopg2://strix:${POSTGRES_PASSWORD:-strix}@postgres:5432/strix
       REDIS_URL: redis://redis:6379/0
-      API_TOKEN: ${API_TOKEN:?must set API_TOKEN}
+      SECRET_KEY: ${SECRET_KEY:?must set SECRET_KEY}
+      ADMIN_INITIAL_PASSWORD: ${ADMIN_INITIAL_PASSWORD:-strix-admin-123}
       WORKSPACE_ROOT: /data/workspaces
       STRIX_BIN: strix
       STRIX_LLM: ${STRIX_LLM:-free}

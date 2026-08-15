@@ -1,4 +1,4 @@
-"""扫描任务流水线：获取源码 → strix 执行 → 产物解析入库 → 归档。"""
+"""扫描任务流水线：获取源码（项目/分支/凭据） → strix 执行 → 产物解析入库 → 归档 → 中文翻译。"""
 
 from __future__ import annotations
 
@@ -14,11 +14,18 @@ from .artifacts import archive_run
 from .celery_app import celery_app
 from .config import get_settings
 from .db import SessionLocal
-from .models import Finding, Task
+from .models import Finding, Project, ProjectUpload, Task
 from .runner import execute_scan, read_run_artifacts
 from .sources import SourceError, clone_git, du_mb, safe_extract_zip
+from .translate import translate_findings_task
 
 LOG_CAP = 200_000  # task.log 滚动上限（字符）
+
+ZH_INSTRUCTION = (
+    "Please write the entire report in Simplified Chinese (简体中文): "
+    "vulnerability titles, descriptions, PoC explanations and remediation steps. "
+    "Keep technical identifiers (CVE/CWE, code, endpoints) unchanged."
+)
 
 
 def _log(task, line: str) -> None:
@@ -44,6 +51,8 @@ def run_scan(self, task_id: str) -> dict:
         db.close()
         return {"error": "task not found"}
 
+    project = db.get(Project, task.project_id) if task.project_id else None
+
     ws = Path(s.workspace_root)
     task_ws = ws / task_id
     src_dir = task_ws / "src"
@@ -58,11 +67,22 @@ def run_scan(self, task_id: str) -> dict:
         _set_status(db, task, "fetching")
 
         # ---- Stage 1: 获取源码 ----
+        import shutil
+
+        if src_dir.exists():  # 重派发/重试时清掉上次残留，保证可幂等重跑
+            shutil.rmtree(src_dir, ignore_errors=True)
         src_dir.mkdir(parents=True, exist_ok=True)
         if task.source_type == "git":
-            clone_git(task.source_ref, src_dir, lambda m: (_log(task, m), db.commit()))
+            clone_git(
+                task.source_ref, src_dir, lambda m: (_log(task, m), db.commit()),
+                branch=task.branch or "",
+                auth_type=(project.git_auth_type if project else ""),
+                token=(project.git_token if project else ""),
+                ssh_key=(project.git_ssh_key if project else ""),
+            )
         else:
-            zip_path = ws / "uploads" / f"{task_id}.zip"
+            upload = db.get(ProjectUpload, task.upload_id) if task.upload_id else None
+            zip_path = Path(upload.stored_path) if upload and upload.stored_path else ws / "uploads" / f"{task_id}.zip"
             if not zip_path.is_file():
                 raise SourceError("上传的压缩包丢失，请重新提交")
             safe_extract_zip(
@@ -71,15 +91,16 @@ def run_scan(self, task_id: str) -> dict:
             )
         _log(task, f"[fetch] 源码就绪（{du_mb(src_dir)}MB）")
 
-        # ---- Stage 2: strix 扫描 ----
+        # ---- Stage 2: strix 扫描（中文报告通过 --instruction 提示词注入）----
         _set_status(db, task, "scanning")
-        _log(task, f"[scan] 模型: {task.model}")
+        _log(task, f"[scan] 模型: {task.model}" + ("（中文报告）" if task.report_lang == "zh" else ""))
         result = execute_scan(
             work_dir=scan_dir,
             src_dir=src_dir,
             test_url=task.test_url or "",
             scan_mode=task.scan_mode,
             model=task.model or "",
+            instruction=ZH_INSTRUCTION if task.report_lang == "zh" else "",
             log=lambda m: (_log(task, m), db.commit()),
         )
         task.exit_code = result["exit_code"]
@@ -93,6 +114,12 @@ def run_scan(self, task_id: str) -> dict:
         usage = run_record.get("llm_usage") or {}
         task.total_tokens = usage.get("total_tokens")
         task.llm_requests = usage.get("requests")
+        # 官方执行摘要报告（strix view 展示的同款 penetration_test_report.md）
+        report_path = scan_dir / "strix_runs" / result["run_dir_name"] / "penetration_test_report.md"
+        try:
+            task.report_md = report_path.read_text(encoding="utf-8")[:500_000]
+        except OSError:
+            task.report_md = ""
 
         db.execute(delete(Finding).where(Finding.task_id == task_id))
         counts: dict[str, int] = {}
@@ -113,6 +140,8 @@ def run_scan(self, task_id: str) -> dict:
                     has_poc=bool(v.get("poc_script_code") or v.get("poc_description")),
                     description=str(v.get("description", "") or ""),
                     remediation=str(v.get("remediation_steps", "") or ""),
+                    poc_description=str(v.get("poc_description", "") or ""),
+                    poc_code=str(v.get("poc_script_code", "") or ""),
                     raw=json.dumps(v, ensure_ascii=False),
                 )
             )
@@ -140,6 +169,13 @@ def run_scan(self, task_id: str) -> dict:
             f"耗时 {task.duration_sec} 秒，发现 {task.findings_count} 条",
         )
         _set_status(db, task, "done")
+
+        # ---- Stage 5: 中文翻译（report_lang=zh；提示词失败时的兜底）----
+        if task.report_lang == "zh" and task.findings_count > 0:
+            task.zh_status = "pending"
+            db.commit()
+            _log(task, "[translate] 调度中文翻译任务")
+            translate_findings_task.delay(task_id)
         return {"task_id": task_id, "exit_code": task.exit_code, "findings": task.findings_count}
 
     except SourceError as exc:

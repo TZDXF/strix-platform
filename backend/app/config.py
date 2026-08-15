@@ -14,8 +14,12 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg2://strix:strix@localhost:5432/strix"
     redis_url: str = "redis://localhost:6379/0"
 
-    # 最低成本护栏①：共享访问令牌（全平台一个，够拦无关访问）
-    api_token: str = "change-me-in-env"
+    # 登录会话签名密钥（必改；用于签发/校验用户访问令牌）
+    secret_key: str = "change-me-secret-key"
+    # 登录令牌有效期（小时）
+    token_expiry_hours: int = 24
+    # 首次启动时自动创建的超管账号密码（用户库为空时生效）
+    admin_initial_password: str = "strix-admin-123"
 
     # 工作目录（任务源码、扫描工作区、产物归档）
     workspace_root: str = "./workspaces"

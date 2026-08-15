@@ -1,0 +1,19 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg: #0f1420;
+  --color-panel: #171e2e;
+  --color-panel2: #1e2740;
+  --color-border: #2a3550;
+  --color-text: #dce3f2;
+  --color-muted: #8b96ad;
+  --color-accent: #4f8cff;
+  --color-crit: #e5484d;
+  --color-high: #f5a524;
+  --color-med: #f0b429;
+  --color-low: #46a758;
+  --color-ok: #3dd68c;
+
+  --font-sans: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  --font-mono: Consolas, "Courier New", monospace;
+}

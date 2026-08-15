@@ -11,21 +11,76 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+class User(Base):
+    """平台用户：admin（超管）可管理账号与查看全部任务，user 仅见自己的项目/任务。"""
+
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    username = Column(String(64), unique=True, nullable=False, index=True)
+    password_hash = Column(String(256), default="")
+    role = Column(String(16), default="user")  # admin | user
+    display_name = Column(String(128), default="")
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), default=_now)
+    last_login_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class Project(Base):
+    """扫描项目：Git 仓库（可配访问密钥）或 zip 上传两种来源。"""
+
+    __tablename__ = "projects"
+
+    id = Column(String(32), primary_key=True)  # uuid4 hex
+    name = Column(String(128), nullable=False)
+    description = Column(Text, default="")
+    source_type = Column(String(8), default="git")  # git | zip
+    git_url = Column(Text, default="")
+    # 访问凭据（仅创建人/超管可写，接口永不回显明文）
+    git_auth_type = Column(String(8), default="")  # "" | token | ssh
+    git_token = Column(Text, default="")  # https token（加密前的明文，仅后端使用）
+    git_ssh_key = Column(Text, default="")  # PEM 私钥
+    default_test_url = Column(Text, default="")
+    created_by = Column(Integer, ForeignKey("users.id"), index=True)
+    created_at = Column(DateTime(timezone=True), default=_now)
+    updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+
+class ProjectUpload(Base):
+    """项目内历史上传的 zip 包，供再次发起扫描时复用。"""
+
+    __tablename__ = "project_uploads"
+
+    id = Column(String(32), primary_key=True)  # uuid4 hex
+    project_id = Column(String(32), ForeignKey("projects.id"), index=True)
+    filename = Column(String(255), default="")
+    size_bytes = Column(BigInteger, default=0)
+    stored_path = Column(Text, default="")  # workspace 下的相对路径
+    uploaded_by = Column(Integer, ForeignKey("users.id"))
+    created_at = Column(DateTime(timezone=True), default=_now)
+
+
 class Task(Base):
     __tablename__ = "tasks"
 
     id = Column(String(32), primary_key=True)  # uuid4 hex
+    project_id = Column(String(32), ForeignKey("projects.id"), nullable=True, index=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), default=_now)
     updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now)
     started_at = Column(DateTime(timezone=True), nullable=True)
     finished_at = Column(DateTime(timezone=True), nullable=True)
 
-    # pending -> fetching -> scanning -> parsing -> done | failed
+    # pending -> fetching -> scanning -> parsing -> translating -> done | failed
     status = Column(String(16), default="pending", index=True)
     scan_mode = Column(String(16), default="quick")
     source_type = Column(String(8))  # git | zip
     source_ref = Column(Text, default="")  # git URL 或上传文件名
+    branch = Column(String(255), default="")  # git 项目扫描分支
+    upload_id = Column(String(32), ForeignKey("project_uploads.id"), nullable=True)
     test_url = Column(Text, default="")  # 用户提供的黑盒测试地址（可选）
+    report_lang = Column(String(8), default="en")  # en | zh（中文报告）
+    zh_status = Column(String(16), default="")  # 翻译状态："" | pending | done | failed
 
     # 执行结果
     run_dir_name = Column(String(255), default="")
@@ -40,6 +95,7 @@ class Task(Base):
     findings_count = Column(Integer, default=0)
     severity_counts = Column(Text, default="")  # JSON: {"critical":n,...}
     artifacts_ref = Column(Text, default="")  # 本地 zip 路径 或 s3://key
+    report_md = Column(Text, default="")  # 官方执行摘要报告（penetration_test_report.md）
     log = Column(Text, default="")  # 关键执行日志（滚动截断）
     error = Column(Text, default="")
 
@@ -60,6 +116,12 @@ class Finding(Base):
     has_poc = Column(Boolean, default=False)
     description = Column(Text, default="")
     remediation = Column(Text, default="")
+    poc_description = Column(Text, default="")
+    poc_code = Column(Text, default="")
+    # 中文翻译（report_lang=zh 时由 LLM 生成/翻译）
+    title_zh = Column(Text, default="")
+    description_zh = Column(Text, default="")
+    remediation_zh = Column(Text, default="")
     raw = Column(Text, default="")  # 原始 finding JSON
 
 
@@ -67,12 +129,13 @@ Index("ix_findings_task_severity", Finding.task_id, Finding.severity)
 
 
 class AuditEntry(Base):
-    """最低成本护栏②：审计日志（谁在何时提交/查询了什么）。"""
+    """审计日志（谁在何时提交/查询了什么）。"""
 
     __tablename__ = "audit_entries"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     ts = Column(DateTime(timezone=True), default=_now, index=True)
+    user_id = Column(Integer, nullable=True)
     client_ip = Column(String(64), default="")
     action = Column(String(64), default="")
     detail = Column(Text, default="")

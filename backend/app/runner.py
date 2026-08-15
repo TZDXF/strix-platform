@@ -45,6 +45,7 @@ def execute_scan(
     scan_mode: str,
     log: Callable[[str], None],
     model: str = "",
+    instruction: str = "",
 ) -> dict:
     """运行 strix，返回 {exit_code, timed_out, run_dir_name, attempts}。"""
     s = get_settings()
@@ -55,6 +56,8 @@ def execute_scan(
     if test_url:
         cmd += ["-t", test_url]
     cmd += ["-m", scan_mode]
+    if instruction:
+        cmd += ["--instruction", instruction]
 
     timeout_sec = {"quick": s.timeout_quick, "standard": s.timeout_standard, "deep": s.timeout_deep}.get(
         scan_mode, s.timeout_standard
