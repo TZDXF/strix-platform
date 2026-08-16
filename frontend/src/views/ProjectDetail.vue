@@ -6,8 +6,9 @@ import {
   RadioGroupRoot, RadioGroupItem, RadioGroupIndicator,
   CheckboxRoot, CheckboxIndicator,
 } from 'reka-ui'
-import { api, type ProjectDetailData, type User } from '../api'
-import TargetUrlField from '../components/TargetUrlField.vue'
+import { api, type GitRepoRef, type ProjectDetailData, type TestTarget, type User } from '../api'
+import RepoListField from '../components/RepoListField.vue'
+import TargetListField from '../components/TargetListField.vue'
 import { toast } from '../toast'
 import {
   badge, btn, btnDanger, btnGhost, card, hint, h3, input, label, statusBadgeClass, tableTd, tableTh,
@@ -19,11 +20,31 @@ const showLaunch = ref(false)
 const launching = ref(false)
 let timer: number | undefined
 
+// 每个仓库一个分支选择器：{url, branch, branches, loaded, loading}
+interface RepoBranchSel {
+  url: string
+  branch: string
+  branches: string[]
+  loaded: boolean
+  loading: boolean
+}
+
 const form = ref({
-  scanMode: 'quick', model: '', blackbox: false, testUrl: '', instruction: '',
-  branch: '', branches: [] as string[], branchesLoaded: false, loadingBranches: false,
+  scanMode: 'quick', model: '', blackbox: false, testTargets: [] as TestTarget[], instruction: '',
+  repos: [] as RepoBranchSel[],
   uploadChoice: 'new' as 'history' | 'new', uploadId: '', file: null as File | null, fileName: '',
 })
+
+// 提交前统一清洗：trim + 丢弃未填地址的行（地址列表与仓库列表同构，共用）
+function cleanTargets<T extends { url: string; note: string }>(list: T[]): T[] {
+  return list.map(t => ({ ...t, url: t.url.trim(), note: t.note.trim() })).filter(t => t.url)
+}
+
+// 仓库短名（URL 末段去 .git），用于分支选择器与展示
+function repoBaseName(url: string): string {
+  const seg = url.replace(/\/+$/, '').split(/[/:]/).pop() || url
+  return seg.endsWith('.git') ? seg.slice(0, -4) : seg
+}
 const models = ref<string[]>([])
 const defaultModel = ref('')
 
@@ -35,8 +56,8 @@ const NO_AUTH = '__none__'
 const showEdit = ref(false)
 const savingEdit = ref(false)
 const editForm = ref({
-  name: '', description: '', git_url: '', git_auth_type: NO_AUTH,
-  git_token: '', default_test_url: '',
+  name: '', description: '', git_repos: [] as GitRepoRef[], git_auth_type: NO_AUTH,
+  git_token: '', default_test_targets: [] as TestTarget[],
 })
 
 const authOptions = [
@@ -49,25 +70,29 @@ function openEdit() {
   if (!p) return
   editForm.value = {
     name: p.name, description: p.description,
-    git_url: p.git_url, git_auth_type: p.has_credentials ? p.git_auth_type : NO_AUTH,
-    git_token: '', default_test_url: p.default_test_url,
+    git_repos: (p.git_repos || []).map(r => ({ ...r })),
+    git_auth_type: p.has_credentials ? p.git_auth_type : NO_AUTH,
+    git_token: '', default_test_targets: (p.default_test_targets || []).map(t => ({ ...t })),
   }
   showEdit.value = true
 }
 
 async function saveEdit() {
   if (!editForm.value.name.trim()) { toast.error('项目名称不能为空'); return }
+  const repos = cleanTargets(editForm.value.git_repos)
+  if (isGit.value && !repos.length) { toast.error('Git 项目必须至少保留一个仓库'); return }
   savingEdit.value = true
   try {
     await api.patchProject(props.projectId, {
       name: editForm.value.name.trim(),
       description: editForm.value.description.trim(),
+      // 列表全量提交：仓库列表与默认地址列表，空数组表示清空（仓库至少保留一个，上方已校验）
+      ...(isGit.value ? { git_repos: repos } : {}),
+      default_test_targets: cleanTargets(editForm.value.default_test_targets),
       ...(isGit.value ? {
-        git_url: editForm.value.git_url.trim(),
         git_auth_type: editForm.value.git_auth_type === NO_AUTH ? '' : editForm.value.git_auth_type,
         ...(editForm.value.git_token.trim() ? { git_token: editForm.value.git_token.trim() } : {}),
       } : {}),
-      ...(editForm.value.default_test_url.trim() ? { default_test_url: editForm.value.default_test_url.trim() } : {}),
     })
     toast.success('项目已保存')
     showEdit.value = false
@@ -95,22 +120,37 @@ async function loadModels() {
   } catch { /* 使用平台默认模型 */ }
 }
 
-async function loadBranches() {
-  const f = form.value
-  f.loadingBranches = true
+// 逐仓库加载分支列表（idx 缺省 = 全部仓库）；默认分支排首位并自动选中
+async function loadRepoBranches(idx?: number) {
+  const repos = form.value.repos
+  const idxs = idx == null ? repos.map((_, i) => i) : [idx]
+  if (!idxs.length) return
+  idxs.forEach(i => { repos[i].loading = true })
   try {
-    f.branches = (await api.listBranches(props.projectId)).items || []
-    f.branchesLoaded = true
-    if (f.branches.length) f.branch = f.branches[0]  // 默认分支排首位
-  } catch (e) { toast.error((e as Error).message) } finally { f.loadingBranches = false }
+    await Promise.all(idxs.map(async i => {
+      try {
+        repos[i].branches = (await api.listBranches(props.projectId, repos[i].url)).items || []
+        repos[i].loaded = true
+        if (repos[i].branches.length && !repos[i].branch) repos[i].branch = repos[i].branches[0]
+      } catch (e) {
+        toast.error(`获取仓库「${repoBaseName(repos[i].url)}」分支失败：${(e as Error).message}`)
+      }
+    }))
+  } finally {
+    idxs.forEach(i => { repos[i].loading = false })
+  }
 }
 
 function openLaunch() {
-  form.value.testUrl = project.value?.default_test_url || ''
-  form.value.blackbox = !!project.value?.default_test_url
+  const defaults = (project.value?.default_test_targets || []).map(t => ({ ...t }))
+  form.value.testTargets = defaults
+  form.value.blackbox = defaults.length > 0
+  form.value.repos = (project.value?.git_repos || []).map(r => ({
+    url: r.url, branch: '', branches: [], loaded: false, loading: false,
+  }))
   loadModels()
-  if (isGit.value && !form.value.branchesLoaded) loadBranches()
-  else if (!isGit.value && project.value?.uploads.length) {
+  if (isGit.value) loadRepoBranches()
+  else if (project.value?.uploads.length) {
     form.value.uploadChoice = 'history'
     form.value.uploadId = project.value.uploads[0].id
   }
@@ -119,35 +159,38 @@ function openLaunch() {
 
 async function launch() {
   const f = form.value
-  if (isGit.value && !f.branch) { toast.error('请选择要扫描的分支'); return }
-  if (f.blackbox && !f.testUrl.trim()) { toast.error('已勾选黑盒测试，请填写黑盒测试地址，或取消勾选仅做白盒扫描'); return }
+  if (isGit.value && f.repos.some(r => !r.branch)) { toast.error('请为每个仓库选择扫描分支（可点「刷新」重试拉取）'); return }
+  const targets = cleanTargets(f.testTargets)
+  if (f.blackbox && !targets.length) { toast.error('已勾选黑盒测试，请至少填写一个黑盒测试地址，或取消勾选仅做白盒扫描'); return }
   if (!isGit.value && f.uploadChoice === 'history' && !f.uploadId) { toast.error('请选择历史上传'); return }
   if (!isGit.value && f.uploadChoice === 'new' && !f.file) { toast.error('请选择 zip 压缩包'); return }
   launching.value = true
   try {
-    // 黑盒任务提交前先探测一次目标：无法访问时提示用户确认，避免任务空跑
+    // 黑盒任务提交前逐个探测目标：不在允许清单的直接拦截；无法访问的汇总后确认一次，避免任务空跑
     if (f.blackbox) {
-      let reachable: boolean | null = null
-      let failMsg = ''
-      try {
-        const r = await api.checkTarget(f.testUrl.trim())
-        if (!r.allowed) { toast.error(r.reason); return }
-        reachable = r.reachable
-        failMsg = r.detail
-      } catch (e) {
-        failMsg = (e as Error).message  // 探测接口本身异常：提示但不阻塞提交
-      }
-      if (reachable === false &&
-        !confirm(`黑盒测试地址当前无法访问：${failMsg}\n\n请确认目标服务已启动（可在地址旁点「测试访问」查看详情）。是否仍要提交任务？`)) {
+      const results = await Promise.allSettled(targets.map(t => api.checkTarget(t.url)))
+      const notAllowed: string[] = []
+      const unreachable: string[] = []
+      results.forEach((r, i) => {
+        if (r.status === 'fulfilled') {
+          if (!r.value.allowed) notAllowed.push(`${targets[i].url}：${r.value.reason}`)
+          else if (r.value.reachable === false) unreachable.push(`${targets[i].url}（${r.value.detail}）`)
+        } else {
+          unreachable.push(`${targets[i].url}（探测接口异常：${(r.reason as Error)?.message || '未知错误'}）`)
+        }
+      })
+      if (notAllowed.length) { toast.error(`以下地址不在允许清单：${notAllowed.join('；')}`); return }
+      if (unreachable.length &&
+        !confirm(`以下黑盒测试地址当前无法访问：\n${unreachable.join('\n')}\n\n请确认目标服务已启动（可在地址旁点「测试访问」查看详情）。是否仍要提交任务？`)) {
         return
       }
     }
     const res = await api.submitTask(props.projectId, {
       scanMode: f.scanMode,
-      testUrl: f.blackbox ? f.testUrl.trim() : '',
+      repoBranches: isGit.value ? f.repos.map(r => ({ url: r.url, branch: r.branch })) : undefined,
+      testTargets: f.blackbox ? targets : [],
       instruction: f.instruction.trim(),
       model: f.model,
-      branch: isGit.value ? f.branch : '',
       uploadId: !isGit.value && f.uploadChoice === 'history' ? f.uploadId : '',
       file: !isGit.value && f.uploadChoice === 'new' ? f.file : null,
     })
@@ -230,12 +273,21 @@ onUnmounted(() => clearInterval(timer))
         </div>
         <div class="mb-4 grid gap-3" style="grid-template-columns: repeat(auto-fit, minmax(170px, 1fr))">
           <div v-if="isGit" class="rounded-lg bg-panel2 px-3 py-2.5">
-            <div class="text-xs text-muted">仓库地址</div>
-            <div class="mt-0.5 text-[12.5px] font-semibold break-all">{{ project.git_url }}</div>
+            <div class="text-xs text-muted">代码仓库（{{ project.git_repos?.length || 0 }} 个）</div>
+            <div class="mt-0.5 flex flex-col gap-0.5">
+              <div v-for="r in project.git_repos" :key="r.url" class="text-[12.5px] font-semibold break-all">
+                {{ r.url }}<span v-if="r.note" class="font-normal text-muted">（{{ r.note }}）</span>
+              </div>
+            </div>
           </div>
           <div class="rounded-lg bg-panel2 px-3 py-2.5">
-            <div class="text-xs text-muted">默认黑盒地址</div>
-            <div class="mt-0.5 text-[12.5px] font-semibold">{{ project.default_test_url || '（仅白盒）' }}</div>
+            <div class="text-xs text-muted">默认黑盒地址（{{ project.default_test_targets?.length || 0 }} 个）</div>
+            <div v-if="project.default_test_targets?.length" class="mt-0.5 flex flex-col gap-0.5">
+              <div v-for="t in project.default_test_targets" :key="t.url" class="text-[12.5px] font-semibold break-all">
+                {{ t.url }}<span v-if="t.note" class="font-normal text-muted">（{{ t.note }}）</span>
+              </div>
+            </div>
+            <div v-else class="mt-0.5 text-[12.5px] font-semibold">（仅白盒）</div>
           </div>
           <div class="rounded-lg bg-panel2 px-3 py-2.5">
             <div class="text-xs text-muted">创建人 / 时间</div>
@@ -283,7 +335,9 @@ onUnmounted(() => clearInterval(timer))
                 <span v-if="t.zh_status === 'pending'" :class="badge" class="ml-1 bg-[#9b7bff]/15 text-[#a78bfa]">翻译中</span>
               </td>
               <td :class="[tableTd, 'max-w-[200px] truncate']">
-                {{ t.source_type === 'git' ? (t.branch || '默认分支') : t.source_ref }}
+                {{ t.source_type === 'git'
+                  ? (t.repo_branches?.length > 1 ? `${t.repo_branches.length} 个仓库` : (t.branch || '默认分支'))
+                  : t.source_ref }}
               </td>
               <td :class="tableTd">{{ t.scan_mode }}</td>
               <td :class="tableTd">{{ t.findings_count > 0 ? sevCounts(t) : (t.status === 'done' ? '无' : '-') }}</td>
@@ -302,26 +356,36 @@ onUnmounted(() => clearInterval(timer))
           <DialogContent class="fixed top-1/2 left-1/2 z-50 max-h-[85vh] w-[680px] max-w-[94vw] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-[10px] border border-border bg-panel p-5">
             <DialogTitle class="mb-4 text-base font-semibold text-text">发起扫描任务</DialogTitle>
             <div class="grid grid-cols-2 gap-3.5">
-              <div v-if="isGit">
-                <label :class="label">扫描分支</label>
-                <div class="flex gap-2">
-                  <SelectRoot v-model="form.branch">
-                    <SelectTrigger :class="selectTrigger" class="flex-1">
-                      <SelectValue placeholder="选择分支" />
+              <div v-if="isGit" class="col-span-2">
+                <div class="mb-1.5 flex items-center gap-2.5">
+                  <label :class="label" class="!mb-0">
+                    扫描分支{{ form.repos.length > 1 ? `（${form.repos.length} 个仓库，各自选择分支）` : '' }}
+                  </label>
+                  <button
+                    :class="btnGhost" class="!px-3 !py-1 !text-xs"
+                    :disabled="form.repos.some(r => r.loading)" @click="loadRepoBranches()"
+                  >
+                    {{ form.repos.some(r => r.loading) ? '刷新中…' : '刷新' }}
+                  </button>
+                </div>
+                <div v-for="(r, i) in form.repos" :key="r.url" :class="i > 0 ? 'mt-2' : ''">
+                  <div v-if="form.repos.length > 1" class="mb-1 truncate font-mono text-[11.5px] text-muted" :title="r.url">
+                    {{ repoBaseName(r.url) }}
+                  </div>
+                  <SelectRoot v-model="r.branch">
+                    <SelectTrigger :class="selectTrigger">
+                      <SelectValue :placeholder="r.loading ? '分支拉取中…' : '选择分支'" />
                     </SelectTrigger>
                     <SelectPortal>
                       <SelectContent :class="selectContent" position="popper">
                         <SelectViewport>
-                          <SelectItem v-for="b in form.branches" :key="b" :value="b" :class="selectItem">
-                            <SelectItemText>{{ b }}{{ form.branches[0] === b ? '（默认）' : '' }}</SelectItemText>
+                          <SelectItem v-for="b in r.branches" :key="b" :value="b" :class="selectItem">
+                            <SelectItemText>{{ b }}{{ r.branches[0] === b ? '（默认）' : '' }}</SelectItemText>
                           </SelectItem>
                         </SelectViewport>
                       </SelectContent>
                     </SelectPortal>
                   </SelectRoot>
-                  <button :class="btnGhost" :disabled="form.loadingBranches" @click="loadBranches">
-                    {{ form.loadingBranches ? '刷新中…' : '刷新' }}
-                  </button>
                 </div>
               </div>
               <div>
@@ -395,7 +459,7 @@ onUnmounted(() => clearInterval(timer))
               <div class="col-span-2">
                 <label :class="label">测试方式</label>
                 <label class="flex cursor-pointer items-center gap-1.5 text-[13px] text-text">
-                  <CheckboxRoot v-model:checked="form.blackbox"
+                  <CheckboxRoot v-model="form.blackbox"
                     class="flex h-4 w-4 cursor-pointer items-center justify-center rounded border border-border bg-panel2 data-state-checked:border-accent data-state-checked:bg-accent/20">
                     <CheckboxIndicator class="text-xs leading-none text-accent">✓</CheckboxIndicator>
                   </CheckboxRoot>
@@ -403,10 +467,10 @@ onUnmounted(() => clearInterval(timer))
                 </label>
               </div>
               <div v-if="form.blackbox" class="col-span-2">
-                <TargetUrlField
-                  v-model="form.testUrl"
-                  label="黑盒测试地址"
-                  placeholder="https://app-a.test.company.internal"
+                <TargetListField
+                  v-model="form.testTargets"
+                  label="黑盒测试地址（可添加多个，建议注明每个地址的作用）"
+                  hint="每个地址都会作为独立目标传入扫描引擎；作用说明会随测试指令注入，帮助引擎理解各入口用途。"
                 />
               </div>
               <div class="col-span-2">
@@ -440,15 +504,16 @@ onUnmounted(() => clearInterval(timer))
                 <input v-model="editForm.name" type="text" :class="input" />
               </div>
               <div>
-                <TargetUrlField
-                  v-model="editForm.default_test_url"
-                  label="默认黑盒测试地址（可选）"
-                  placeholder="https://app-a.test.company.internal"
-                />
+                <label :class="label">描述（可选，清空后提交则保持原描述）</label>
+                <input v-model="editForm.description" type="text" placeholder="项目说明 / 负责人 / 测试范围" :class="input" />
               </div>
               <div v-if="isGit" class="col-span-2">
-                <label :class="label">Git 仓库地址</label>
-                <input v-model="editForm.git_url" type="text" :class="input" />
+                <RepoListField
+                  v-model="editForm.git_repos"
+                  label="代码仓库（可绑定多个，一次扫描覆盖全部）"
+                  :auth-type="editForm.git_auth_type === 'token' ? 'token' : ''"
+                  :token="editForm.git_token"
+                />
               </div>
               <div v-if="isGit">
                 <label :class="label">访问凭据（当前：{{ project.has_credentials ? `已配置（${project.git_auth_type}）` : '未配置' }}）</label>
@@ -470,8 +535,10 @@ onUnmounted(() => clearInterval(timer))
                 <input v-model="editForm.git_token" type="password" placeholder="glpat-xxxx / ghp_xxxx" :class="input" />
               </div>
               <div class="col-span-2">
-                <label :class="label">描述（可选，清空后提交则保持原描述）</label>
-                <input v-model="editForm.description" type="text" placeholder="项目说明 / 负责人 / 测试范围" :class="input" />
+                <TargetListField
+                  v-model="editForm.default_test_targets"
+                  label="默认黑盒测试地址（可选，发起任务时预填；可添加多个并注明作用）"
+                />
               </div>
             </div>
             <div class="mt-4 flex items-center gap-2.5">

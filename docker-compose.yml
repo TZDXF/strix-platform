@@ -39,7 +39,11 @@ services:
       REDIS_URL: redis://redis:6379/0
       SECRET_KEY: ${SECRET_KEY:?must set SECRET_KEY}
       ADMIN_INITIAL_PASSWORD: ${ADMIN_INITIAL_PASSWORD:-strix-admin-123}
-      WORKSPACE_ROOT: /data/workspaces
+      # strix 沙箱由宿主 daemon 创建、bind mount 源码目录，因此容器内的工作区路径
+      # 必须同时是 daemon 可解析的路径：Docker Desktop 下宿主磁盘挂在其 VM 的
+      # /run/desktop/mnt/host/<盘符>/ 下，WORKSPACE_CONTAINER_ROOT 需指向该路径；
+      # 原生 Linux 部署则把 WORKSPACE_HOST_DIR 与 WORKSPACE_CONTAINER_ROOT 设为同一宿主绝对路径
+      WORKSPACE_ROOT: ${WORKSPACE_CONTAINER_ROOT:-/data/workspaces}
       STRIX_BIN: strix
       STRIX_LLM: ${STRIX_LLM:-free}
       FREE_MODELS: ${FREE_MODELS:-free}
@@ -53,7 +57,9 @@ services:
       STRIX_MAX_BUDGET: ${STRIX_MAX_BUDGET:-0}
       STRIX_EXTRA_ARGS: ${STRIX_EXTRA_ARGS:-}
     volumes:
-      - workspaces:/data/workspaces
+      - type: bind
+        source: ${WORKSPACE_HOST_DIR:-./workspaces}
+        target: ${WORKSPACE_CONTAINER_ROOT:-/data/workspaces}
     depends_on:
       postgres:
         condition: service_healthy
@@ -65,9 +71,18 @@ services:
   worker:
     build: ./backend
     command: celery -A app.celery_app.celery_app worker --pool=solo --loglevel=info -n worker1
-    environment: *backend_env
+    environment:
+      <<: *backend_env
+      # strix 在容器内运行时，沙箱须加入 worker 所在网络，Caido 代理走容器 IP 直连；
+      # 不设置时端口解析为 127.0.0.1:<宿主发布端口>，容器内不可达 → Instance not ready
+      STRIX_DOCKER_SANDBOX_NETWORK: strix-sandbox
+    networks:
+      - default
+      - strix-sandbox
     volumes:
-      - workspaces:/data/workspaces
+      - type: bind
+        source: ${WORKSPACE_HOST_DIR:-./workspaces}
+        target: ${WORKSPACE_CONTAINER_ROOT:-/data/workspaces}
       - /var/run/docker.sock:/var/run/docker.sock   # strix 沙箱需要 Docker
     depends_on:
       postgres:
@@ -85,4 +100,7 @@ services:
 volumes:
   pgdata:
   rustfsdata:
-  workspaces:
+
+networks:
+  strix-sandbox:
+    name: strix-sandbox

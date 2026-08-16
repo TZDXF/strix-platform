@@ -4,10 +4,11 @@ import {
   DialogRoot, DialogPortal, DialogOverlay, DialogContent, DialogTitle,
   SelectRoot, SelectTrigger, SelectValue, SelectPortal, SelectContent, SelectViewport, SelectItem, SelectItemText,
 } from 'reka-ui'
-import { api, type GitConfig, type GitProject, type Project, type User } from '../api'
-import TargetUrlField from '../components/TargetUrlField.vue'
+import { api, type GitConfig, type GitProject, type GitRepoRef, type Project, type TestTarget, type User } from '../api'
+import RepoListField from '../components/RepoListField.vue'
+import TargetListField from '../components/TargetListField.vue'
 import { toast } from '../toast'
-import { btn, btnGhost, card, cardLifted, hint, input, label, tableTd, tableTh, h3 } from '../ui'
+import { btn, btnGhost, card, hint, input, label, tableTd, tableTh, h3 } from '../ui'
 
 const props = defineProps<{ user: User | null }>()
 const projects = ref<Project[]>([])
@@ -20,8 +21,8 @@ const ALL_ORGS = '__all__'
 
 const emptyForm = {
   name: '', description: '', source_type: 'git',
-  git_url: '', git_auth_type: NO_AUTH, git_token: '',
-  default_test_url: '',
+  git_repos: [] as GitRepoRef[], git_auth_type: NO_AUTH, git_token: '',
+  default_test_targets: [] as TestTarget[],
 }
 const form = ref({ ...emptyForm })
 
@@ -47,7 +48,7 @@ const gitProjects = ref<GitProject[]>([])
 const loadingRepos = ref(false)
 const repoSearch = ref('')
 const orgFilter = ref(ALL_ORGS)
-const selectedRepo = ref<GitProject | null>(null)
+const selectedRepos = ref<GitProject[]>([]) // 可多选：一个项目绑定多个仓库
 
 async function loadGitConfigs() {
   try {
@@ -61,7 +62,7 @@ async function loadGitConfigs() {
 
 function openCreate() {
   showCreate.value = true
-  selectedRepo.value = null
+  selectedRepos.value = []
   repoSearch.value = ''
   orgFilter.value = ALL_ORGS
   loadGitConfigs().then(() => {
@@ -77,7 +78,7 @@ function openCreate() {
 async function loadRepos() {
   if (!selectedConfig.value) return
   loadingRepos.value = true
-  selectedRepo.value = null
+  selectedRepos.value = []
   try {
     gitProjects.value = (await api.listGitProjects(selectedConfig.value)).items
     repoSearch.value = ''
@@ -121,13 +122,13 @@ const filteredRepos = computed(() => {
   })
 })
 
+// 点击切换选中（多选）：同一项目可绑定多个仓库，一次扫描覆盖全部
 function pickRepo(p: GitProject) {
-  selectedRepo.value = selectedRepo.value?.id === p.id ? null : p
-  if (selectedRepo.value) {
-    form.value.git_url = p.http_url_to_repo || p.web_url
+  const idx = selectedRepos.value.findIndex(x => x.id === p.id)
+  if (idx >= 0) selectedRepos.value.splice(idx, 1)
+  else {
+    selectedRepos.value.push(p)
     if (!form.value.name) form.value.name = p.name
-  } else {
-    form.value.git_url = ''
   }
 }
 
@@ -141,29 +142,6 @@ function switchMode(mode: 'import' | 'manual') {
   }
 }
 
-// ---- 手动输入仓库地址：测试访问（git ls-remote，同时校验地址与凭据），结果以 toast 提示 ----
-const gitChecking = ref(false)
-
-async function checkGitUrl() {
-  const url = form.value.git_url.trim()
-  if (!url) { toast.error('请先填写 Git 仓库地址'); return }
-  gitChecking.value = true
-  try {
-    const r = await api.checkGitRepo(
-      url,
-      form.value.git_auth_type === 'token' ? 'token' : '',
-      form.value.git_token,
-    )
-    if (r.reachable) {
-      toast.success(`✓ 可访问：共 ${r.branches.length} 个分支，默认分支 ${r.branches[0] || '-'}，耗时 ${r.latency_ms}ms`)
-    } else {
-      toast.error(`✗ 无法访问：${r.detail}。请确认地址正确、私有仓库已配好凭据。`)
-    }
-  } catch (e) {
-    toast.error(`探测失败：${(e as Error).message}`)
-  } finally { gitChecking.value = false }
-}
-
 async function refresh() {
   try {
     projects.value = (await api.listProjects()).items
@@ -171,15 +149,31 @@ async function refresh() {
 }
 
 async function create() {
-  if (form.value.source_type === 'git' && gitMode.value === 'import') {
-    if (!selectedRepo.value) { toast.error('请先从列表中选择一个仓库'); return }
-    if (!form.value.name.trim()) { toast.error('请填写项目名称'); return }
+  if (form.value.source_type === 'git') {
+    if (gitMode.value === 'import') {
+      if (!selectedRepos.value.length) { toast.error('请从列表中选择至少一个仓库（可多选）'); return }
+      if (!form.value.name.trim()) { toast.error('请填写项目名称'); return }
+    } else if (!form.value.git_repos.some(r => r.url.trim())) {
+      toast.error('请至少填写一个 Git 仓库地址'); return
+    }
   }
   creating.value = true
   try {
+    // 仓库列表：导入模式取自所选 GitLab 仓库（可多选），手动模式取表单（丢弃空行）
+    const repos: GitRepoRef[] = form.value.source_type === 'git' && gitMode.value === 'import'
+      ? selectedRepos.value.map(p => ({ url: (p.http_url_to_repo || p.web_url).trim(), note: '' }))
+      : form.value.git_repos.map(r => ({ url: r.url.trim(), note: r.note.trim() })).filter(r => r.url)
     const payload: Parameters<typeof api.createProject>[0] = {
-      ...form.value,
+      name: form.value.name.trim(),
+      description: form.value.description.trim(),
+      source_type: form.value.source_type,
+      git_repos: repos,
       git_auth_type: form.value.git_auth_type === NO_AUTH ? '' : form.value.git_auth_type,
+      ...(form.value.source_type === 'git' && form.value.git_auth_type === 'token' && form.value.git_token.trim()
+        ? { git_token: form.value.git_token.trim() } : {}),
+      default_test_targets: form.value.default_test_targets
+        .map(t => ({ url: t.url.trim(), note: t.note.trim() }))
+        .filter(t => t.url),
     }
     if (form.value.source_type === 'git' && gitMode.value === 'import') {
       // 凭据由后端从所选 Git 配置复制（令牌不回显，前端拿不到）
@@ -191,7 +185,7 @@ async function create() {
     toast.success('项目已创建')
     showCreate.value = false
     form.value = { ...emptyForm }
-    selectedRepo.value = null
+    selectedRepos.value = []
     gitProjects.value = []
     refresh()
   } catch (e) { toast.error((e as Error).message) } finally { creating.value = false }
@@ -201,13 +195,6 @@ function open(id: string) { location.hash = `#/project/${id}` }
 function fmtTime(iso: string | null) { return iso ? new Date(iso).toLocaleString('zh-CN', { hour12: false }) : '-' }
 
 const search = ref('')
-
-// 首页入口说明的三步流程
-const entrySteps = [
-  { no: 1, title: '创建项目', desc: '从 Git 配置导入仓库或手动填写地址，也可以直接上传代码压缩包。' },
-  { no: 2, title: '发起扫描', desc: '选择扫描档位与模型，可选填内网黑盒测试地址和自定义测试指令。' },
-  { no: 3, title: '查看报告', desc: '查看漏洞明细与 PoC，下载中文 PDF 报告与完整产物归档。' },
-]
 
 const activeProjects = computed(() => {
   const q = search.value.trim().toLowerCase()
@@ -223,55 +210,37 @@ async function restore(p: Project) {
   try { await api.unarchiveProject(p.id); toast.success(`项目「${p.name}」已恢复`); refresh() } catch (e) { toast.error((e as Error).message) }
 }
 
-onMounted(refresh)
+onMounted(() => {
+  refresh()
+  // 从欢迎页「新建项目开始」跳转而来（#/projects?create=1）时自动打开新建弹窗
+  if (location.hash.includes('create=1')) {
+    openCreate()
+    // 只清掉查询后缀，不产生新的历史记录（视图仍为 projects，无需触发路由变化）
+    history.replaceState(null, '', '#/projects')
+  }
+})
 </script>
 
 <template>
   <div>
-  <!-- 首页入口说明 -->
-  <section :class="cardLifted" class="relative mb-[18px] overflow-hidden p-7">
-    <!-- 氛围色块（仅装饰，不承载交互） -->
-    <div class="pointer-events-none absolute -top-20 -right-16 size-64 rounded-full bg-[#e55cff]/12 blur-3xl"></div>
-    <div class="pointer-events-none absolute -bottom-24 right-40 size-56 rounded-full bg-[#0099ff]/12 blur-3xl"></div>
-
-    <div class="relative">
-      <h1 class="max-w-2xl text-[30px] leading-tight font-bold text-text">
-        欢迎使用 <span class="text-accent">Strix</span>，三步完成一次内部安全测试
-      </h1>
-      <p class="mt-2.5 max-w-2xl text-[13.5px] leading-relaxed text-muted">
-        接入 Git 仓库或上传代码压缩包，由 AI 模型执行白盒代码审计与黑盒渗透测试，自动生成含漏洞明细、PoC 与修复建议的中文测试报告。
+  <!-- 页头 -->
+  <div class="mb-[18px] flex items-end gap-3">
+    <div>
+      <h1 class="text-[28px] leading-tight font-bold text-text">项目</h1>
+      <p class="mt-1 text-[13px] text-muted">
+        {{ props.user?.role === 'admin' ? '全部项目（含各用户创建）' : '你创建的项目' }}，创建后即可发起扫描；
+        完整操作步骤见<a href="#/welcome" class="cursor-pointer font-semibold text-accent hover:underline">使用指南</a>。
       </p>
-      <div class="mt-4.5 flex flex-wrap items-center gap-3">
-        <button :class="btn" @click="openCreate">新建项目开始</button>
-        <a
-          href="#/stats"
-          class="cursor-pointer rounded-lg bg-text px-5.5 py-2 text-sm font-semibold text-panel transition-opacity hover:opacity-90"
-        >查看统计汇总</a>
-        <a href="#/tasks" class="cursor-pointer text-sm font-semibold text-accent hover:underline">浏览全部任务 →</a>
-      </div>
-
-      <!-- 使用流程 -->
-      <div class="mt-6 grid gap-3.5 sm:grid-cols-3">
-        <div
-          v-for="step in entrySteps" :key="step.no"
-          class="rounded-xl border border-border bg-panel2/60 p-4"
-        >
-          <div class="flex size-7 items-center justify-center rounded-full bg-accent/12 text-[13px] font-bold text-accent">
-            {{ step.no }}
-          </div>
-          <div class="mt-2.5 text-sm font-semibold text-text">{{ step.title }}</div>
-          <p class="mt-1 text-xs leading-relaxed text-muted">{{ step.desc }}</p>
-        </div>
-      </div>
     </div>
-  </section>
+    <div class="flex-1"></div>
+    <button :class="btn" @click="openCreate">新建项目</button>
+  </div>
 
   <div :class="card">
     <div class="mb-3.5 flex items-center gap-2.5">
-      <h3 class="mb-0 text-sm font-semibold text-muted">项目（{{ props.user?.role === 'admin' ? '全部项目' : '我创建的项目' }}）</h3>
+      <h3 class="mb-0 text-sm font-semibold text-muted">项目列表（{{ activeProjects.length }}）</h3>
       <div class="flex-1"></div>
       <input v-model="search" type="text" placeholder="搜索项目 / 仓库 / 创建人" :class="[input, '!w-56']" />
-      <button :class="btn" @click="openCreate">新建项目</button>
     </div>
 
     <table v-if="activeProjects.length" class="w-full border-collapse">
@@ -419,7 +388,7 @@ onMounted(refresh)
                   <input v-model="repoSearch" type="text" placeholder="输入关键字过滤，如 app / api / web" :class="input" />
                 </div>
                 <div class="col-span-2">
-                  <label :class="label">选择仓库（{{ filteredRepos.length }} 个）</label>
+                  <label :class="label">选择仓库（{{ filteredRepos.length }} 个，已选 {{ selectedRepos.length }}，可多选）</label>
                   <div class="max-h-56 overflow-auto rounded-lg border border-border">
                     <div v-if="loadingRepos" class="px-3 py-4 text-center text-xs text-muted">正在从 Git 服务拉取仓库列表…</div>
                     <div v-else-if="!filteredRepos.length" class="px-3 py-4 text-center text-xs text-muted">
@@ -428,7 +397,7 @@ onMounted(refresh)
                     <div
                       v-for="p in filteredRepos" :key="p.id"
                       class="flex cursor-pointer items-center gap-2.5 border-b border-border px-3 py-2 last:border-b-0 hover:bg-panel2"
-                      :class="selectedRepo?.id === p.id ? 'bg-accent/10' : ''"
+                      :class="selectedRepos.some(x => x.id === p.id) ? 'bg-accent/10' : ''"
                       @click="pickRepo(p)"
                     >
                       <div class="min-w-0 flex-1">
@@ -445,6 +414,10 @@ onMounted(refresh)
                         <div>最近活跃</div>
                         <div>{{ fmtTime(p.last_activity_at || null).split(' ')[0] }}</div>
                       </div>
+                      <span
+                        class="shrink-0 w-5 text-center text-sm font-bold"
+                        :class="selectedRepos.some(x => x.id === p.id) ? 'text-accent' : 'text-transparent'"
+                      >✓</span>
                     </div>
                   </div>
                 </div>
@@ -453,18 +426,13 @@ onMounted(refresh)
               <!-- 方式二：手动输入 -->
               <template v-else>
                 <div class="col-span-2">
-                  <label :class="label">Git 仓库地址（白盒源码扫描）</label>
-                  <div class="flex gap-2">
-                    <input v-model="form.git_url" type="text" placeholder="https://git.company.internal/team/app-a.git" :class="input" />
-                    <button
-                      :class="btnGhost + ' !px-3 !py-1.5 !text-xs'"
-                      class="shrink-0 whitespace-nowrap"
-                      :disabled="gitChecking"
-                      @click="checkGitUrl"
-                    >
-                      {{ gitChecking ? '测试中…' : '测试访问' }}
-                    </button>
-                  </div>
+                  <RepoListField
+                    v-model="form.git_repos"
+                    label="Git 仓库（白盒源码扫描，可绑定多个）"
+                    hint="同一项目的全部仓库会在一次扫描中一起分析；私有仓库请在下方选择凭据后再逐个「测试访问」。"
+                    :auth-type="form.git_auth_type === 'token' ? 'token' : ''"
+                    :token="form.git_token"
+                  />
                 </div>
                 <div>
                   <label :class="label">访问凭据（私有仓库需要）</label>
@@ -489,10 +457,10 @@ onMounted(refresh)
             </template>
 
             <div class="col-span-2">
-              <TargetUrlField
-                v-model="form.default_test_url"
-                label="默认黑盒测试地址（可选，需内网测试环境）"
-                placeholder="https://app-a.test.company.internal"
+              <TargetListField
+                v-model="form.default_test_targets"
+                label="默认黑盒测试地址（可选，需内网测试环境；可添加多个并注明作用）"
+                hint="发起扫描任务时会预填这些地址，提交任务时可再增删。"
               />
             </div>
             <div class="col-span-2">

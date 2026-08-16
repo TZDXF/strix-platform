@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -10,10 +11,108 @@ from pathlib import Path
 
 MAX_FILES = 200_000
 CHUNK = 1024 * 1024
+# 单项目可绑定的仓库数上限
+MAX_REPOS = 10
 
 
 class SourceError(Exception):
     pass
+
+
+# ---- 多仓库列表（JSON [{"url", "note"}]）解析与清洗 ----
+
+
+def parse_repos(raw) -> list[dict]:
+    """解析仓库列表 JSON；容忍 JSON 字符串 / 已解出的 list / 其他脏数据，出错返回 []。"""
+    if isinstance(raw, str):
+        if not raw.strip():
+            return []
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return []
+    if not isinstance(raw, list):
+        return []
+    items: list[dict] = []
+    for it in raw:
+        if isinstance(it, str):
+            items.append({"url": it, "note": ""})
+        elif isinstance(it, dict):
+            items.append({"url": str(it.get("url") or ""), "note": str(it.get("note") or "")})
+    return items
+
+
+def dump_repos(items: list[dict]) -> str:
+    return json.dumps(items, ensure_ascii=False)
+
+
+def normalize_repos(items: list[dict]) -> tuple[list[dict], str]:
+    """清洗用户提交的仓库列表：去空白、丢弃空行、按 URL 去重、限制数量与说明长度。"""
+    cleaned: list[dict] = []
+    seen: set[str] = set()
+    for it in items:
+        url = str(it.get("url") or "").strip()
+        note = str(it.get("note") or "").strip()[:200]
+        if not url:
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        cleaned.append({"url": url, "note": note})
+    if len(cleaned) > MAX_REPOS:
+        return [], f"单个项目最多绑定 {MAX_REPOS} 个仓库"
+    return cleaned, ""
+
+
+def effective_repos(git_repos: str, legacy_url: str) -> list[dict]:
+    """读取侧合并：git_repos 列为非空字符串时即权威，否则回退旧版单仓库列（存量项目兼容）。"""
+    if git_repos and git_repos.strip():
+        return [r for r in parse_repos(git_repos) if r.get("url")]
+    url = (legacy_url or "").strip()
+    return [{"url": url, "note": ""}] if url else []
+
+
+def repo_dir_name(url: str, taken: set[str]) -> str:
+    """从仓库 URL 推导克隆子目录名（去 .git 后缀）；重名时追加序号。"""
+    name = re.split(r"[/:]", url.rstrip("/")).pop() or "repo"
+    if name.endswith(".git"):
+        name = name[: -len(".git")]
+    base, i = name, 1
+    while name in taken:
+        i += 1
+        name = f"{base}_{i}"
+    taken.add(name)
+    return name
+
+
+# ---- 任务侧：多仓库各自的扫描分支（JSON [{"url", "branch"}]） ----
+
+
+def parse_repo_branches(raw) -> list[dict]:
+    """解析任务的多仓库分支 JSON；坏数据返回 []。"""
+    if isinstance(raw, str):
+        if not raw.strip():
+            return []
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return []
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for it in raw:
+        if isinstance(it, dict):
+            out.append({"url": str(it.get("url") or ""), "branch": str(it.get("branch") or "")})
+    return out
+
+
+def effective_repo_branches(repo_branches: str, legacy_source_ref: str, legacy_branch: str) -> list[dict]:
+    """读取侧合并：repo_branches 列为非空字符串时即权威，否则回退旧版单仓库
+    （source_ref + branch，存量任务兼容）。"""
+    if repo_branches and repo_branches.strip():
+        return [r for r in parse_repo_branches(repo_branches) if r["url"]]
+    url = (legacy_source_ref or "").strip()
+    return [{"url": url, "branch": (legacy_branch or "").strip()}] if url else []
 
 
 def _git_env(extra: dict[str, str] | None = None) -> dict[str, str]:

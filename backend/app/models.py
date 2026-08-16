@@ -26,6 +26,8 @@ class User(Base):
     last_login_at = Column(DateTime(timezone=True), nullable=True)
     # 个人 AI 网关密钥（必填）：该用户发起的扫描与翻译用它调用 LLM 网关，平台不再持有统一密钥
     llm_api_key = Column(Text, default="")
+    # 通知邮箱（可选）：任务完成/失败时向该地址发送提醒邮件
+    email = Column(String(255), default="")
 
 
 class PlatformModel(Base):
@@ -49,11 +51,15 @@ class Project(Base):
     name = Column(String(128), nullable=False)
     description = Column(Text, default="")
     source_type = Column(String(8), default="git")  # git | zip
-    git_url = Column(Text, default="")
+    git_url = Column(Text, default="")  # 旧版单仓库地址（兼容存量数据，读取时回退用）
+    # 绑定的代码仓库列表：JSON [{"url": "...", "note": "用途说明"}]；非空字符串时优先生效
+    git_repos = Column(Text, default="")
     # 访问凭据（仅创建人/超管可写，接口永不回显明文）；仅支持 Personal Access Token
     git_auth_type = Column(String(8), default="")  # "" | token
     git_token = Column(Text, default="")  # PAT 明文（`token` 或 `user:token`），仅后端使用
-    default_test_url = Column(Text, default="")
+    default_test_url = Column(Text, default="")  # 旧版单地址（兼容存量数据，读取时回退用）
+    # 默认黑盒测试地址列表：JSON [{"url": "...", "note": "作用说明"}]；非空字符串时优先生效
+    default_test_targets = Column(Text, default="")
     is_archived = Column(Boolean, default=False)  # 归档（软删除）：数据保留，仅不能再发起新任务
     created_by = Column(Integer, ForeignKey("users.id"), index=True)
     created_at = Column(DateTime(timezone=True), default=_now)
@@ -103,10 +109,14 @@ class Task(Base):
     status = Column(String(16), default="pending", index=True)
     scan_mode = Column(String(16), default="quick")
     source_type = Column(String(8))  # git | zip
-    source_ref = Column(Text, default="")  # git URL 或上传文件名
-    branch = Column(String(255), default="")  # git 项目扫描分支
+    source_ref = Column(Text, default="")  # git URL（多仓库时为首个仓库）或上传文件名
+    branch = Column(String(255), default="")  # 旧版单仓库扫描分支（兼容存量任务）
+    # 多仓库各自的扫描分支：JSON [{"url": "...", "branch": ""}]；非空字符串时优先生效
+    repo_branches = Column(Text, default="")
     upload_id = Column(String(32), ForeignKey("project_uploads.id"), nullable=True)
-    test_url = Column(Text, default="")  # 用户提供的黑盒测试地址（可选）
+    test_url = Column(Text, default="")  # 旧版单地址（兼容存量任务，读取时回退用）
+    # 黑盒测试地址列表：JSON [{"url": "...", "note": "作用说明"}]；非空字符串时优先生效
+    test_targets = Column(Text, default="")
     instruction = Column(Text, default="")  # 用户自定义测试指令（--instruction，可选）
     report_lang = Column(String(8), default="zh")  # 固定中文报告；保留字段兼容历史 en 任务
     zh_status = Column(String(16), default="")  # 翻译状态："" | pending | done | failed
@@ -120,7 +130,11 @@ class Task(Base):
     timed_out = Column(Boolean, default=False)
     duration_sec = Column(Integer, nullable=True)
     total_tokens = Column(BigInteger, nullable=True)
+    input_tokens = Column(BigInteger, nullable=True)
+    output_tokens = Column(BigInteger, nullable=True)
     llm_requests = Column(Integer, nullable=True)
+    # JSON: [{agent_id, agent_name, model, requests, input/output/total_tokens, started_at, finished_at, status, parent}]
+    agents_usage = Column(Text, default="")
     findings_count = Column(Integer, default=0)
     severity_counts = Column(Text, default="")  # JSON: {"critical":n,...}
     artifacts_ref = Column(Text, default="")  # 本地 zip 路径 或 s3://key
@@ -155,6 +169,17 @@ class Finding(Base):
 
 
 Index("ix_findings_task_severity", Finding.task_id, Finding.severity)
+
+
+class SystemSetting(Base):
+    """系统设置（仅超管在「系统设置」页维护）：键值对存储，如 SMTP 邮件配置。"""
+
+    __tablename__ = "system_settings"
+
+    key = Column("key", String(64), primary_key=True)  # "key" 非保留字冲突，显式列名避免歧义
+    value = Column(Text, default="")
+    updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now)
+    updated_by = Column(Integer, ForeignKey("users.id"), nullable=True)
 
 
 class AuditEntry(Base):

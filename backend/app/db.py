@@ -39,9 +39,19 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
     ],
     "users": [
         ("llm_api_key", "TEXT DEFAULT ''"),
+        ("email", "VARCHAR(255) DEFAULT ''"),
     ],
     "projects": [
         ("is_archived", "BOOLEAN DEFAULT FALSE"),
+        ("default_test_targets", "TEXT DEFAULT ''"),
+        ("git_repos", "TEXT DEFAULT ''"),
+    ],
+    "tasks": [
+        ("input_tokens", "BIGINT"),
+        ("output_tokens", "BIGINT"),
+        ("agents_usage", "TEXT DEFAULT ''"),
+        ("test_targets", "TEXT DEFAULT ''"),
+        ("repo_branches", "TEXT DEFAULT ''"),
     ],
 }
 

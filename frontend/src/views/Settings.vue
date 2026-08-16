@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, onMounted } from 'vue'
 import {
   DialogRoot, DialogPortal, DialogOverlay, DialogContent, DialogTitle,
 } from 'reka-ui'
-import { api, updateStoredUser, type User, type PlatformModel, type GitConfig } from '../api'
+import { api, updateStoredUser, type User, type GitConfig } from '../api'
 import { toast } from '../toast'
 import { badge, btn, btnDanger, btnGhost, card, hint, h3, input, label, tableTd, tableTh } from '../ui'
 
@@ -15,6 +15,10 @@ const pwd = ref({ old: '', neo: '', confirm: '' })
 const savingKey = ref(false)
 const apiKey = ref('')
 const showKeyInput = ref(false)
+
+const emailInput = ref('')
+const showEmailInput = ref(false)
+const savingEmail = ref(false)
 
 async function refreshMe() {
   try {
@@ -55,6 +59,28 @@ async function removeKey() {
     updateStoredUser(me.value)
     showKeyInput.value = true
     toast.success('AI 密钥已清除。')
+  } catch (e) { toast.error((e as Error).message) }
+}
+
+async function saveEmail() {
+  const email = emailInput.value.trim()
+  if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) { toast.error('邮箱格式不正确'); return }
+  savingEmail.value = true
+  try {
+    me.value = await api.setEmail(email)
+    updateStoredUser(me.value)
+    emailInput.value = ''
+    showEmailInput.value = false
+    toast.success(email ? '通知邮箱已保存，任务结束时将收到提醒邮件。' : '通知邮箱已清除。')
+  } catch (e) { toast.error((e as Error).message) } finally { savingEmail.value = false }
+}
+
+async function clearEmail() {
+  if (!confirm('确定清除通知邮箱？清除后任务结束将不再发送提醒邮件。')) return
+  try {
+    me.value = await api.setEmail('')
+    updateStoredUser(me.value)
+    toast.success('通知邮箱已清除。')
   } catch (e) { toast.error((e as Error).message) }
 }
 
@@ -120,75 +146,8 @@ async function removeGitConfig(c: GitConfig) {
   } catch (e) { toast.error((e as Error).message) }
 }
 
-// ---- 平台模型管理（仅超管）----
-const isAdmin = computed(() => me.value?.role === 'admin')
-const models = ref<PlatformModel[]>([])
-const modelNames = computed(() => new Set(models.value.map((m) => m.name)))
-const discoverKey = ref('')
-const discovering = ref(false)
-const discovered = ref<string[]>([])
-const checked = ref<Record<string, boolean>>({})
-const defaultPick = ref('')
-const adding = ref(false)
-const modelBusy = ref(false)
-
-async function loadModels() {
-  if (!isAdmin.value) return
-  try {
-    models.value = (await api.listPlatformModels()).items
-  } catch (e) { toast.error((e as Error).message) }
-}
-
-async function discover() {
-  const key = discoverKey.value.trim()
-  if (!key) { toast.error('请先填写网关密钥'); return }
-  discovering.value = true
-  try {
-    discovered.value = (await api.discoverModels(key)).items
-    checked.value = {}
-    defaultPick.value = ''
-    if (discovered.value.length) toast.info(`查询到 ${discovered.value.length} 个可用模型，勾选后加入平台。`)
-    else toast.info('网关未返回任何模型。')
-  } catch (e) { toast.error((e as Error).message) } finally { discovering.value = false }
-}
-
-const checkedNames = computed(() => discovered.value.filter((n) => checked.value[n]))
-
-async function addSelected() {
-  const names = checkedNames.value
-  if (!names.length) { toast.error('请先勾选要添加的模型'); return }
-  adding.value = true
-  try {
-    const res = await api.addModels(names, defaultPick.value || undefined)
-    models.value = res.items
-    discovered.value = discovered.value.filter((n) => !res.items.some((m) => m.name === n))
-    checked.value = {}
-    defaultPick.value = ''
-    toast.success(`已添加 ${names.length} 个模型。`)
-  } catch (e) { toast.error((e as Error).message) } finally { adding.value = false }
-}
-
-async function setDefault(m: PlatformModel) {
-  try {
-    await api.setDefaultModel(m.id)
-    await loadModels()
-    toast.success(`已将「${m.name}」设为平台默认模型。`)
-  } catch (e) { toast.error((e as Error).message) }
-}
-
-async function removeModel(m: PlatformModel) {
-  if (!confirm(`确定从平台移除模型「${m.name}」？移除后用户将无法在选择该模型发起任务。`)) return
-  modelBusy.value = true
-  try {
-    await api.deleteModel(m.id)
-    await loadModels()
-    toast.success(`已移除「${m.name}」。`)
-  } catch (e) { toast.error((e as Error).message) } finally { modelBusy.value = false }
-}
-
 onMounted(() => {
   refreshMe()
-  loadModels()
   loadGitConfigs()
 })
 </script>
@@ -267,6 +226,32 @@ onMounted(() => {
       </div>
     </div>
 
+    <!-- 通知邮箱 -->
+    <div :class="card">
+      <h3 :class="h3">通知邮箱（任务提醒）</h3>
+      <div class="mt-2 flex items-center gap-2.5">
+        <span :class="badge + (me?.email ? ' bg-ok/15 text-ok' : ' bg-border/30 text-muted')">
+          {{ me?.email || '未设置' }}
+        </span>
+        <div class="flex-1"></div>
+        <template v-if="me?.email">
+          <button :class="btnGhost" @click="showEmailInput = !showEmailInput">{{ showEmailInput ? '取消' : '更换邮箱' }}</button>
+          <button :class="btnDanger" @click="clearEmail">清除邮箱</button>
+        </template>
+        <button v-else :class="btnGhost" @click="showEmailInput = true">设置邮箱</button>
+      </div>
+      <p :class="hint">扫描任务完成或失败时，平台将向该邮箱发送提醒邮件；需管理员先在「系统设置」中配置邮件服务。</p>
+      <div v-if="showEmailInput" class="mt-3 grid max-w-[520px] gap-3.5">
+        <div>
+          <label :class="label">通知邮箱</label>
+          <input v-model="emailInput" type="email" placeholder="you@example.com" :class="input" @keyup.enter="saveEmail" />
+        </div>
+        <div>
+          <button :class="btn" :disabled="savingEmail" @click="saveEmail">{{ savingEmail ? '保存中…' : '保存邮箱' }}</button>
+        </div>
+      </div>
+    </div>
+
     <!-- 个人 Git 配置（GitLab） -->
     <div :class="card">
       <h3 :class="h3">Git 配置（GitLab）</h3>
@@ -338,77 +323,5 @@ onMounted(() => {
         </DialogContent>
       </DialogPortal>
     </DialogRoot>
-
-    <!-- 平台模型管理（仅超管） -->
-    <div v-if="isAdmin" :class="card">
-      <h3 :class="h3">平台模型管理（超管）</h3>
-
-      <!-- 第一步：密钥查询 -->
-      <div class="mt-3 flex max-w-[640px] items-end gap-2.5">
-        <div class="flex-1">
-          <label :class="label">网关密钥（API Key）</label>
-          <input
-            v-model="discoverKey" type="password" placeholder="sk-…"
-            class="w-full rounded-md border border-border bg-panel2 px-2.5 py-2 text-[13.5px] text-text outline-none focus:border-accent"
-            @keyup.enter="discover"
-          />
-        </div>
-        <button :class="btn" :disabled="discovering" @click="discover">{{ discovering ? '查询中…' : '查询模型' }}</button>
-      </div>
-
-      <!-- 第二步：勾选添加 -->
-      <div v-if="discovered.length" class="mt-3.5">
-        <div class="max-h-56 overflow-auto rounded-lg border border-border">
-          <div
-            v-for="name in discovered" :key="name"
-            class="flex items-center gap-2.5 border-b border-border px-3 py-2 last:border-b-0 hover:bg-panel2"
-          >
-            <label class="flex flex-1 cursor-pointer items-center gap-2.5" :class="modelNames.has(name) ? 'pointer-events-none opacity-60' : ''">
-              <input v-model="checked[name]" type="checkbox" class="accent-accent" :disabled="modelNames.has(name)" />
-              <span class="font-mono text-[13px]">{{ name }}</span>
-            </label>
-            <span v-if="modelNames.has(name)" :class="badge + ' bg-ok/15 text-ok'">已添加</span>
-            <label v-else class="flex cursor-pointer items-center gap-1 text-xs text-muted">
-              <input v-model="defaultPick" :value="name" type="radio" class="accent-accent" /> 设为默认
-            </label>
-          </div>
-        </div>
-        <div class="mt-2.5 flex items-center gap-2.5">
-          <button :class="btn" :disabled="adding || !checkedNames.length" @click="addSelected">
-            {{ adding ? '添加中…' : `添加所选（${checkedNames.length}）` }}
-          </button>
-          <span v-if="defaultPick" class="text-xs text-muted">默认模型：{{ defaultPick }}</span>
-        </div>
-      </div>
-
-      <!-- 当前列表 -->
-      <div class="mt-4">
-        <div class="mb-1.5 text-[12.5px] text-muted">平台当前可用模型：</div>
-        <div v-if="!models.length" :class="hint">暂无模型；请先通过密钥查询并添加，否则用户无法提交任务。</div>
-        <table v-else class="w-full border-collapse">
-          <thead>
-            <tr>
-              <th :class="tableTh">模型</th>
-              <th :class="tableTh">默认</th>
-              <th :class="tableTh">添加时间</th>
-              <th :class="tableTh"></th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="m in models" :key="m.id">
-              <td :class="tableTd"><span class="font-mono text-[13px]">{{ m.name }}</span></td>
-              <td :class="tableTd">
-                <span v-if="m.is_default" :class="badge + ' bg-accent/15 text-accent'">默认</span>
-                <button v-else :class="btnGhost + ' !px-3 !py-1 !text-xs'" @click="setDefault(m)">设为默认</button>
-              </td>
-              <td :class="tableTd + ' text-muted'">{{ fmtTime(m.created_at) }}</td>
-              <td :class="tableTd + ' text-right'">
-                <button :class="btnDanger + ' !px-3 !py-1 !text-xs'" :disabled="modelBusy" @click="removeModel(m)">移除</button>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
   </div>
 </template>

@@ -17,6 +17,7 @@ backend/    FastAPI + Celery + SQLAlchemy
               ├─ app/auth.py      账号体系（PBKDF2 口令 + HMAC 签名令牌）
               ├─ app/tasks.py     流水线：fetch → scan → parse → archive → translate
               ├─ app/translate.py 中文报告兜底翻译（LLM 网关）
+              ├─ app/mailer.py    邮件提醒（SMTP 配置存库 + 任务完成/失败通知）
               └─ app/runner.py    strix 子进程执行器（失败自动重试）
 docker-compose.yml  postgres + redis + rustfs + api + worker + frontend
 ```
@@ -36,6 +37,10 @@ docker-compose.yml  postgres + redis + rustfs + api + worker + frontend
 6. **报告页**：对齐 `strix view` 官方报告结构——严重级别概览网格（严重/高危/中危/低危/提示）、
    官方执行摘要报告（`penetration_test_report.md`，Markdown 渲染）、逐条漏洞明细
    （彩色级别条 / CVSS / CWE / PoC 说明与脚本）。
+7. **系统设置页（仅超管）**：集中管理平台级配置——平台模型管理（网关密钥查询可用模型后加入平台、
+   指定默认模型）与邮件提醒（SMTP 服务器/端口/加密方式/发件人，可真实发送测试邮件验证连通）。
+8. **邮件提醒**：超管在「系统设置」配置 SMTP 后，扫描任务完成/失败时平台自动向创建者
+   在「个人设置」填写的通知邮箱发送结果摘要邮件（严重度分布、耗时、失败原因、任务链接）。
 
 ## 本地开发
 
@@ -84,17 +89,10 @@ cd frontend && npm install && npm run dev   # http://localhost:5173
    docker compose up -d --build
    ```
 
-3. **创建 RustFS 桶**（一次性；不创建则任务归档阶段报 `NoSuchBucket`，不影响扫描结果）：
+   RustFS 归档桶由 api 启动时自动创建（`ensure_bucket`，等待 RustFS 就绪并幂等），
+   上传时若桶仍缺失还会现场补建一次，无需手动操作。
 
-   ```bash
-   docker compose exec api python -c "
-   import boto3, os
-   c = boto3.client('s3', endpoint_url=os.environ['S3_ENDPOINT'],
-       aws_access_key_id=os.environ['S3_ACCESS_KEY'], aws_secret_access_key=os.environ['S3_SECRET_KEY'])
-   c.create_bucket(Bucket=os.environ['S3_BUCKET'])"
-   ```
-
-4. **验证部署**：
+3. **验证部署**：
 
    ```bash
    # worker 内 docker CLI 可达宿主机 daemon（strix 沙箱依赖，失败则扫描秒退）
@@ -102,7 +100,7 @@ cd frontend && npm install && npm run dev   # http://localhost:5173
    docker compose ps        # 六个服务均 Up / healthy
    ```
 
-5. 访问 `http://<server>/`，用 `admin` / `ADMIN_INITIAL_PASSWORD` 登录，
+4. 访问 `http://<server>/`，用 `admin` / `ADMIN_INITIAL_PASSWORD` 登录，
    在「用户管理」给同事开号后**立即修改默认密码**。
 
 ### 升级
@@ -117,8 +115,9 @@ docker compose up -d --build     # 仅重建有变化的镜像，数据卷（pg/
 | 现象 | 原因与处理 |
 |------|-----------|
 | 任务日志含 `DOCKER NOT INSTALLED`，秒退退出码 1 | worker 容器内无 `docker` CLI 或未挂载 docker.sock。镜像已内置 `docker-cli`（见 `backend/Dockerfile`），若仍出现请确认 compose 中 worker 挂载了 `/var/run/docker.sock`，并重新 `docker compose build worker && docker compose up -d worker` |
-| 归档阶段 `NoSuchBucket` | RustFS 桶未创建，执行上文第 3 步 |
+| 归档阶段 `NoSuchBucket` | 正常部署不会出现（api 启动与上传时均自动建桶）；若出现多为 RustFS 密钥与 `.env` 不一致，或 api 启动日志中有 `[startup] S3 归档桶不可用`，检查 `RUSTFS_*` 配置后重启 api |
 | 首个任务卡在 scanning 很久 | 首次扫描需拉取沙箱镜像，可在宿主机预拉取：`docker pull ghcr.io/usestrix/strix-sandbox:<tag>` |
+| 任务日志含 `invalid mount config ... bind source path does not exist`，秒退退出码 1 | 沙箱容器的 bind mount 由宿主 daemon 解析路径，worker 容器内的工作区路径在宿主机不存在。Docker Desktop 下需把工作区 bind 到 VM 可见路径（`.env` 中 `WORKSPACE_CONTAINER_ROOT=/run/desktop/mnt/host/<盘符>/...`）；原生 Linux 下把 `WORKSPACE_HOST_DIR` 与 `WORKSPACE_CONTAINER_ROOT` 设为同一宿主绝对路径 |
 | `SECRET_KEY` / `LLM_API_BASE` 启动报错 | `.env` 未填写必填项，对照 `.env.deploy.example` |
 
 > Worker 挂载了 `/var/run/docker.sock`（strix 沙箱通过宿主机 Docker 启动分析容器，镜像内已安装 docker-cli）。
@@ -155,6 +154,8 @@ docker compose up -d --build     # 仅重建有变化的镜像，数据卷（pg/
 4. 任务列表实时刷新状态：`pending → fetching → scanning → parsing → (translating) → done/failed`。
 5. 报告页查看：严重级别概览 + 漏洞明细（可展开 PoC）+ 官方执行摘要；可导出 PDF、下载产物 zip
    （漏洞 JSON/CSV/MD、SARIF、执行日志）。
+6. （可选）超管在「系统设置」配置邮件提醒（SMTP），用户在「个人设置 → 通知邮箱」填写收件地址；
+   任务完成或失败时会自动收到提醒邮件。
 
 ## 安全护栏
 

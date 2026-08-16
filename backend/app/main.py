@@ -30,10 +30,31 @@ from .config import get_settings
 from .db import get_db, init_db
 from .gitlab import GitLabError, list_projects as gitlab_list_projects, normalize_base_url, same_host, verify_token
 from .llm_models import default_model, discover_models, platform_models, seed_platform_models, valid_model_name
+from .mailer import (
+    K_FROM, K_HOST, K_NOTIFY_DONE, K_NOTIFY_FAILED, K_PASSWORD, K_PORT,
+    K_SENDER_NAME, K_SITE_URL, K_SSL, K_USE_TLS, K_USER,
+    get_mail_settings, mail_configured, mail_settings_public, send_mail, set_mail_settings,
+)
 from .models import AuditEntry, Finding, GitConfig, PlatformModel, Project, ProjectUpload, Task, User
 from .runner import read_run_artifacts  # noqa: F401（契约复用说明）
-from .sources import SourceError, list_branches
-from .targets import check_target_allowed, probe_target
+from .sources import (
+    SourceError,
+    dump_repos,
+    effective_repo_branches,
+    effective_repos,
+    list_branches,
+    normalize_repos,
+    parse_repo_branches,
+    parse_repos,
+)
+from .targets import (
+    check_target_allowed,
+    dump_targets,
+    effective_targets,
+    normalize_targets,
+    parse_targets,
+    probe_target,
+)
 from .tasks import new_task_id, run_scan
 
 settings = get_settings()
@@ -108,6 +129,7 @@ def _user_out(u: User) -> dict:
         "created_at": u.created_at.isoformat() if u.created_at else None,
         "last_login_at": u.last_login_at.isoformat() if u.last_login_at else None,
         "has_llm_key": bool(u.llm_api_key),
+        "email": u.email or "",
     }
 
 
@@ -161,6 +183,22 @@ def clear_llm_key(request: Request, db: Session = Depends(get_db), user: User = 
     user.llm_api_key = ""
     db.commit()
     _audit(db, request, "me.llm_key_clear", f"username={user.username}", user=user)
+    return _user_out(user)
+
+
+class EmailBody(BaseModel):
+    email: str
+
+
+@app.put("/api/me/email", dependencies=[Depends(require_user)])
+def set_notification_email(body: EmailBody, request: Request, db: Session = Depends(get_db), user: User = Depends(require_user)):
+    """设置/清除个人通知邮箱：任务完成或失败时向该地址发送提醒邮件（需超管先在系统设置中配置 SMTP）。"""
+    email = body.email.strip()
+    if email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(400, "邮箱格式不正确")
+    user.email = email
+    db.commit()
+    _audit(db, request, "me.email_set" if email else "me.email_clear", f"username={user.username} email={email or '-'}", user=user)
     return _user_out(user)
 
 
@@ -394,6 +432,94 @@ def admin_delete_model(
     return {"ok": True}
 
 
+# ===================== 系统设置：邮件提醒（仅超管） =====================
+
+
+class MailSettingsBody(BaseModel):
+    smtp_host: str
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""  # 留空 = 保持已有密码不变
+    clear_password: bool = False  # 显式清除已保存的密码
+    smtp_use_tls: bool = True  # STARTTLS（常见 587）
+    smtp_ssl: bool = False  # SMTPS 直连 TLS（常见 465），与 STARTTLS 互斥
+    mail_from: str = ""  # 发件人邮箱；留空用 SMTP 用户名
+    mail_sender_name: str = ""  # 发件人显示名；留空用「Strix 平台」
+    site_url: str = ""  # 平台访问地址，用于拼接邮件里的任务链接
+    notify_done: bool = True  # 任务完成时通知
+    notify_failed: bool = True  # 任务失败时通知
+
+
+@app.get("/api/admin/mail-settings", dependencies=[Depends(require_admin)])
+def admin_get_mail_settings(db: Session = Depends(get_db)):
+    return mail_settings_public(db)
+
+
+@app.put("/api/admin/mail-settings", dependencies=[Depends(require_admin)])
+def admin_save_mail_settings(
+    body: MailSettingsBody, request: Request,
+    db: Session = Depends(get_db), admin: User = Depends(require_admin),
+):
+    host = body.smtp_host.strip()
+    if host:
+        if not 1 <= body.smtp_port <= 65535:
+            raise HTTPException(400, "SMTP 端口需在 1-65535 之间")
+        if body.smtp_ssl and body.smtp_use_tls:
+            raise HTTPException(400, "SMTPS（465）与 STARTTLS（587）只能选一种加密方式")
+    if len(body.smtp_password) > 256:
+        raise HTTPException(400, "SMTP 密码过长")
+    current = get_mail_settings(db)
+    password = "" if body.clear_password else (body.smtp_password or current[K_PASSWORD])
+
+    set_mail_settings(db, {
+        K_HOST: host,
+        K_PORT: str(body.smtp_port),
+        K_USER: body.smtp_user.strip(),
+        K_PASSWORD: password,
+        K_USE_TLS: "1" if body.smtp_use_tls and not body.smtp_ssl else "0",
+        K_SSL: "1" if body.smtp_ssl else "0",
+        K_FROM: body.mail_from.strip(),
+        K_SENDER_NAME: body.mail_sender_name.strip(),
+        K_SITE_URL: body.site_url.strip(),
+        K_NOTIFY_DONE: "1" if body.notify_done else "0",
+        K_NOTIFY_FAILED: "1" if body.notify_failed else "0",
+    }, user_id=admin.id)
+    _audit(db, request, "mail.settings_save", f"host={host or '-'} port={body.smtp_port} ssl={body.smtp_ssl}", user=admin)
+    return mail_settings_public(db)
+
+
+class MailTestBody(BaseModel):
+    to: str
+
+
+@app.post("/api/admin/mail-settings/test", dependencies=[Depends(require_admin)])
+def admin_test_mail_settings(
+    body: MailTestBody, request: Request,
+    db: Session = Depends(get_db), admin: User = Depends(require_admin),
+):
+    """用已保存的配置真实发送一封测试邮件，验证 SMTP 连通性。"""
+    to = body.to.strip()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", to):
+        raise HTTPException(400, "收件邮箱格式不正确")
+    s = get_mail_settings(db)
+    if not mail_configured(s):
+        raise HTTPException(400, "请先保存 SMTP 服务器配置")
+    sender = s.get(K_FROM, "").strip() or s.get(K_USER, "")
+    html = (
+        '<div style="font-family:sans-serif;max-width:520px;">'
+        '<p style="font-size:16px;font-weight:700;color:#2e9e5b;">测试邮件</p>'
+        "<p>这是一封来自 Strix 安全测试平台的测试邮件；收到它说明邮件提醒配置正确，"
+        "任务完成/失败时将向用户设置的通知邮箱发送提醒。</p>"
+        "</div>"
+    )
+    try:
+        send_mail(s, to, "[Strix] 邮件提醒配置测试", html)
+    except Exception as exc:  # noqa: BLE001 —— 把 SMTP 报错原样反馈给管理员
+        raise HTTPException(400, f"发送失败：{exc}")
+    _audit(db, request, "mail.settings_test", f"to={to} from={sender}", user=admin)
+    return {"ok": True, "detail": f"测试邮件已发送至 {to}"}
+
+
 # ===================== 个人 Git 配置（GitLab） =====================
 
 
@@ -517,16 +643,20 @@ def _project_out(p: Project, db: Session) -> dict:
     tasks_count = db.execute(select(func.count(Task.id)).where(Task.project_id == p.id)).scalar() or 0
     uploads_count = db.execute(select(func.count(ProjectUpload.id)).where(ProjectUpload.project_id == p.id)).scalar() or 0
     creator = db.get(User, p.created_by) if p.created_by else None
+    targets = effective_targets(p.default_test_targets, p.default_test_url)
+    repos = effective_repos(p.git_repos, p.git_url)
     return {
         "id": p.id,
         "name": p.name,
         "description": p.description or "",
         "source_type": p.source_type,
-        "git_url": p.git_url or "",
+        "git_url": repos[0]["url"] if repos else "",  # 兼容旧字段：首个仓库
+        "git_repos": repos,
         # 仅支持 PAT；存量 ssh 配置一律视为未配置凭据
         "git_auth_type": "token" if p.git_auth_type == "token" else "",
         "has_credentials": bool(p.git_token),
-        "default_test_url": p.default_test_url or "",
+        "default_test_url": targets[0]["url"] if targets else "",  # 兼容旧字段：首个地址
+        "default_test_targets": targets,
         "is_archived": bool(p.is_archived),
         "created_by": p.created_by,
         "created_by_name": creator.username if creator else "-",
@@ -543,6 +673,18 @@ def _get_project_checked(db: Session, project_id: str, user: User) -> Project:
     if user.role != "admin" and project.created_by != user.id:
         raise HTTPException(403, "无权访问该项目")
     return project
+
+
+def _checked_targets(raw) -> list[dict]:
+    """多目标入口共用：清洗 + 数量上限 + 逐个过黑盒地址允许清单；不通过直接 400。"""
+    targets, err = normalize_targets(parse_targets(raw))
+    if err:
+        raise HTTPException(400, err)
+    for t in targets:
+        ok, reason = check_target_allowed(t["url"])
+        if not ok:
+            raise HTTPException(400, reason)
+    return targets
 
 
 @app.get("/api/projects", dependencies=[Depends(require_user)])
@@ -562,7 +704,9 @@ class ProjectCreateBody(BaseModel):
     git_auth_type: str = ""
     git_token: str = ""
     git_config_id: str = ""  # 从个人 Git 配置导入时填写：凭据取自该配置
-    default_test_url: str = ""
+    git_repos: str | list | None = None  # 绑定的仓库列表：JSON 字符串或 [{"url","note"}]
+    default_test_url: str = ""  # 旧版单地址（兼容旧客户端）
+    default_test_targets: str | list | None = None  # 多目标列表：JSON 字符串或 [{"url","note"}]
 
 
 @app.post("/api/projects", dependencies=[Depends(require_user)])
@@ -574,28 +718,44 @@ def create_project(body: ProjectCreateBody, request: Request, user: User = Depen
         raise HTTPException(400, "source_type 必须是 git 或 zip")
     git_auth_type = body.git_auth_type
     git_token = body.git_token.strip()
+    repos: list[dict] = []
     if body.source_type == "git":
-        if not body.git_url.strip():
-            raise HTTPException(400, "Git 项目必须填写仓库地址")
+        # 仓库列表：git_repos 优先（可绑定多个），旧 git_url 单仓库兼容
+        if body.git_repos is not None:
+            repos, err = normalize_repos(parse_repos(body.git_repos))
+        elif body.git_url.strip():
+            repos, err = normalize_repos([{"url": body.git_url, "note": ""}])
+        else:
+            repos, err = [], ""
+        if err:
+            raise HTTPException(400, err)
+        if not repos:
+            raise HTTPException(400, "Git 项目必须至少绑定一个仓库")
         if git_auth_type not in ("", "token"):
             raise HTTPException(400, "git_auth_type 必须是 token / 留空（仅支持 Personal Access Token）")
         if git_auth_type == "token" and not git_token:
             raise HTTPException(400, "选择 token 认证时必须填写 token")
         if body.git_config_id:
-            # 从个人 Git 配置导入：校验归属与服务地址，凭据复制自配置
+            # 从个人 Git 配置导入：校验归属与服务地址（每个仓库都须与配置同域），凭据复制自配置
             config = _get_git_config_checked(db, body.git_config_id, user)
-            if not same_host(config.base_url, body.git_url):
-                raise HTTPException(400, "仓库地址与所选 Git 配置的服务地址不一致")
+            for r in repos:
+                if not same_host(config.base_url, r["url"]):
+                    raise HTTPException(400, f"仓库 {r['url']} 与所选 Git 配置的服务地址不一致")
             git_auth_type, git_token = "token", config.token
-    if body.default_test_url:
-        ok, reason = check_target_allowed(body.default_test_url)
-        if not ok:
-            raise HTTPException(400, reason)
+    if body.default_test_targets is not None:
+        default_targets = _checked_targets(body.default_test_targets)
+    elif body.default_test_url:
+        default_targets = _checked_targets([{"url": body.default_test_url, "note": ""}])
+    else:
+        default_targets = []
     project = Project(
         id=uuid.uuid4().hex, name=name, description=body.description.strip()[:2000],
-        source_type=body.source_type, git_url=body.git_url.strip(),
+        source_type=body.source_type,
+        git_url=repos[0]["url"] if repos else "",
+        git_repos=dump_repos(repos),
         git_auth_type=git_auth_type, git_token=git_token,
-        default_test_url=body.default_test_url.strip(),
+        default_test_url=default_targets[0]["url"] if default_targets else "",
+        default_test_targets=dump_targets(default_targets),
         created_by=user.id,
     )
     db.add(project)
@@ -607,10 +767,12 @@ def create_project(body: ProjectCreateBody, request: Request, user: User = Depen
 class ProjectPatchBody(BaseModel):
     name: str = ""
     description: str = ""
-    git_url: str = ""
+    git_url: str = ""  # 旧版单仓库（兼容旧客户端，仅在未提交列表时生效）
+    git_repos: str | list | None = None  # 仓库列表：None=不修改；否则全量替换
     git_auth_type: str | None = None  # None=不修改，""=清除凭据
     git_token: str = ""
-    default_test_url: str = ""
+    default_test_url: str = ""  # 旧版单地址（兼容旧客户端，仅在未提交列表时生效）
+    default_test_targets: str | list | None = None  # None=不修改；否则全量替换（含空列表=清空）
 
 
 @app.patch("/api/projects/{project_id}", dependencies=[Depends(require_user)])
@@ -620,13 +782,25 @@ def patch_project(project_id: str, body: ProjectPatchBody, request: Request, use
         project.name = body.name.strip()[:128]
     if body.description:
         project.description = body.description.strip()[:2000]
-    if body.git_url:
+    if body.git_repos is not None:
+        repos, err = normalize_repos(parse_repos(body.git_repos))
+        if err:
+            raise HTTPException(400, err)
+        if project.source_type == "git" and not repos:
+            raise HTTPException(400, "Git 项目必须至少保留一个仓库")
+        project.git_repos = dump_repos(repos)
+        project.git_url = repos[0]["url"] if repos else ""
+    elif body.git_url and body.git_url.strip():
         project.git_url = body.git_url.strip()
-    if body.default_test_url:
-        ok, reason = check_target_allowed(body.default_test_url)
-        if not ok:
-            raise HTTPException(400, reason)
-        project.default_test_url = body.default_test_url.strip()
+        project.git_repos = dump_repos([{"url": body.git_url.strip(), "note": ""}])
+    if body.default_test_targets is not None:
+        targets = _checked_targets(body.default_test_targets)
+        project.default_test_targets = dump_targets(targets)
+        project.default_test_url = targets[0]["url"] if targets else ""
+    elif body.default_test_url:
+        targets = _checked_targets([{"url": body.default_test_url, "note": ""}])
+        project.default_test_url = targets[0]["url"]
+        project.default_test_targets = dump_targets(targets)
     if body.git_auth_type is not None:
         if body.git_auth_type not in ("", "token"):
             raise HTTPException(400, "git_auth_type 必须是 token / 留空（仅支持 Personal Access Token）")
@@ -692,13 +866,23 @@ def project_detail(project_id: str, user: User = Depends(require_user), db: Sess
 
 
 @app.get("/api/projects/{project_id}/branches", dependencies=[Depends(require_user)])
-def project_branches(project_id: str, user: User = Depends(require_user), db: Session = Depends(get_db)):
+def project_branches(project_id: str, repo_url: str = "", user: User = Depends(require_user), db: Session = Depends(get_db)):
+    """列分支；repo_url 指定多仓库项目中的某个仓库（须在绑定列表内），缺省为首个仓库。"""
     project = _get_project_checked(db, project_id, user)
     if project.source_type != "git":
         raise HTTPException(400, "仅 Git 项目支持分支选择")
+    repos = effective_repos(project.git_repos, project.git_url)
+    if not repos:
+        raise HTTPException(400, "项目未绑定仓库")
+    if repo_url:
+        if repo_url not in {r["url"] for r in repos}:
+            raise HTTPException(400, "仓库不在项目绑定列表内")
+        url = repo_url
+    else:
+        url = repos[0]["url"]
     try:
         branches = list_branches(
-            project.git_url, auth_type=project.git_auth_type,
+            url, auth_type=project.git_auth_type,
             token=project.git_token,
         )
     except SourceError as exc:
@@ -782,6 +966,7 @@ def delete_upload(project_id: str, upload_id: str, request: Request, user: User 
 def _task_summary(t: Task, db: Session) -> dict:
     project = db.get(Project, t.project_id) if t.project_id else None
     creator = db.get(User, t.created_by) if t.created_by else None
+    targets = effective_targets(t.test_targets, t.test_url)
     return {
         "id": t.id,
         "project_id": t.project_id,
@@ -794,7 +979,11 @@ def _task_summary(t: Task, db: Session) -> dict:
         "source_type": t.source_type,
         "source_ref": t.source_ref,
         "branch": t.branch or "",
-        "test_url": t.test_url,
+        "repo_branches": effective_repo_branches(
+            t.repo_branches, t.source_ref if t.source_type == "git" else "", t.branch or "",
+        ),
+        "test_url": targets[0]["url"] if targets else "",  # 兼容旧字段：首个地址
+        "test_targets": targets,
         "instruction": t.instruction or "",
         "report_lang": t.report_lang,
         "zh_status": t.zh_status or "",
@@ -877,10 +1066,12 @@ async def create_task(
     request: Request,
     db: Session = Depends(get_db),
     scan_mode: str = Form("quick"),
-    test_url: str = Form(""),
+    test_url: str = Form(""),  # 旧版单地址（兼容旧客户端）
+    test_targets: str = Form(""),  # 多目标列表：JSON [{"url","note"}]
     instruction: str = Form(""),
     model: str = Form(""),
-    branch: str = Form(""),
+    branch: str = Form(""),  # 旧版单仓库分支（兼容旧客户端）
+    repo_branches: str = Form(""),  # 多仓库各自分支：JSON [{"url","branch"}]
     upload_id: str = Form(""),
     file: UploadFile | None = File(default=None),
     user: User = Depends(require_user),
@@ -903,11 +1094,13 @@ async def create_task(
     elif not platform_models(db):
         raise HTTPException(400, "平台尚未配置可用模型，请联系超管在「设置」中添加")
 
-    # 黑盒目标允许清单校验
-    if test_url:
-        ok, reason = check_target_allowed(test_url)
-        if not ok:
-            raise HTTPException(400, reason)
+    # 黑盒目标允许清单校验（多目标逐个校验；test_targets 优先，旧 test_url 兼容）
+    if test_targets.strip():
+        targets = _checked_targets(test_targets)
+    elif test_url:
+        targets = _checked_targets([{"url": test_url, "note": ""}])
+    else:
+        targets = []
 
     # 自定义测试指令（透传 strix --instruction）
     instruction = instruction.strip()
@@ -917,11 +1110,32 @@ async def create_task(
     task_id = new_task_id()
     upload_ref: ProjectUpload | None = None
     branch = (branch or "").strip()
+    repo_refs: list[dict] = []  # [{"url","branch"}]：git 任务实际扫描的仓库与分支
     if project.source_type == "git":
         source_type = "git"
-        source_ref = project.git_url
-        if branch and not re.fullmatch(r"[A-Za-z0-9._/-]+", branch):
-            raise HTTPException(400, "branch 不合法")
+        repos = effective_repos(project.git_repos, project.git_url)
+        if not repos:
+            raise HTTPException(400, "项目未绑定仓库")
+        if repo_branches.strip():
+            # 新前端提交：逐仓库分支；URL 必须在项目绑定列表内，分支名做白名单校验
+            repo_refs = parse_repo_branches(repo_branches)
+            if not repo_refs:
+                raise HTTPException(400, "repo_branches 格式不合法")
+            bound = {r["url"] for r in repos}
+            for r in repo_refs:
+                if r["url"] not in bound:
+                    raise HTTPException(400, f"仓库 {r['url']} 不在项目绑定列表内")
+                if r["branch"] and not re.fullmatch(r"[A-Za-z0-9._/-]+", r["branch"]):
+                    raise HTTPException(400, f"仓库 {r['url']} 的分支名不合法")
+        else:
+            if branch and not re.fullmatch(r"[A-Za-z0-9._/-]+", branch):
+                raise HTTPException(400, "branch 不合法")
+            # 未提交列表：按项目当前仓库展开（单仓库沿用旧 branch 字段，多仓库各用默认分支）
+            repo_refs = [
+                {"url": r["url"], "branch": branch if len(repos) == 1 and branch else ""}
+                for r in repos
+            ]
+        source_ref = repo_refs[0]["url"]
     else:
         source_type = "zip"
         if file is not None and file.filename:
@@ -939,16 +1153,20 @@ async def create_task(
     task = Task(
         id=task_id, project_id=project_id, created_by=user.id,
         scan_mode=scan_mode, source_type=source_type,
-        source_ref=source_ref, branch=branch, upload_id=upload_ref.id if upload_ref else None,
-        test_url=test_url, instruction=instruction, model=model, report_lang="zh", status="pending",
+        source_ref=source_ref, branch=repo_refs[0]["branch"] if repo_refs else branch,
+        repo_branches=json.dumps(repo_refs, ensure_ascii=False),
+        upload_id=upload_ref.id if upload_ref else None,
+        test_url=targets[0]["url"] if targets else "",
+        test_targets=dump_targets(targets),
+        instruction=instruction, model=model, report_lang="zh", status="pending",
     )
     db.add(task)
     db.commit()
     _audit(
         db, request, "task.submit",
         f"id={task_id} project={project_id} mode={scan_mode} model={model or 'default'} "
-        f"source={source_type} branch={branch} upload={upload_ref.id if upload_ref else '-'} "
-        f"url={test_url} instruction={'yes' if instruction else 'no'}",
+        f"source={source_type} repos={len(repo_refs)} branch={branch} upload={upload_ref.id if upload_ref else '-'} "
+        f"targets={dump_targets(targets) if targets else '-'} instruction={'yes' if instruction else 'no'}",
         user=user,
     )
     run_scan.delay(task_id)
@@ -1034,6 +1252,23 @@ def stats(db: Session = Depends(get_db), user: User = Depends(require_user)):
     total_tokens = db.execute(
         scope_tasks(select(func.coalesce(func.sum(Task.total_tokens), 0)))
     ).scalar() or 0
+    # token 消耗明细：输入/输出拆分、请求次数、按模型聚合
+    total_input_tokens = db.execute(
+        scope_tasks(select(func.coalesce(func.sum(Task.input_tokens), 0)))
+    ).scalar() or 0
+    total_output_tokens = db.execute(
+        scope_tasks(select(func.coalesce(func.sum(Task.output_tokens), 0)))
+    ).scalar() or 0
+    llm_requests_total = db.execute(
+        scope_tasks(select(func.coalesce(func.sum(Task.llm_requests), 0)))
+    ).scalar() or 0
+    tokens_by_model = dict(db.execute(
+        scope_tasks(
+            select(Task.model, func.coalesce(func.sum(Task.total_tokens), 0))
+            .group_by(Task.model)
+            .order_by(desc(func.sum(Task.total_tokens)))
+        ).limit(6)
+    ).all())
 
     # 漏洞严重度分布：以 findings 表为准（历史任务可能只有 severity_counts 汇总）
     findings_by_severity = dict(db.execute(
@@ -1056,19 +1291,25 @@ def stats(db: Session = Depends(get_db), user: User = Depends(require_user)):
             except (ValueError, TypeError):
                 continue
 
-    # 近 14 天任务趋势（按日聚合，缺失日期补零）
+    # 近 14 天任务趋势（按日聚合任务数与 token 消耗，缺失日期补零）
     trend_start = datetime.now(timezone.utc) - timedelta(days=13)
     trend_counts: dict[str, int] = {}
-    for created in db.execute(
-        scope_tasks(select(Task.created_at).where(Task.created_at >= trend_start))
-    ).scalars():
+    trend_tokens: dict[str, int] = {}
+    for created, tokens in db.execute(
+        scope_tasks(select(Task.created_at, Task.total_tokens).where(Task.created_at >= trend_start))
+    ).all():
         if created is None:
             continue
         day = created.astimezone(timezone.utc).strftime("%Y-%m-%d")
         trend_counts[day] = trend_counts.get(day, 0) + 1
+        trend_tokens[day] = trend_tokens.get(day, 0) + (tokens or 0)
     today = datetime.now(timezone.utc)
     trend = [
-        {"date": (day := (today - timedelta(days=13 - i)).strftime("%Y-%m-%d")), "count": trend_counts.get(day, 0)}
+        {
+            "date": (day := (today - timedelta(days=13 - i)).strftime("%Y-%m-%d")),
+            "count": trend_counts.get(day, 0),
+            "tokens": trend_tokens.get(day, 0),
+        }
         for i in range(14)
     ]
 
@@ -1115,6 +1356,10 @@ def stats(db: Session = Depends(get_db), user: User = Depends(require_user)):
         "findings_by_severity": findings_by_severity,
         "avg_duration_sec": round(float(avg_duration), 1) if avg_duration is not None else None,
         "total_tokens": int(total_tokens),
+        "total_input_tokens": int(total_input_tokens),
+        "total_output_tokens": int(total_output_tokens),
+        "llm_requests_total": int(llm_requests_total),
+        "tokens_by_model": tokens_by_model,
         "trend": trend,
         "top_projects": top_projects,
     }
@@ -1136,6 +1381,10 @@ def task_detail(task_id: str, db: Session = Depends(get_db), user: User = Depend
         "attempts": task.attempts,
         "run_dir_name": task.run_dir_name,
         "strix_version": task.strix_version,
+        "input_tokens": task.input_tokens,
+        "output_tokens": task.output_tokens,
+        "llm_requests": task.llm_requests,
+        "agents": json.loads(task.agents_usage or "[]"),
         "has_artifacts": bool(task.artifacts_ref),
         "has_report_md": bool(task.report_md),
         "report_md": task.report_md or "",

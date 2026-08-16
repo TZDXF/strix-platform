@@ -5,8 +5,24 @@ export interface User {
   display_name: string
   is_active: boolean
   has_llm_key: boolean
+  email: string
   created_at: string | null
   last_login_at: string | null
+}
+
+export interface TestTarget {
+  url: string
+  note: string
+}
+
+export interface GitRepoRef {
+  url: string
+  note: string
+}
+
+export interface RepoBranch {
+  url: string
+  branch: string
 }
 
 export interface Project {
@@ -14,11 +30,13 @@ export interface Project {
   name: string
   description: string
   source_type: 'git' | 'zip'
-  git_url: string
+  git_url: string // 兼容旧字段：首个仓库
+  git_repos: GitRepoRef[]
   git_auth_type: '' | 'token'
   has_credentials: boolean
   is_archived: boolean
-  default_test_url: string
+  default_test_url: string // 兼容旧字段：首个地址
+  default_test_targets: TestTarget[]
   created_by: number | null
   created_by_name: string
   created_at: string | null
@@ -52,7 +70,9 @@ export interface TaskSummary {
   source_type: 'git' | 'zip'
   source_ref: string
   branch: string
-  test_url: string
+  repo_branches: RepoBranch[]
+  test_url: string // 兼容旧字段：首个地址
+  test_targets: TestTarget[]
   instruction: string
   report_lang: 'en' | 'zh'
   zh_status: string
@@ -84,12 +104,30 @@ export interface Finding {
   poc_code: string
 }
 
+export interface AgentUsage {
+  agent_id: string
+  agent_name: string
+  model: string
+  parent: string
+  requests: number
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  started_at: string
+  finished_at: string
+  status: string
+}
+
 export interface TaskDetail extends TaskSummary {
   started_at: string | null
   finished_at: string | null
   attempts: number
   run_dir_name: string
   strix_version: string
+  input_tokens: number | null
+  output_tokens: number | null
+  llm_requests: number | null
+  agents: AgentUsage[]
   has_artifacts: boolean
   has_report_md: boolean
   report_md: string
@@ -99,6 +137,7 @@ export interface TaskDetail extends TaskSummary {
 export interface StatsTrendPoint {
   date: string
   count: number
+  tokens: number
 }
 
 export interface StatsTopProject {
@@ -121,6 +160,10 @@ export interface StatsData {
   findings_by_severity: Record<string, number>
   avg_duration_sec: number | null
   total_tokens: number
+  total_input_tokens: number
+  total_output_tokens: number
+  llm_requests_total: number
+  tokens_by_model: Record<string, number>
   trend: StatsTrendPoint[]
   top_projects: StatsTopProject[]
 }
@@ -220,7 +263,8 @@ export interface GitRepoCheckResult {
 
 export interface SubmitTaskParams {
   scanMode: string
-  testUrl?: string
+  repoBranches?: RepoBranch[]
+  testTargets?: TestTarget[]
   instruction?: string
   model?: string
   branch?: string
@@ -241,6 +285,36 @@ export interface GitConfig {
   base_url: string
   has_token: boolean
   created_at: string | null
+}
+
+export interface MailSettings {
+  smtp_host: string
+  smtp_port: number
+  smtp_user: string
+  has_password: boolean
+  smtp_use_tls: boolean
+  smtp_ssl: boolean
+  mail_from: string
+  mail_sender_name: string
+  site_url: string
+  notify_done: boolean
+  notify_failed: boolean
+  configured: boolean
+}
+
+export interface MailSettingsPayload {
+  smtp_host: string
+  smtp_port: number
+  smtp_user: string
+  smtp_password?: string
+  clear_password?: boolean
+  smtp_use_tls: boolean
+  smtp_ssl: boolean
+  mail_from: string
+  mail_sender_name: string
+  site_url: string
+  notify_done: boolean
+  notify_failed: boolean
 }
 
 export interface GitNamespace {
@@ -266,10 +340,12 @@ export interface ProjectPayload {
   description?: string
   source_type?: string
   git_url?: string
+  git_repos?: GitRepoRef[]
   git_auth_type?: string
   git_token?: string
   git_config_id?: string
   default_test_url?: string
+  default_test_targets?: TestTarget[]
 }
 
 export interface ProjectDetailData extends Project {
@@ -288,6 +364,7 @@ export const api = {
   // 个人设置
   setLlmKey: (apiKey: string) => request<User>('PUT', '/api/me/llm-key', { json: { api_key: apiKey } }),
   clearLlmKey: () => request<User>('DELETE', '/api/me/llm-key'),
+  setEmail: (email: string) => request<User>('PUT', '/api/me/email', { json: { email } }),
 
   // 个人 Git 配置（GitLab）
   listGitConfigs: () => request<{ items: GitConfig[] }>('GET', '/api/git-configs'),
@@ -315,6 +392,12 @@ export const api = {
   setDefaultModel: (id: number) => request<PlatformModel>('PATCH', `/api/admin/models/${id}`, { json: { is_default: true } }),
   deleteModel: (id: number) => request<{ ok: boolean }>('DELETE', `/api/admin/models/${id}`),
 
+  // 系统设置：邮件提醒（超管）
+  getMailSettings: () => request<MailSettings>('GET', '/api/admin/mail-settings'),
+  saveMailSettings: (s: MailSettingsPayload) => request<MailSettings>('PUT', '/api/admin/mail-settings', { json: s }),
+  testMailSettings: (to: string) =>
+    request<{ ok: boolean; detail: string }>('POST', '/api/admin/mail-settings/test', { json: { to } }),
+
   // 项目
   listProjects: () => request<{ items: Project[] }>('GET', '/api/projects'),
   createProject: (p: ProjectPayload) => request<Project>('POST', '/api/projects', { json: p }),
@@ -323,7 +406,8 @@ export const api = {
   archiveProject: (id: string) => request<Project>('POST', `/api/projects/${id}/archive`),
   unarchiveProject: (id: string) => request<Project>('POST', `/api/projects/${id}/unarchive`),
   getProject: (id: string) => request<ProjectDetailData>('GET', `/api/projects/${id}`),
-  listBranches: (id: string) => request<{ items: string[] }>('GET', `/api/projects/${id}/branches`),
+  listBranches: (id: string, repoUrl?: string) =>
+    request<{ items: string[] }>('GET', `/api/projects/${id}/branches` + (repoUrl ? `?repo_url=${encodeURIComponent(repoUrl)}` : '')),
 
   // 项目内 zip 上传
   uploadToProject: (projectId: string, file: File) => {
@@ -340,7 +424,9 @@ export const api = {
   submitTask: (projectId: string, p: SubmitTaskParams) => {
     const form = new FormData()
     form.append('scan_mode', p.scanMode)
-    if (p.testUrl) form.append('test_url', p.testUrl)
+    if (p.repoBranches) form.append('repo_branches', JSON.stringify(p.repoBranches))
+    if (p.branch) form.append('branch', p.branch)
+    form.append('test_targets', JSON.stringify(p.testTargets || []))
     if (p.instruction) form.append('instruction', p.instruction)
     if (p.model) form.append('model', p.model)
     if (p.branch) form.append('branch', p.branch)

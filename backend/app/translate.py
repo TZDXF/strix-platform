@@ -16,6 +16,7 @@ from .celery_app import celery_app
 from .config import get_settings
 from .db import SessionLocal
 from .models import Finding, Task, User
+from .tasklog import append_log
 
 SYSTEM_PROMPT = (
     "You are a professional translator for security vulnerability reports. "
@@ -69,14 +70,30 @@ def translate_findings(task_id: str) -> int:
         api_key = (creator.llm_api_key or "") if creator else ""
         findings = db.execute(select(Finding).where(Finding.task_id == task_id)).scalars().all()
         todo = [f for f in findings if not f.title_zh]
+        total = len(todo)
+        if not todo:
+            return 0
+
+        def _tl(line: str) -> None:
+            append_log(task, line)
+            db.commit()
+
+        _tl(
+            f"[translate] 开始翻译：待处理 {total} 条（模型 {task.model or '平台默认'}，"
+            f"单批约 {_MAX_CHARS // 1000}k 字符，超出自动分批）"
+        )
         done = 0
+        batch_no = 0
         batch: list[Finding] = []
         batch_chars = 0
 
         def flush() -> None:
-            nonlocal done, batch_chars
+            nonlocal done, batch_chars, batch_no
             if not batch:
                 return
+            batch_no += 1
+            n = len(batch)
+            _tl(f"[translate] 第 {batch_no} 批（{n} 条）翻译中…")
             payload = [
                 {
                     "id": f.id,
@@ -95,6 +112,7 @@ def translate_findings(task_id: str) -> int:
                 api_key=api_key,
             )
             by_id = {item.get("id"): item for item in _extract_json_array(reply) if isinstance(item, dict)}
+            hit = 0
             for f in batch:
                 item = by_id.get(f.id)
                 if item:
@@ -102,7 +120,9 @@ def translate_findings(task_id: str) -> int:
                     f.description_zh = str(item.get("description") or f.description)
                     f.remediation_zh = str(item.get("remediation") or f.remediation)
                     done += 1
+                    hit += 1
             db.commit()
+            _tl(f"[translate] 第 {batch_no} 批完成（{hit}/{n} 条成功）")
             batch.clear()
             batch_chars = 0
 
@@ -113,6 +133,7 @@ def translate_findings(task_id: str) -> int:
             batch.append(f)
             batch_chars += size
         flush()
+        _tl(f"[translate] 全部完成：{done}/{total} 条已译为中文")
         return done
     finally:
         db.close()
@@ -132,10 +153,13 @@ def translate_findings_task(self, task_id: str) -> dict:
             return {"task_id": task_id, "translated": n}
         except Exception as exc:  # noqa: BLE001
             task.zh_status = "failed"
+            append_log(task, f"[translate] 失败：{str(exc)[:300]}")
             db.commit()
             try:
                 raise self.retry(exc=exc, countdown=60)
             except self.MaxRetriesExceededError:
+                append_log(task, "[translate] 重试次数用尽，翻译中止；漏洞明细保留原文可查看")
+                db.commit()
                 return {"task_id": task_id, "error": str(exc)}
     finally:
         db.close()

@@ -57,12 +57,28 @@ const modeEntries = computed(() => {
 
 const modelEntries = computed(() => {
   const counts = data.value?.tasks_by_model || {}
-  return Object.entries(counts)
-    .map(([k, v]) => ({ key: k || '（默认）', count: v }))
+  const tokens = data.value?.tokens_by_model || {}
+  const keys = new Set([...Object.keys(counts), ...Object.keys(tokens)])
+  return [...keys]
+    .map((k) => ({ key: k, label: k || '（默认）', count: counts[k] || 0, tokens: tokens[k] || 0 }))
     .sort((a, b) => b.count - a.count)
+    .slice(0, 6)
 })
 
 const trendMax = computed(() => Math.max(1, ...(data.value?.trend || []).map((p) => p.count)))
+const tokenMax = computed(() => Math.max(1, ...(data.value?.trend || []).map((p) => p.tokens)))
+
+// 折线用 0-100 的虚拟坐标系（preserveAspectRatio="none" 拉伸铺满），x 与各柱中心对齐
+const tokenLinePoints = computed(() => {
+  const trend = data.value?.trend || []
+  return trend
+    .map((p, i) => {
+      const x = (((i + 0.5) / trend.length) * 100).toFixed(2)
+      const y = (100 - Math.min(1, p.tokens / tokenMax.value) * 92).toFixed(2)
+      return `${x},${y}`
+    })
+    .join(' ')
+})
 
 function fmtDuration(sec: number | null): string {
   if (sec == null) return '-'
@@ -89,8 +105,13 @@ function openProject(id: string) {
 const kpis = computed(() => [
   { label: '项目', value: data.value?.projects_total ?? '-', sub: data.value?.projects_archived ? `另有 ${data.value.projects_archived} 个已归档` : '进行中的项目' },
   { label: '扫描任务', value: data.value?.tasks_total ?? '-', sub: data.value?.avg_duration_sec != null ? `平均耗时 ${fmtDuration(data.value.avg_duration_sec)}` : '全部任务' },
-  { label: '发现漏洞', value: data.value?.findings_total ?? '-', sub: `累计消耗 ${fmtTokens(data.value?.total_tokens || 0)} tokens` },
+  { label: '发现漏洞', value: data.value?.findings_total ?? '-', sub: data.value?.tasks_total ? `平均每任务 ${(data.value.findings_total / data.value.tasks_total).toFixed(1)} 个` : '全部漏洞' },
   { label: '严重 / 高危', value: criticalAndHigh.value || 0, sub: '需要优先修复', danger: true },
+  {
+    label: 'Token 消耗',
+    value: fmtTokens(data.value?.total_tokens || 0),
+    sub: `输入 ${fmtTokens(data.value?.total_input_tokens || 0)} / 输出 ${fmtTokens(data.value?.total_output_tokens || 0)} · ${fmtTokens(data.value?.llm_requests_total || 0)} 次请求`,
+  },
 ])
 </script>
 
@@ -114,7 +135,7 @@ const kpis = computed(() => [
 
     <template v-if="data">
       <!-- KPI 卡片 -->
-      <div class="mb-[18px] grid grid-cols-2 gap-3.5 lg:grid-cols-4">
+      <div class="mb-[18px] grid grid-cols-2 gap-3.5 lg:grid-cols-5">
         <div
           v-for="k in kpis" :key="k.label"
           :class="cardLifted" class="p-4.5"
@@ -130,20 +151,45 @@ const kpis = computed(() => [
       <div class="grid gap-[18px] lg:grid-cols-2">
         <!-- 近 14 天任务趋势 -->
         <div :class="card">
-          <h3 class="text-sm font-semibold text-muted">近 14 天任务趋势</h3>
-          <div class="mt-4 flex h-40 items-end gap-1.5">
+          <h3 class="text-sm font-semibold text-muted">
+            近 14 天任务趋势
+            <span class="ml-1.5 font-normal">（累计 {{ fmtTokens(data.trend.reduce((s, p) => s + p.tokens, 0)) }} tokens）</span>
+          </h3>
+          <div class="mt-2 flex items-center gap-4 text-[11.5px] text-muted">
+            <span class="flex items-center gap-1.5"><span class="inline-block size-2.5 rounded-[3px] bg-accent/80"></span>任务数</span>
+            <span class="flex items-center gap-1.5"><span class="inline-block h-0.5 w-4 rounded-full bg-ok"></span>Token 消耗</span>
+            <span class="ml-auto">峰值 {{ fmtTokens(tokenMax) }} / 天</span>
+          </div>
+          <!-- 柱与折线共享 0-100 高度但各自独立缩放；列内 padding 取代 gap，保证折线节点对准柱中心 -->
+          <div class="relative mt-4 flex h-40">
             <div
               v-for="p in data.trend" :key="p.date"
-              class="group flex h-full flex-1 flex-col justify-end"
-              :title="`${p.date}：${p.count} 个任务`"
+              class="group flex h-full flex-1 flex-col justify-end px-[3px]"
+              :title="`${p.date}：${p.count} 个任务 · ${fmtTokens(p.tokens)} tokens`"
             >
               <div
                 class="rounded-t-[4px] bg-accent/80 transition-colors group-hover:bg-accent"
                 :style="{ height: `${Math.max(p.count ? 6 : 2, (p.count / trendMax) * 100)}%` }"
               ></div>
             </div>
+            <svg
+              v-if="tokenLinePoints"
+              class="pointer-events-none absolute inset-0 h-full w-full"
+              viewBox="0 0 100 100"
+              preserveAspectRatio="none"
+            >
+              <polyline
+                :points="tokenLinePoints"
+                fill="none"
+                class="stroke-ok"
+                stroke-width="2"
+                stroke-linejoin="round"
+                stroke-linecap="round"
+                vector-effect="non-scaling-stroke"
+              />
+            </svg>
           </div>
-          <div class="mt-1.5 flex gap-1.5 text-[10.5px] text-muted">
+          <div class="mt-1.5 flex text-[10.5px] text-muted">
             <div v-for="p in data.trend" :key="p.date" class="flex-1 text-center">{{ fmtDay(p.date) }}</div>
           </div>
         </div>
@@ -205,10 +251,13 @@ const kpis = computed(() => [
               <p v-if="!modeEntries.length" :class="hint">暂无数据</p>
             </div>
             <div>
-              <div class="text-xs font-semibold text-muted">模型（Top 6）</div>
+              <div class="text-xs font-semibold text-muted">模型（Top 6，含 token 消耗）</div>
               <div v-for="m in modelEntries" :key="m.key" class="mt-2 flex items-center justify-between gap-2 text-[13px]">
-                <span class="truncate text-muted" :title="m.key">{{ m.key }}</span>
-                <span class="shrink-0 font-semibold text-text">{{ m.count }}</span>
+                <span class="truncate text-muted" :title="m.key">{{ m.label }}</span>
+                <span class="shrink-0">
+                  <span class="font-semibold text-text">{{ m.count }}</span>
+                  <span class="ml-1.5 text-[11.5px] text-muted">{{ fmtTokens(m.tokens) }} tok</span>
+                </span>
               </div>
               <p v-if="!modelEntries.length" :class="hint">暂无数据</p>
             </div>

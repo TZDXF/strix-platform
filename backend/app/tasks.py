@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from sqlalchemy import delete
@@ -15,12 +16,21 @@ from .celery_app import celery_app
 from .config import get_settings
 from .db import SessionLocal
 from .llm_models import default_model
+from .mailer import notify_task_finished
 from .models import Finding, Project, ProjectUpload, Task, User
 from .runner import execute_scan, read_run_artifacts
-from .sources import SourceError, clone_git, du_mb, safe_extract_zip
+from .sources import (
+    SourceError,
+    clone_git,
+    du_mb,
+    effective_repo_branches,
+    effective_repos,
+    repo_dir_name,
+    safe_extract_zip,
+)
+from .targets import effective_targets
+from .tasklog import append_log as _log
 from .translate import translate_findings_task
-
-LOG_CAP = 200_000  # task.log 滚动上限（字符）
 
 ZH_INSTRUCTION = (
     "Please write the entire report in Simplified Chinese (简体中文): "
@@ -29,18 +39,128 @@ ZH_INSTRUCTION = (
 )
 
 
-def _log(task, line: str) -> None:
-    stamp = time.strftime("%H:%M:%S")
-    entry = f"[{stamp}] {line}\n"
-    task.log = (task.log or "") + entry
-    if len(task.log) > LOG_CAP:
-        task.log = task.log[-LOG_CAP:]
-
-
 def _set_status(db, task, status: str) -> None:
     task.status = status
     task.updated_at = datetime.now(timezone.utc)
     db.commit()
+
+
+# 这些情况属正常跳过（未配置/无邮箱/开关关闭），不写进任务日志
+_NOTIFY_QUIET = {"邮件未配置", "创建者未设置通知邮箱", "完成通知已关闭", "失败通知已关闭"}
+
+
+def _notify(db, task, task_id: str) -> None:
+    """任务终态后向创建者发送提醒邮件；结果写进任务日志，发送失败不影响任务状态。"""
+    try:
+        result = notify_task_finished(task_id)
+    except Exception as exc:  # noqa: BLE001 —— 双保险，notify 内部已兜底
+        result = {"sent": False, "reason": str(exc)}
+    if result.get("sent"):
+        _log(task, f"[mail] 已发送{'失败' if task.status == 'failed' else '完成'}提醒至 {result.get('to')}")
+    elif result.get("reason") not in _NOTIFY_QUIET:
+        _log(task, f"[mail] 提醒邮件未发送: {result.get('reason')}")
+    db.commit()
+
+
+def _strix_log_shift(log_text: str, log_path: Path) -> timedelta:
+    """推断 strix.log 本地时间戳 → 北京时间的偏移。
+
+    strix 按容器本地时间写日志（compose 默认 UTC），文件 mtime 是绝对时间，
+    两者差值取整到小时即容器时区偏移，再 +8 折算成北京时间；容器若已设
+    TZ=Asia/Shanghai，差值为 -8，净偏移为 0，同样正确。
+    """
+    last = ""
+    for line in reversed(log_text.splitlines()):
+        if len(line) >= 19 and line[10] == " ":
+            last = line[:19]
+            break
+    try:
+        naive = datetime.strptime(last, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        delta_hours = round((log_path.stat().st_mtime - naive.timestamp()) / 3600)
+        delta_hours = max(-12, min(14, delta_hours))
+        return timedelta(hours=delta_hours + 8)
+    except (ValueError, OSError):
+        return timedelta(hours=8)
+
+
+def _ts_bj(ts: str, shift: timedelta) -> str:
+    try:
+        return (datetime.strptime(ts[:19], "%Y-%m-%d %H:%M:%S") + shift).strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return ts
+
+
+def _agents_usage(run_record: dict, scan_dir: Path, run_dir_name: str) -> str:
+    """合并 run.json 的智能体用量（tokens/请求）与 strix.log 的生命周期事件（启动/完成时间）。
+
+    strix.log 行样例：
+      2026-08-14 16:30:52.867 INFO  run - strix.core.agents: agent.register b2383e25 (Root Agent) parent=-
+      2026-08-14 17:08:47.265 INFO  run - strix.core.agents: agent.status 0d0065a0=completed
+    """
+    agents: dict[str, dict] = {}
+
+    def _entry(agent_id: str) -> dict:
+        if agent_id not in agents:
+            agents[agent_id] = {
+                "agent_id": agent_id, "agent_name": "", "model": "", "parent": "",
+                "requests": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+                "started_at": "", "finished_at": "", "status": "",
+            }
+        return agents[agent_id]
+
+    for a in (run_record.get("llm_usage") or {}).get("agents") or []:
+        e = _entry(str(a.get("agent_id") or ""))
+        e.update({
+            "agent_name": str(a.get("agent_name") or ""),
+            "model": str(a.get("model") or ""),
+            "requests": int(a.get("requests") or 0),
+            "input_tokens": int(a.get("input_tokens") or 0),
+            "output_tokens": int(a.get("output_tokens") or 0),
+            "total_tokens": int(a.get("total_tokens") or 0),
+        })
+
+    log_path = scan_dir / "strix_runs" / run_dir_name / "strix.log"
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        log_text = ""
+    # strix.log 里的时间是引擎容器本地时间，换算成北京时间再展示
+    shift = _strix_log_shift(log_text, log_path)
+    for line in log_text.splitlines():
+        ts = line[:23].strip()
+        m = re.search(r"agent\.register (\w+) \((.+?)\) parent=(\S+)", line)
+        if m:
+            e = _entry(m.group(1))
+            if not e["agent_name"]:
+                e["agent_name"] = m.group(2)
+            e["parent"] = m.group(3)
+            if ts:
+                e["started_at"] = _ts_bj(ts, shift)
+            continue
+        m = re.search(r"agent\.status (\w+)=(\w+)", line)
+        if m:
+            e = _entry(m.group(1))
+            e["status"] = m.group(2)
+            if m.group(2) in ("completed", "failed") and ts:
+                e["finished_at"] = _ts_bj(ts, shift)
+
+    ordered = sorted(
+        agents.values(),
+        key=lambda a: (a["started_at"] or "9999", a["agent_name"]),
+    )
+    return json.dumps(ordered, ensure_ascii=False)
+
+
+def _scan_error_detail(scan_dir: Path) -> str:
+    """提取 scan.log 中 strix 的报错行（"Error during penetration test: ..."），用于失败原因展示。"""
+    try:
+        text = (scan_dir / "scan.log").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    for line in reversed(text.splitlines()):
+        if "Error during penetration test:" in line:
+            return line.split("Error during penetration test:", 1)[1].strip()[:300]
+    return ""
 
 
 @celery_app.task(name="run_scan", bind=True, max_retries=1)
@@ -60,6 +180,7 @@ def run_scan(self, task_id: str) -> dict:
         _log(task, f"[fail] {task.error}")
         task.finished_at = datetime.now(timezone.utc)
         _set_status(db, task, "failed")
+        _notify(db, task, task_id)
         db.close()
         return {"task_id": task_id, "error": task.error}
 
@@ -75,6 +196,14 @@ def run_scan(self, task_id: str) -> dict:
     try:
         task.started_at = datetime.now(timezone.utc)
         _set_status(db, task, "fetching")
+        repo_refs = effective_repo_branches(task.repo_branches, task.source_ref, task.branch or "")
+        src_desc = (
+            f"git（{len(repo_refs)} 个仓库，分支 {'/'.join(r['branch'] or '默认' for r in repo_refs)}）"
+            if task.source_type == "git" and len(repo_refs) != 1
+            else f"git（分支 {repo_refs[0]['branch'] or '默认'}）" if task.source_type == "git" else "zip 上传"
+        )
+        _log(task, f"[task] 任务开始：{src_desc} · {task.scan_mode} 模式 · 模型 {task.model} · strix {s.strix_version}")
+        db.commit()
 
         # ---- Stage 1: 获取源码 ----
         import shutil
@@ -82,13 +211,27 @@ def run_scan(self, task_id: str) -> dict:
         if src_dir.exists():  # 重派发/重试时清掉上次残留，保证可幂等重跑
             shutil.rmtree(src_dir, ignore_errors=True)
         src_dir.mkdir(parents=True, exist_ok=True)
+        t_fetch = time.monotonic()
         if task.source_type == "git":
-            clone_git(
-                task.source_ref, src_dir, lambda m: (_log(task, m), db.commit()),
-                branch=task.branch or "",
-                auth_type=(project.git_auth_type if project else ""),
-                token=(project.git_token if project else ""),
-            )
+            git_log = lambda m: (_log(task, m), db.commit())  # noqa: E731
+            if len(repo_refs) == 1:
+                clone_git(
+                    repo_refs[0]["url"], src_dir, git_log,
+                    branch=repo_refs[0]["branch"],
+                    auth_type=(project.git_auth_type if project else ""),
+                    token=(project.git_token if project else ""),
+                )
+            else:
+                # 多仓库：逐个克隆到源码目录的子目录，整体作为一个白盒目标扫描
+                _log(task, f"[fetch] 项目绑定 {len(repo_refs)} 个仓库，逐个克隆")
+                taken: set[str] = set()
+                for r in repo_refs:
+                    clone_git(
+                        r["url"], src_dir / repo_dir_name(r["url"], taken), git_log,
+                        branch=r["branch"],
+                        auth_type=(project.git_auth_type if project else ""),
+                        token=(project.git_token if project else ""),
+                    )
         else:
             upload = db.get(ProjectUpload, task.upload_id) if task.upload_id else None
             zip_path = Path(upload.stored_path) if upload and upload.stored_path else ws / "uploads" / f"{task_id}.zip"
@@ -98,16 +241,45 @@ def run_scan(self, task_id: str) -> dict:
                 zip_path, src_dir, s.max_upload_mb * 1024 * 1024,
                 lambda m: (_log(task, m), db.commit()),
             )
-        _log(task, f"[fetch] 源码就绪（{du_mb(src_dir)}MB）")
+        _log(task, f"[fetch] 源码就绪（{du_mb(src_dir)}MB，耗时 {int(time.monotonic() - t_fetch)} 秒）")
 
-        # ---- Stage 2: strix 扫描（用户自定义指令 + 中文报告提示词均通过 --instruction 注入）----
+        # ---- Stage 2: strix 扫描（用户自定义指令 + 目标说明 + 中文报告提示词均通过 --instruction 注入）----
         _set_status(db, task, "scanning")
         _log(task, f"[scan] 模型: {task.model}（中文报告）")
-        instruction = f"{task.instruction or ''}\n{ZH_INSTRUCTION}".strip()
+        targets = effective_targets(task.test_targets, task.test_url)
+        if targets:
+            _log(
+                task,
+                "[scan] 黑盒目标: "
+                + "；".join(f"{t['url']}（{t['note']}）" if t["note"] else t["url"] for t in targets),
+            )
+        # 用户指令在首位，其后依次是仓库结构 / 黑盒目标说明块，最后是中文报告要求
+        instruction_parts: list[str] = [task.instruction] if task.instruction else []
+        if task.source_type == "git" and len(repo_refs) > 1:
+            notes = {
+                r["url"]: r["note"]
+                for r in (effective_repos(project.git_repos, project.git_url) if project else [])
+            }
+            lines = ["This project's source code consists of multiple repositories (all included in the whitebox source directory):"]
+            for i, r in enumerate(repo_refs, 1):
+                seg = f"{i}. {r['url']}"
+                if r["branch"]:
+                    seg += f" (branch {r['branch']})"
+                if notes.get(r["url"]):
+                    seg += f" — {notes[r['url']]}"
+                lines.append(seg)
+            instruction_parts.append("\n".join(lines))
+        if targets:
+            lines = ["Black-box test targets for this scan (test each of them):"]
+            for i, t in enumerate(targets, 1):
+                lines.append(f"{i}. {t['url']}" + (f" — {t['note']}" if t["note"] else ""))
+            instruction_parts.append("\n".join(lines))
+        instruction_parts.append(ZH_INSTRUCTION)
+        instruction = "\n".join(instruction_parts).strip()
         result = execute_scan(
             work_dir=scan_dir,
             src_dir=src_dir,
-            test_url=task.test_url or "",
+            test_targets=targets,
             scan_mode=task.scan_mode,
             model=task.model or "",
             instruction=instruction,
@@ -124,13 +296,18 @@ def run_scan(self, task_id: str) -> dict:
         run_record, vulns = read_run_artifacts(scan_dir, result["run_dir_name"])
         usage = run_record.get("llm_usage") or {}
         task.total_tokens = usage.get("total_tokens")
+        task.input_tokens = usage.get("input_tokens")
+        task.output_tokens = usage.get("output_tokens")
         task.llm_requests = usage.get("requests")
+        task.agents_usage = _agents_usage(run_record, scan_dir, result["run_dir_name"])
         # 官方执行摘要报告（strix view 展示的同款 penetration_test_report.md）
         report_path = scan_dir / "strix_runs" / result["run_dir_name"] / "penetration_test_report.md"
         try:
             task.report_md = report_path.read_text(encoding="utf-8")[:500_000]
         except OSError:
             task.report_md = ""
+        if not task.report_md:
+            _log(task, "[parse] 未生成执行摘要报告（penetration_test_report.md）")
 
         db.execute(delete(Finding).where(Finding.task_id == task_id))
         counts: dict[str, int] = {}
@@ -160,7 +337,8 @@ def run_scan(self, task_id: str) -> dict:
         task.severity_counts = json.dumps(counts, ensure_ascii=False)
         _log(
             task,
-            f"[parse] 漏洞 {len(vulns)} 条 {json.dumps(counts, ensure_ascii=False)} "
+            f"[parse] run={result['run_dir_name'] or '-'} · 智能体 {len(usage.get('agents') or [])} 个 · "
+            f"漏洞 {len(vulns)} 条 {json.dumps(counts, ensure_ascii=False)} "
             f"tokens={usage.get('total_tokens', '-')} 退出码={task.exit_code}",
         )
 
@@ -174,12 +352,22 @@ def run_scan(self, task_id: str) -> dict:
         task.finished_at = datetime.now(timezone.utc)
         if task.started_at:
             task.duration_sec = int((task.finished_at - task.started_at).total_seconds())
+        if task.exit_code == 1 and not task.timed_out:
+            # 退出码契约（runner.py）：0 无发现 / 1 执行错误 / 2 发现漏洞。
+            # 1 是沙箱/代理/LLM 网关等执行错误，不是"扫描完成无发现"，须标记失败
+            detail = _scan_error_detail(scan_dir)
+            task.error = f"strix 执行失败（退出码 1）：{detail or '详见任务日志与归档产物'}"
+            _log(task, f"[done] 状态: 失败，耗时 {task.duration_sec} 秒，{task.error}")
+            _set_status(db, task, "failed")
+            _notify(db, task, task_id)
+            return {"task_id": task_id, "error": task.error}
         _log(
             task,
             f"[done] 状态: {'超时终止' if task.timed_out else '完成'}，"
             f"耗时 {task.duration_sec} 秒，发现 {task.findings_count} 条",
         )
         _set_status(db, task, "done")
+        _notify(db, task, task_id)
 
         # ---- Stage 5: 中文翻译（提示词要求中文撰写失败时的兜底）----
         if task.findings_count > 0:
@@ -194,12 +382,14 @@ def run_scan(self, task_id: str) -> dict:
         _log(task, f"[fail] {task.error}")
         task.finished_at = datetime.now(timezone.utc)
         _set_status(db, task, "failed")
+        _notify(db, task, task_id)
         return {"task_id": task_id, "error": task.error}
     except Exception as exc:  # noqa: BLE001 —— 流水线任何异常都要落到任务状态
         task.error = f"执行异常: {exc}"
         _log(task, f"[fail] {task.error}")
         task.finished_at = datetime.now(timezone.utc)
         _set_status(db, task, "failed")
+        _notify(db, task, task_id)
         return {"task_id": task_id, "error": task.error}
     finally:
         db.close()

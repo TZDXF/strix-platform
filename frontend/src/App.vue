@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import Login from './views/Login.vue'
+import Welcome from './views/Welcome.vue'
 import Projects from './views/Projects.vue'
 import ProjectDetail from './views/ProjectDetail.vue'
 import TaskList from './views/TaskList.vue'
 import TaskDetail from './views/TaskDetail.vue'
 import Users from './views/Users.vue'
 import Settings from './views/Settings.vue'
+import AdminSettings from './views/AdminSettings.vue'
 import Stats from './views/Stats.vue'
 import ToastHost from './components/ToastHost.vue'
 import { getToken, getUser, clearSession, type User } from './api'
@@ -35,7 +37,7 @@ function logout() {
 function onLogin(logged: User) {
   token.value = getToken()
   user.value = logged
-  location.hash = '#/projects'
+  location.hash = '#/welcome'
 }
 
 interface View { name: string; id?: string }
@@ -48,14 +50,16 @@ const view = computed<View>(() => {
   if (r.startsWith('#/stats')) return { name: 'stats' }
   if ((m = r.match(/^#\/project\/([a-f0-9]+)/))) return { name: 'project-detail', id: m[1] }
   if (r.startsWith('#/projects')) return { name: 'projects' }
+  if (r.startsWith('#/welcome')) return { name: 'welcome' }
+  if (r.startsWith('#/admin-settings')) return { name: 'admin-settings' }
   if (r.startsWith('#/settings')) return { name: 'settings' }
   if (r.startsWith('#/users')) return { name: 'users' }
-  return { name: token.value ? 'projects' : 'login' }
+  return { name: token.value ? 'welcome' : 'login' }
 })
 
 onMounted(() => {
   if (!token.value && route.value !== '#/login') location.hash = '#/login'
-  else if (token.value && (route.value === '#/' || route.value === '#/login')) location.hash = '#/projects'
+  else if (token.value && (route.value === '#/' || route.value === '#/login')) location.hash = '#/welcome'
 })
 onUnmounted(() => window.removeEventListener('hashchange', onHash))
 </script>
@@ -70,6 +74,11 @@ onUnmounted(() => window.removeEventListener('hashchange', onHash))
         <span class="text-accent">Strix</span> 内部安全测试平台
       </div>
       <nav class="ml-4.5 flex gap-1">
+        <a
+          href="#/welcome"
+          class="cursor-pointer rounded-md px-3.5 py-1.5 font-semibold"
+          :class="view.name === 'welcome' ? 'bg-accent/12 text-accent' : 'text-muted hover:bg-panel2 hover:text-text'"
+        >首页</a>
         <a
           href="#/projects"
           class="cursor-pointer rounded-md px-3.5 py-1.5 font-semibold"
@@ -94,6 +103,12 @@ onUnmounted(() => window.removeEventListener('hashchange', onHash))
           class="cursor-pointer rounded-md px-3.5 py-1.5 font-semibold"
           :class="view.name === 'users' ? 'bg-accent/12 text-accent' : 'text-muted hover:bg-panel2 hover:text-text'"
         >用户管理</a>
+        <a
+          v-if="user?.role === 'admin'"
+          href="#/admin-settings"
+          class="cursor-pointer rounded-md px-3.5 py-1.5 font-semibold"
+          :class="view.name === 'admin-settings' ? 'bg-accent/12 text-accent' : 'text-muted hover:bg-panel2 hover:text-text'"
+        >系统设置</a>
       </nav>
       <div class="flex-1"></div>
       <span v-if="user" class="text-xs text-muted">
@@ -116,12 +131,14 @@ onUnmounted(() => window.removeEventListener('hashchange', onHash))
     </header>
 
     <Login v-if="view.name === 'login'" @logged-in="onLogin" />
+    <Welcome v-else-if="view.name === 'welcome'" :user="user" />
     <Projects v-else-if="view.name === 'projects'" :user="user" />
     <ProjectDetail v-else-if="view.name === 'project-detail'" :project-id="view.id!" :user="user" />
     <TaskList v-else-if="view.name === 'task-list'" :user="user" />
     <Stats v-else-if="view.name === 'stats'" />
     <TaskDetail v-else-if="view.name === 'task-detail'" :task-id="view.id!" />
     <Users v-else-if="view.name === 'users'" />
+    <AdminSettings v-else-if="view.name === 'admin-settings'" />
     <Settings v-else-if="view.name === 'settings'" :user="user" />
     <ToastHost />
   </div>

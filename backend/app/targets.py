@@ -7,6 +7,7 @@ TARGET_ALLOWLIST 为空时采用安全默认：仅放行内网/回环 IP 与内�
 from __future__ import annotations
 
 import ipaddress
+import json
 import socket
 import time
 from urllib.parse import urlparse
@@ -16,6 +17,67 @@ import httpx
 from .config import get_settings
 
 _DEFAULT_SUFFIXES = (".internal", ".local", ".test", ".lan", ".lab")
+
+# 单任务/单项目的黑盒测试地址上限与作用说明长度上限
+MAX_TARGETS = 10
+MAX_NOTE_LEN = 200
+
+
+# ---- 多目标列表（JSON [{"url", "note"}]）解析与清洗 ----
+
+
+def parse_targets(raw) -> list[dict]:
+    """解析地址列表 JSON；容忍 JSON 字符串 / 已解出的 list / 其他脏数据，出错返回 []。"""
+    if isinstance(raw, str):
+        if not raw.strip():
+            return []
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return []
+    if not isinstance(raw, list):
+        return []
+    items: list[dict] = []
+    for it in raw:
+        if isinstance(it, str):
+            items.append({"url": it, "note": ""})
+        elif isinstance(it, dict):
+            items.append({"url": str(it.get("url") or ""), "note": str(it.get("note") or "")})
+    return items
+
+
+def dump_targets(items: list[dict]) -> str:
+    return json.dumps(items, ensure_ascii=False)
+
+
+def normalize_targets(items: list[dict]) -> tuple[list[dict], str]:
+    """清洗用户提交的目标：去空白、丢弃空地址行、按 URL 去重、限制数量与说明长度。
+
+    返回 (清洗后的列表, 错误信息)；出错时列表为空、错误信息可直接作为 400 响应。
+    """
+    cleaned: list[dict] = []
+    seen: set[str] = set()
+    for it in items:
+        url = str(it.get("url") or "").strip()
+        note = str(it.get("note") or "").strip()[:MAX_NOTE_LEN]
+        if not url:
+            continue  # 前端允许保留未填完的空行，提交时静默丢弃
+        if url in seen:
+            continue
+        seen.add(url)
+        cleaned.append({"url": url, "note": note})
+    if len(cleaned) > MAX_TARGETS:
+        return [], f"黑盒测试地址最多 {MAX_TARGETS} 个"
+    return cleaned, ""
+
+
+def effective_targets(test_targets: str, legacy_url: str) -> list[dict]:
+    """读取侧合并：test_targets 列为非空字符串时即权威（"[]" 表示显式无目标），
+    否则回退旧版单地址列（存量任务/项目兼容）。"""
+    if test_targets and test_targets.strip():
+        return [t for t in parse_targets(test_targets) if t.get("url")]
+    url = (legacy_url or "").strip()
+    return [{"url": url, "note": ""}] if url else []
 
 
 def _allowlist_entries() -> tuple[list[str], list[ipaddress.IPv4Network | ipaddress.IPv6Network]]:

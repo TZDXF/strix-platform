@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && . /etc/os-release \
     && echo "deb [signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian ${VERSION_CODENAME} stable" > /etc/apt/sources.list.d/docker.list \
     && apt-get update && apt-get install -y --no-install-recommends \
-    git fonts-noto-cjk docker-cli \
+    git fonts-wqy-microhei fonts-wqy-zenhei docker-cli \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
