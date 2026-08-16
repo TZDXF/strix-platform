@@ -15,21 +15,15 @@ const projects = ref<Project[]>([])
 const showCreate = ref(false)
 const creating = ref(false)
 
-// reka-ui SelectItem 不允许 value=""，用哨兵值表示「无需凭据」，提交时转回空串
-const NO_AUTH = '__none__'
+// reka-ui SelectItem 不允许 value=""，用哨兵值表示「全部组织」
 const ALL_ORGS = '__all__'
 
 const emptyForm = {
   name: '', description: '', source_type: 'git',
-  git_repos: [] as GitRepoRef[], git_auth_type: NO_AUTH, git_token: '',
+  git_repos: [] as GitRepoRef[],
   default_test_targets: [] as TestTarget[],
 }
 const form = ref({ ...emptyForm })
-
-const authOptions = [
-  { value: NO_AUTH, label: '无需凭据（公开仓库）' },
-  { value: 'token', label: 'Personal Access Token' },
-]
 
 const typeOptions = [
   { value: 'git', label: 'Git 仓库' },
@@ -159,27 +153,24 @@ async function create() {
   }
   creating.value = true
   try {
-    // 仓库列表：导入模式取自所选 GitLab 仓库（可多选），手动模式取表单（丢弃空行）
+    // 仓库列表：导入模式取自所选 GitLab 仓库（可多选），手动模式取表单（丢弃空行，携带逐仓库令牌）
     const repos: GitRepoRef[] = form.value.source_type === 'git' && gitMode.value === 'import'
       ? selectedRepos.value.map(p => ({ url: (p.http_url_to_repo || p.web_url).trim(), note: '' }))
-      : form.value.git_repos.map(r => ({ url: r.url.trim(), note: r.note.trim() })).filter(r => r.url)
+      : form.value.git_repos
+          .map(r => ({ url: r.url.trim(), note: r.note.trim(), token: (r.token || '').trim() }))
+          .filter(r => r.url)
     const payload: Parameters<typeof api.createProject>[0] = {
       name: form.value.name.trim(),
       description: form.value.description.trim(),
       source_type: form.value.source_type,
       git_repos: repos,
-      git_auth_type: form.value.git_auth_type === NO_AUTH ? '' : form.value.git_auth_type,
-      ...(form.value.source_type === 'git' && form.value.git_auth_type === 'token' && form.value.git_token.trim()
-        ? { git_token: form.value.git_token.trim() } : {}),
       default_test_targets: form.value.default_test_targets
         .map(t => ({ url: t.url.trim(), note: t.note.trim() }))
         .filter(t => t.url),
     }
     if (form.value.source_type === 'git' && gitMode.value === 'import') {
-      // 凭据由后端从所选 Git 配置复制（令牌不回显，前端拿不到）
+      // 凭据由后端从所选 Git 配置逐仓库复制（令牌不回显，前端拿不到）
       payload.git_config_id = selectedConfig.value
-      payload.git_auth_type = 'token'
-      payload.git_token = ''
     }
     await api.createProject(payload)
     toast.success('项目已创建')
@@ -429,29 +420,8 @@ onMounted(() => {
                   <RepoListField
                     v-model="form.git_repos"
                     label="Git 仓库（白盒源码扫描，可绑定多个）"
-                    hint="同一项目的全部仓库会在一次扫描中一起分析；私有仓库请在下方选择凭据后再逐个「测试访问」。"
-                    :auth-type="form.git_auth_type === 'token' ? 'token' : ''"
-                    :token="form.git_token"
+                    hint="同一项目的全部仓库会在一次扫描中一起分析。每个仓库可单独填写专属访问令牌；留空时按域名自动匹配「设置」中的个人 Git 服务凭据，公开仓库无需填写。"
                   />
-                </div>
-                <div>
-                  <label :class="label">访问凭据（私有仓库需要）</label>
-                  <SelectRoot v-model="form.git_auth_type">
-                    <SelectTrigger :class="selectTrigger"><SelectValue /></SelectTrigger>
-                    <SelectPortal>
-                      <SelectContent :class="selectContent" position="popper">
-                        <SelectViewport>
-                          <SelectItem v-for="o in authOptions" :key="o.value" :value="o.value" :class="selectItem">
-                            <SelectItemText>{{ o.label }}</SelectItemText>
-                          </SelectItem>
-                        </SelectViewport>
-                      </SelectContent>
-                    </SelectPortal>
-                  </SelectRoot>
-                </div>
-                <div v-if="form.git_auth_type === 'token'" class="col-span-2">
-                  <label :class="label">Personal Access Token（token 或 `用户名:token`，保存后不再回显）</label>
-                  <input v-model="form.git_token" type="password" placeholder="glpat-xxxx / ghp_xxxx" :class="input" />
                 </div>
               </template>
             </template>

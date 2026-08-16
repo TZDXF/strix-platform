@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { TabsRoot, TabsList, TabsTrigger, TabsContent, CheckboxRoot, CheckboxIndicator } from 'reka-ui'
-import { api, type AgentUsage, type TaskDetail as TaskDetailData } from '../api'
+import { api, type AgentUsage, type Finding, type TaskDetail as TaskDetailData } from '../api'
 import MarkdownRender from 'markstream-vue'
 import { toast } from '../toast'
 import {
@@ -65,9 +65,66 @@ function expandAll(open: boolean) {
   for (const f of task.value?.findings || []) expanded.value[f.id] = open
 }
 
+// ---- 漏洞按目标分组：白盒各仓库 / 黑盒各地址 / 未标注 ----
+// target 由引擎逐条填写（受影响仓库或源码路径 / 黑盒地址），与任务绑定的仓库和
+// 黑盒地址匹配归类；匹配不上的 URL 视为黑盒、本地路径视为白盒（兼容历史任务）
+interface FindingGroup { key: string; kind: 'whitebox' | 'blackbox' | 'unknown'; name: string; findings: Finding[] }
+
+function repoNameOf(url: string): string {
+  const seg = url.replace(/\/+$/, '').split(/[/:]/).pop() || url
+  return seg.endsWith('.git') ? seg.slice(0, -4) : seg
+}
+const repoDefs = computed(() => {
+  const t = task.value
+  if (!t || t.source_type !== 'git') return [] as { url: string; name: string }[]
+  const refs = t.repo_branches?.length ? t.repo_branches : [{ url: t.source_ref, branch: '' }]
+  return refs.map(r => ({ url: r.url, name: repoNameOf(r.url) })).filter(r => r.url)
+})
+const targetDefs = computed(() => task.value?.test_targets || [])
+
+function groupOf(f: Finding): { key: string; kind: FindingGroup['kind']; name: string } {
+  const t = (f.target || '').trim()
+  if (!t) return { key: 'unknown', kind: 'unknown', name: '未标注目标' }
+  for (const r of repoDefs.value) {
+    if (t.includes(r.url) || t.includes(r.name)) return { key: `wb:${r.name}`, kind: 'whitebox', name: r.name }
+  }
+  const norm = (u: string) => u.replace(/\/+$/, '')
+  for (const tt of targetDefs.value) {
+    if (t === tt.url || norm(t).startsWith(norm(tt.url)) || norm(tt.url).startsWith(norm(t))) {
+      return { key: `bb:${tt.url}`, kind: 'blackbox', name: tt.url }
+    }
+  }
+  if (/^https?:\/\//i.test(t)) return { key: `bb:${t}`, kind: 'blackbox', name: t }
+  const base = t.split(/[\\/]/).filter(Boolean).pop() || t
+  return { key: `wb:${base}`, kind: 'whitebox', name: base }
+}
+
+const findingGroups = computed<FindingGroup[]>(() => {
+  const map = new Map<string, FindingGroup>()
+  for (const f of filteredFindings.value) {
+    const { key, kind, name } = groupOf(f)
+    let g = map.get(key)
+    if (!g) { g = { key, kind, name, findings: [] }; map.set(key, g) }
+    g.findings.push(f)
+  }
+  // 分组排序：白盒仓库（按任务绑定顺序）→ 黑盒地址（按配置顺序）→ 未标注
+  const rank = (g: FindingGroup) => (g.kind === 'whitebox' ? 0 : g.kind === 'blackbox' ? 1 : 2)
+  const pos = (g: FindingGroup) =>
+    g.kind === 'whitebox' ? repoDefs.value.findIndex(r => g.key === `wb:${r.name}`)
+      : g.kind === 'blackbox' ? targetDefs.value.findIndex(t => g.key === `bb:${t.url}`)
+        : 0
+  return [...map.values()].sort((a, b) => rank(a) - rank(b) || pos(a) - pos(b))
+})
+
 function title(f: { title: string; title_zh: string }) { return showZh.value && f.title_zh ? f.title_zh : f.title }
 function desc(f: { description: string; description_zh: string }) { return showZh.value && f.description_zh ? f.description_zh : f.description }
 function fix(f: { remediation: string; remediation_zh: string }) { return showZh.value && f.remediation_zh ? f.remediation_zh : f.remediation }
+
+// poc_code 原样入库，可能带 ``` 围栏；裸代码补一层围栏，避免 # 注释等被当成 markdown 渲染
+function pocMd(code: string): string {
+  const t = code.trim()
+  return t.includes('```') ? t : `\`\`\`\n${t}\n\`\`\``
+}
 
 async function refresh() {
   try {
@@ -269,8 +326,17 @@ onUnmounted(() => { clearInterval(timer); themeObserver?.disconnect() })
             当前筛选条件下没有漏洞，试试切换严重度或取消「仅看有 PoC」。
           </div>
 
-          <div v-for="f in filteredFindings" :key="f.id"
-            class="mb-2.5 overflow-hidden rounded-xl border border-border border-l-4" :class="findingBarClass(f.severity)">
+          <div v-for="g in findingGroups" :key="g.key" class="mb-5">
+            <div class="mb-2.5 flex flex-wrap items-center gap-2 border-b border-border pb-2">
+              <span
+                class="shrink-0 rounded-full px-2.5 py-0.5 text-[11px] font-bold"
+                :class="g.kind === 'whitebox' ? 'bg-accent/15 text-accent' : g.kind === 'blackbox' ? 'bg-high/15 text-high' : 'bg-panel2 text-muted'"
+              >{{ g.kind === 'whitebox' ? '白盒' : g.kind === 'blackbox' ? '黑盒' : '其他' }}</span>
+              <span class="min-w-0 break-all text-[13.5px] font-semibold text-text">{{ g.name }}</span>
+              <span class="shrink-0 text-xs text-muted">{{ g.findings.length }} 条</span>
+            </div>
+            <div v-for="f in g.findings" :key="f.id"
+              class="mb-2.5 overflow-hidden rounded-xl border border-border border-l-4" :class="findingBarClass(f.severity)">
             <button
               class="flex w-full cursor-pointer items-center gap-2.5 bg-panel2/60 px-3.5 py-2.5 text-left transition-colors hover:bg-panel2"
               @click="expanded[f.id] = !expanded[f.id]"
@@ -287,27 +353,32 @@ onUnmounted(() => { clearInterval(timer); themeObserver?.disconnect() })
             </button>
             <div v-if="expanded[f.id]" class="px-4 pt-1 pb-4 text-[13.5px] leading-relaxed text-body">
               <h4 class="mt-3 mb-1.5 text-xs font-semibold tracking-wide text-muted">端点 / 目标</h4>
-              <div class="break-all rounded-lg bg-panel2 px-3 py-2 font-mono text-xs">{{ f.endpoint || '-' }}</div>
+              <div class="break-all rounded-lg bg-panel2 px-3 py-2 font-mono text-xs">
+                <template v-if="f.target">{{ f.target }}<br /></template>{{ f.endpoint || '-' }}
+              </div>
               <template v-if="desc(f)">
                 <h4 class="mt-3.5 mb-1.5 text-xs font-semibold tracking-wide text-muted">描述</h4>
-                <div class="whitespace-pre-wrap">{{ desc(f) }}</div>
+                <MarkdownRender mode="docs" :content="desc(f)" :final="true" :is-dark="isDark" />
               </template>
               <template v-if="f.poc_description">
                 <h4 class="mt-3.5 mb-1.5 text-xs font-semibold tracking-wide text-muted">PoC 说明</h4>
-                <div class="whitespace-pre-wrap">{{ f.poc_description }}</div>
+                <MarkdownRender mode="docs" :content="f.poc_description" :final="true" :is-dark="isDark" />
               </template>
               <template v-if="f.poc_code">
                 <h4 class="mt-3.5 mb-1.5 text-xs font-semibold tracking-wide text-muted">PoC 脚本</h4>
-                <pre :class="logPre">{{ f.poc_code }}</pre>
+                <MarkdownRender mode="docs" :content="pocMd(f.poc_code)" :final="true" :is-dark="isDark" />
               </template>
               <template v-if="fix(f)">
                 <h4 class="mt-3.5 mb-1.5 text-xs font-semibold tracking-wide text-muted">修复建议</h4>
-                <div class="whitespace-pre-wrap rounded-lg border border-ok/25 bg-ok/10 px-3.5 py-2.5">{{ fix(f) }}</div>
+                <div class="rounded-lg border border-ok/25 bg-ok/10 px-3.5 py-2.5">
+                  <MarkdownRender mode="docs" :content="fix(f)" :final="true" :is-dark="isDark" />
+                </div>
               </template>
               <template v-if="showZh && f.title_zh">
                 <h4 class="mt-3.5 mb-1.5 text-xs font-semibold tracking-wide text-muted">原文</h4>
-                <div class="whitespace-pre-wrap text-xs text-muted">{{ f.title }}<br />{{ f.description }}</div>
+                <MarkdownRender mode="docs" :content="`**${f.title}**\n\n${f.description}`" :final="true" :is-dark="isDark" />
               </template>
+            </div>
             </div>
           </div>
         </TabsContent>

@@ -54,6 +54,9 @@ class Project(Base):
     git_url = Column(Text, default="")  # 旧版单仓库地址（兼容存量数据，读取时回退用）
     # 绑定的代码仓库列表：JSON [{"url": "...", "note": "用途说明"}]；非空字符串时优先生效
     git_repos = Column(Text, default="")
+    # 各仓库专属凭据快照：JSON {"仓库地址": "token"}；保存项目时逐仓库收集（表单显式填写
+    # 或按域名从操作者个人 Git 配置解析），接口永不回显
+    repo_tokens = Column(Text, default="")
     # 访问凭据（仅创建人/超管可写，接口永不回显明文）；仅支持 Personal Access Token
     git_auth_type = Column(String(8), default="")  # "" | token
     git_token = Column(Text, default="")  # PAT 明文（`token` 或 `user:token`），仅后端使用

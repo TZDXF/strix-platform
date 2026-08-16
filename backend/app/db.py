@@ -45,6 +45,7 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         ("is_archived", "BOOLEAN DEFAULT FALSE"),
         ("default_test_targets", "TEXT DEFAULT ''"),
         ("git_repos", "TEXT DEFAULT ''"),
+        ("repo_tokens", "TEXT DEFAULT ''"),
     ],
     "tasks": [
         ("input_tokens", "BIGINT"),

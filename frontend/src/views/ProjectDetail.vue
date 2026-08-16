@@ -20,9 +20,10 @@ const showLaunch = ref(false)
 const launching = ref(false)
 let timer: number | undefined
 
-// 每个仓库一个分支选择器：{url, branch, branches, loaded, loading}
+// 每个仓库一个分支选择器：{url, note, branch, branches, loaded, loading}
 interface RepoBranchSel {
   url: string
+  note: string
   branch: string
   branches: string[]
   loaded: boolean
@@ -50,29 +51,21 @@ const defaultModel = ref('')
 
 const isGit = computed(() => project.value?.source_type === 'git')
 
-// reka-ui SelectItem 不允许 value=""，用哨兵值表示「无需凭据」，提交时转回空串
-const NO_AUTH = '__none__'
-
 const showEdit = ref(false)
 const savingEdit = ref(false)
 const editForm = ref({
-  name: '', description: '', git_repos: [] as GitRepoRef[], git_auth_type: NO_AUTH,
-  git_token: '', default_test_targets: [] as TestTarget[],
+  name: '', description: '', git_repos: [] as GitRepoRef[],
+  clearProjectToken: false, default_test_targets: [] as TestTarget[],
 })
-
-const authOptions = [
-  { value: NO_AUTH, label: '无需凭据（公开仓库）' },
-  { value: 'token', label: 'Personal Access Token' },
-]
 
 function openEdit() {
   const p = project.value
   if (!p) return
   editForm.value = {
     name: p.name, description: p.description,
-    git_repos: (p.git_repos || []).map(r => ({ ...r })),
-    git_auth_type: p.has_credentials ? p.git_auth_type : NO_AUTH,
-    git_token: '', default_test_targets: (p.default_test_targets || []).map(t => ({ ...t })),
+    // 令牌不回显：行内 token 置空，留空提交=保持各仓库已存令牌
+    git_repos: (p.git_repos || []).map(r => ({ ...r, token: '' })),
+    clearProjectToken: false, default_test_targets: (p.default_test_targets || []).map(t => ({ ...t })),
   }
   showEdit.value = true
 }
@@ -87,12 +80,12 @@ async function saveEdit() {
       name: editForm.value.name.trim(),
       description: editForm.value.description.trim(),
       // 列表全量提交：仓库列表与默认地址列表，空数组表示清空（仓库至少保留一个，上方已校验）
-      ...(isGit.value ? { git_repos: repos } : {}),
-      default_test_targets: cleanTargets(editForm.value.default_test_targets),
       ...(isGit.value ? {
-        git_auth_type: editForm.value.git_auth_type === NO_AUTH ? '' : editForm.value.git_auth_type,
-        ...(editForm.value.git_token.trim() ? { git_token: editForm.value.git_token.trim() } : {}),
+        git_repos: repos,
+        // 旧版项目级统一 PAT：仅在用户勾选清除时提交清空（现在凭据按仓库单独配置）
+        ...(editForm.value.clearProjectToken ? { git_auth_type: '' } : {}),
       } : {}),
+      default_test_targets: cleanTargets(editForm.value.default_test_targets),
     })
     toast.success('项目已保存')
     showEdit.value = false
@@ -146,7 +139,7 @@ function openLaunch() {
   form.value.testTargets = defaults
   form.value.blackbox = defaults.length > 0
   form.value.repos = (project.value?.git_repos || []).map(r => ({
-    url: r.url, branch: '', branches: [], loaded: false, loading: false,
+    url: r.url, note: r.note, branch: '', branches: [], loaded: false, loading: false,
   }))
   loadModels()
   if (isGit.value) loadRepoBranches()
@@ -276,7 +269,13 @@ onUnmounted(() => clearInterval(timer))
             <div class="text-xs text-muted">代码仓库（{{ project.git_repos?.length || 0 }} 个）</div>
             <div class="mt-0.5 flex flex-col gap-0.5">
               <div v-for="r in project.git_repos" :key="r.url" class="text-[12.5px] font-semibold break-all">
-                {{ r.url }}<span v-if="r.note" class="font-normal text-muted">（{{ r.note }}）</span>
+                {{ r.url }}
+                <span v-if="r.note" class="font-normal text-muted">（{{ r.note }}）</span>
+                <span
+                  class="ml-1 inline-block rounded-full px-1.5 py-0.5 align-middle text-[10.5px] font-semibold"
+                  :class="r.credential === 'repo' ? 'bg-ok/15 text-ok' : (r.credential === 'project' ? 'bg-accent/15 text-accent' : 'bg-border/30 text-muted')"
+                  :title="r.credential === 'repo' ? '已保存该仓库专属令牌（手动填写或从个人 Git 配置按域名解析）' : (r.credential === 'project' ? '使用旧版项目级统一 PAT' : '无凭据（仅公开仓库可克隆）')"
+                >{{ r.credential === 'repo' ? '仓库令牌' : (r.credential === 'project' ? '项目级令牌' : '无凭据') }}</span>
               </div>
             </div>
           </div>
@@ -356,38 +355,6 @@ onUnmounted(() => clearInterval(timer))
           <DialogContent class="fixed top-1/2 left-1/2 z-50 max-h-[85vh] w-[680px] max-w-[94vw] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-[10px] border border-border bg-panel p-5">
             <DialogTitle class="mb-4 text-base font-semibold text-text">发起扫描任务</DialogTitle>
             <div class="grid grid-cols-2 gap-3.5">
-              <div v-if="isGit" class="col-span-2">
-                <div class="mb-1.5 flex items-center gap-2.5">
-                  <label :class="label" class="!mb-0">
-                    扫描分支{{ form.repos.length > 1 ? `（${form.repos.length} 个仓库，各自选择分支）` : '' }}
-                  </label>
-                  <button
-                    :class="btnGhost" class="!px-3 !py-1 !text-xs"
-                    :disabled="form.repos.some(r => r.loading)" @click="loadRepoBranches()"
-                  >
-                    {{ form.repos.some(r => r.loading) ? '刷新中…' : '刷新' }}
-                  </button>
-                </div>
-                <div v-for="(r, i) in form.repos" :key="r.url" :class="i > 0 ? 'mt-2' : ''">
-                  <div v-if="form.repos.length > 1" class="mb-1 truncate font-mono text-[11.5px] text-muted" :title="r.url">
-                    {{ repoBaseName(r.url) }}
-                  </div>
-                  <SelectRoot v-model="r.branch">
-                    <SelectTrigger :class="selectTrigger">
-                      <SelectValue :placeholder="r.loading ? '分支拉取中…' : '选择分支'" />
-                    </SelectTrigger>
-                    <SelectPortal>
-                      <SelectContent :class="selectContent" position="popper">
-                        <SelectViewport>
-                          <SelectItem v-for="b in r.branches" :key="b" :value="b" :class="selectItem">
-                            <SelectItemText>{{ b }}{{ r.branches[0] === b ? '（默认）' : '' }}</SelectItemText>
-                          </SelectItem>
-                        </SelectViewport>
-                      </SelectContent>
-                    </SelectPortal>
-                  </SelectRoot>
-                </div>
-              </div>
               <div>
                 <label :class="label">扫描档位</label>
                 <SelectRoot v-model="form.scanMode">
@@ -417,6 +384,47 @@ onUnmounted(() => clearInterval(timer))
                     </SelectContent>
                   </SelectPortal>
                 </SelectRoot>
+              </div>
+              <div v-if="isGit" class="col-span-2">
+                <div class="mb-1.5 flex items-center gap-2.5">
+                  <label :class="label" class="!mb-0">
+                    扫描分支{{ form.repos.length > 1 ? `（${form.repos.length} 个仓库，各自选择分支）` : '' }}
+                  </label>
+                  <button
+                    :class="btnGhost" class="!px-3 !py-1 !text-xs"
+                    :disabled="form.repos.some(r => r.loading)" @click="loadRepoBranches()"
+                  >
+                    {{ form.repos.some(r => r.loading) ? '刷新中…' : '刷新' }}
+                  </button>
+                </div>
+                <div class="flex flex-col gap-2">
+                  <div
+                    v-for="(r, i) in form.repos" :key="r.url"
+                    class="flex items-center gap-2.5 rounded-lg border border-border bg-panel2/40 px-2.5 py-2"
+                  >
+                    <span class="shrink-0 text-xs font-bold text-muted">{{ i + 1 }}</span>
+                    <div class="min-w-0 flex-1" :title="r.url">
+                      <div class="truncate font-mono text-[12.5px] font-semibold">{{ repoBaseName(r.url) }}</div>
+                      <div v-if="r.note" class="truncate text-[11px] text-muted">{{ r.note }}</div>
+                    </div>
+                    <div class="w-48 shrink-0">
+                      <SelectRoot v-model="r.branch">
+                        <SelectTrigger :class="selectTrigger">
+                          <SelectValue :placeholder="r.loading ? '分支拉取中…' : '选择分支'" />
+                        </SelectTrigger>
+                        <SelectPortal>
+                          <SelectContent :class="selectContent" position="popper">
+                            <SelectViewport>
+                              <SelectItem v-for="b in r.branches" :key="b" :value="b" :class="selectItem">
+                                <SelectItemText>{{ b }}{{ r.branches[0] === b ? '（默认）' : '' }}</SelectItemText>
+                              </SelectItem>
+                            </SelectViewport>
+                          </SelectContent>
+                        </SelectPortal>
+                      </SelectRoot>
+                    </div>
+                  </div>
+                </div>
               </div>
               <template v-if="!isGit">
                 <div class="col-span-2">
@@ -511,28 +519,18 @@ onUnmounted(() => clearInterval(timer))
                 <RepoListField
                   v-model="editForm.git_repos"
                   label="代码仓库（可绑定多个，一次扫描覆盖全部）"
-                  :auth-type="editForm.git_auth_type === 'token' ? 'token' : ''"
-                  :token="editForm.git_token"
+                  hint="每个仓库可单独填写专属访问令牌（保存后不回显，留空=保持已存令牌）；未填写时按域名自动使用「设置」中的个人 Git 服务密钥，公开仓库无需填写。凭据状态见仓库行内徽标。"
                 />
               </div>
-              <div v-if="isGit">
-                <label :class="label">访问凭据（当前：{{ project.has_credentials ? `已配置（${project.git_auth_type}）` : '未配置' }}）</label>
-                <SelectRoot v-model="editForm.git_auth_type">
-                  <SelectTrigger :class="selectTrigger"><SelectValue /></SelectTrigger>
-                  <SelectPortal>
-                    <SelectContent :class="selectContent" position="popper">
-                      <SelectViewport>
-                        <SelectItem v-for="o in authOptions" :key="o.value" :value="o.value" :class="selectItem">
-                          <SelectItemText>{{ o.label }}</SelectItemText>
-                        </SelectItem>
-                      </SelectViewport>
-                    </SelectContent>
-                  </SelectPortal>
-                </SelectRoot>
-              </div>
-              <div v-if="isGit && editForm.git_auth_type === 'token'" class="col-span-2">
-                <label :class="label">Personal Access Token（{{ project.git_auth_type === 'token' ? '留空保持现有 token' : '必填' }}）</label>
-                <input v-model="editForm.git_token" type="password" placeholder="glpat-xxxx / ghp_xxxx" :class="input" />
+              <div v-if="isGit && project.has_credentials" class="col-span-2 flex items-center gap-2.5 rounded-lg bg-panel2 px-3 py-2 text-xs text-muted">
+                <span>
+                  该项目仍保有旧版「项目级统一 PAT」，未单独配置令牌的仓库用它兜底；
+                  已为仓库单独保存令牌的优先使用各自令牌。
+                </span>
+                <label class="ml-auto flex shrink-0 cursor-pointer items-center gap-1.5 font-semibold">
+                  <input v-model="editForm.clearProjectToken" type="checkbox" class="accent-accent" />
+                  保存时清除
+                </label>
               </div>
               <div class="col-span-2">
                 <TargetListField

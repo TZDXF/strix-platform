@@ -18,6 +18,10 @@ export interface TestTarget {
 export interface GitRepoRef {
   url: string
   note: string
+  /** 凭据来源（仅展示，后端给出）：repo=已保存该仓库专属令牌；project=旧版项目级 PAT；none=无凭据 */
+  credential?: 'repo' | 'project' | 'none'
+  /** 该仓库专属访问令牌：仅创建/编辑提交时携带，保存后后端不回显（编辑留空=保持已存令牌） */
+  token?: string
 }
 
 export interface RepoBranch {
@@ -95,6 +99,7 @@ export interface Finding {
   cvss: number | null
   cwe: string
   endpoint: string
+  target: string
   has_poc: boolean
   description: string
   description_zh: string

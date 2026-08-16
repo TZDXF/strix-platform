@@ -192,7 +192,7 @@ def _display_cmd(cmd: list[str], work_dir: Path) -> str:
 
 def execute_scan(
     work_dir: Path,
-    src_dir: Path,
+    src_dirs: list[Path],
     test_targets: list[dict],
     scan_mode: str,
     log: Callable[[str], None],
@@ -202,14 +202,19 @@ def execute_scan(
 ) -> dict:
     """运行 strix，返回 {exit_code, timed_out, run_dir_name, attempts}。
 
-    test_targets 为黑盒目标列表 [{"url", "note"}]：strix 的 -t 可重复传多个目标，
-    每个地址各占一个 -t；note（地址作用说明）由调用方并入 instruction 注入。
+    src_dirs 为白盒源码目录列表（多仓库任务每仓库一个目录）：strix 的 -t 可重复
+    传多个目标，每个目录各占一个 -t，引擎为每个目标分配独立的 /workspace/<目录名>
+    子目录并在根智能体任务里逐目标列出，漏洞的 target 字段可据此归属到仓库。
+    test_targets 为黑盒目标列表 [{"url", "note"}]：每个地址各占一个 -t；
+    note（地址作用说明）由调用方并入 instruction 注入。
     """
     s = get_settings()
     work_dir.mkdir(parents=True, exist_ok=True)
     before = _list_runs(work_dir)
 
-    cmd = [s.strix_bin, "-n", "-t", str(src_dir)]
+    cmd = [s.strix_bin, "-n"]
+    for d in src_dirs:
+        cmd += ["-t", str(d)]
     for t in test_targets:
         cmd += ["-t", t["url"]]
     cmd += ["-m", scan_mode]

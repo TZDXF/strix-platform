@@ -25,6 +25,8 @@ from .sources import (
     du_mb,
     effective_repo_branches,
     effective_repos,
+    load_repo_tokens,
+    repo_credential,
     repo_dir_name,
     safe_extract_zip,
 )
@@ -208,40 +210,48 @@ def run_scan(self, task_id: str) -> dict:
         # ---- Stage 1: 获取源码 ----
         import shutil
 
-        if src_dir.exists():  # 重派发/重试时清掉上次残留，保证可幂等重跑
-            shutil.rmtree(src_dir, ignore_errors=True)
-        src_dir.mkdir(parents=True, exist_ok=True)
+        # 各仓库克隆到任务工作区顶层各自目录（不嵌套 src/），逐目录作为独立白盒
+        # 目标传给 strix（-t 可重复），引擎为每个目标分配独立 /workspace/<目录名>
+        # 子目录，漏洞的 target 字段才能归属到具体仓库
+        taken = {"scan", "src"}
+        repo_dirs = {r["url"]: task_ws / repo_dir_name(r["url"], taken) for r in repo_refs}
+        for d in [*repo_dirs.values(), src_dir]:  # 重派发/重试时清掉上次残留，保证可幂等重跑
+            shutil.rmtree(d, ignore_errors=True)
         t_fetch = time.monotonic()
+        source_dirs: list[Path]
         if task.source_type == "git":
             git_log = lambda m: (_log(task, m), db.commit())  # noqa: E731
-            if len(repo_refs) == 1:
-                clone_git(
-                    repo_refs[0]["url"], src_dir, git_log,
-                    branch=repo_refs[0]["branch"],
-                    auth_type=(project.git_auth_type if project else ""),
-                    token=(project.git_token if project else ""),
-                )
-            else:
-                # 多仓库：逐个克隆到源码目录的子目录，整体作为一个白盒目标扫描
-                _log(task, f"[fetch] 项目绑定 {len(repo_refs)} 个仓库，逐个克隆")
-                taken: set[str] = set()
-                for r in repo_refs:
-                    clone_git(
-                        r["url"], src_dir / repo_dir_name(r["url"], taken), git_log,
-                        branch=r["branch"],
-                        auth_type=(project.git_auth_type if project else ""),
-                        token=(project.git_token if project else ""),
-                    )
+            # 每个仓库各自的凭据：仓库级令牌快照（逐仓库填写/从个人 Git 配置按域名解析）优先，项目级 PAT 兜底
+            repo_tokens = load_repo_tokens(project.repo_tokens) if project else {}
+            proj_auth = project.git_auth_type if project else ""
+            proj_token = project.git_token if project else ""
+
+            def _clone(url: str, dest, branch: str) -> None:
+                auth, tok = repo_credential(repo_tokens, url, proj_auth, proj_token)
+                clone_git(url, dest, git_log, branch=branch, auth_type=auth, token=tok)
+
+            if len(repo_refs) > 1:
+                _log(task, f"[fetch] 项目绑定 {len(repo_refs)} 个仓库，逐个克隆为独立扫描目标")
+            for r in repo_refs:
+                _clone(r["url"], repo_dirs[r["url"]], r["branch"])
+            source_dirs = [repo_dirs[r["url"]] for r in repo_refs]
         else:
             upload = db.get(ProjectUpload, task.upload_id) if task.upload_id else None
             zip_path = Path(upload.stored_path) if upload and upload.stored_path else ws / "uploads" / f"{task_id}.zip"
             if not zip_path.is_file():
                 raise SourceError("上传的压缩包丢失，请重新提交")
+            src_dir.mkdir(parents=True, exist_ok=True)
             safe_extract_zip(
                 zip_path, src_dir, s.max_upload_mb * 1024 * 1024,
                 lambda m: (_log(task, m), db.commit()),
             )
-        _log(task, f"[fetch] 源码就绪（{du_mb(src_dir)}MB，耗时 {int(time.monotonic() - t_fetch)} 秒）")
+            source_dirs = [src_dir]
+        _log(
+            task,
+            f"[fetch] 源码就绪（{sum(du_mb(d) for d in source_dirs)}MB"
+            + (f"，{len(source_dirs)} 个目录：" + "、".join(f"{d.name} {du_mb(d)}MB" for d in source_dirs) if len(source_dirs) > 1 else "")
+            + f"，耗时 {int(time.monotonic() - t_fetch)} 秒）",
+        )
 
         # ---- Stage 2: strix 扫描（用户自定义指令 + 目标说明 + 中文报告提示词均通过 --instruction 注入）----
         _set_status(db, task, "scanning")
@@ -260,11 +270,17 @@ def run_scan(self, task_id: str) -> dict:
                 r["url"]: r["note"]
                 for r in (effective_repos(project.git_repos, project.git_url) if project else [])
             }
-            lines = ["This project's source code consists of multiple repositories (all included in the whitebox source directory):"]
+            lines = [
+                "This project's source code consists of multiple repositories. "
+                "Each repository is provided as a separate whitebox source directory "
+                "(its own subdirectory under /workspace, named after the repository). "
+                "When reporting a finding, set its target to the affected repository URL:"
+            ]
             for i, r in enumerate(repo_refs, 1):
                 seg = f"{i}. {r['url']}"
                 if r["branch"]:
                     seg += f" (branch {r['branch']})"
+                seg += f" [source at /workspace/{repo_dirs[r['url']].name}]"
                 if notes.get(r["url"]):
                     seg += f" — {notes[r['url']]}"
                 lines.append(seg)
@@ -278,7 +294,7 @@ def run_scan(self, task_id: str) -> dict:
         instruction = "\n".join(instruction_parts).strip()
         result = execute_scan(
             work_dir=scan_dir,
-            src_dir=src_dir,
+            src_dirs=source_dirs,
             test_targets=targets,
             scan_mode=task.scan_mode,
             model=task.model or "",

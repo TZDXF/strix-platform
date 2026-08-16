@@ -43,9 +43,11 @@ from .sources import (
     effective_repo_branches,
     effective_repos,
     list_branches,
+    load_repo_tokens,
     normalize_repos,
     parse_repo_branches,
     parse_repos,
+    repo_credential,
 )
 from .targets import (
     check_target_allowed,
@@ -645,13 +647,20 @@ def _project_out(p: Project, db: Session) -> dict:
     creator = db.get(User, p.created_by) if p.created_by else None
     targets = effective_targets(p.default_test_targets, p.default_test_url)
     repos = effective_repos(p.git_repos, p.git_url)
+    repo_tokens = load_repo_tokens(p.repo_tokens)
+
+    def _cred(url: str) -> str:
+        if url in repo_tokens:
+            return "repo"  # 仓库级专属令牌（表单逐仓库填写，或从个人 Git 配置按域名解析）
+        return "project" if p.git_token else "none"  # 旧版项目级 PAT 兜底 / 无凭据
+
     return {
         "id": p.id,
         "name": p.name,
         "description": p.description or "",
         "source_type": p.source_type,
         "git_url": repos[0]["url"] if repos else "",  # 兼容旧字段：首个仓库
-        "git_repos": repos,
+        "git_repos": [{**r, "credential": _cred(r["url"])} for r in repos],
         # 仅支持 PAT；存量 ssh 配置一律视为未配置凭据
         "git_auth_type": "token" if p.git_auth_type == "token" else "",
         "has_credentials": bool(p.git_token),
@@ -685,6 +694,33 @@ def _checked_targets(raw) -> list[dict]:
         if not ok:
             raise HTTPException(400, reason)
     return targets
+
+
+def _find_config_for_host(db: Session, user: User, repo_url: str) -> GitConfig | None:
+    """在操作者的个人 Git 配置中找与仓库地址同域的一条（用于自动解析凭据）。"""
+    configs = db.execute(select(GitConfig).where(GitConfig.user_id == user.id).order_by(GitConfig.id)).scalars().all()
+    return next((c for c in configs if c.token and same_host(c.base_url, repo_url)), None)
+
+
+def _resolve_repo_tokens(db: Session, user: User, repos: list[dict], previous: dict[str, str] | None = None) -> dict[str, str]:
+    """为仓库列表解析各仓库专属凭据快照 {url: token}。
+
+    优先级：表单逐仓库显式填写的 token > 编辑前已有快照（令牌不回显，留空即保持）
+    > 按域名从操作者个人 Git 配置自动获取（多仓库常来自不同 Git 服务，逐仓库各自解析）。
+    已从列表删除的仓库随删随清。
+    """
+    tokens = {u: t for u, t in (previous or {}).items() if t}
+    for r in repos:
+        url = r["url"]
+        explicit = (r.get("token") or "").strip()
+        if explicit:
+            tokens[url] = explicit
+        elif url not in tokens:
+            cfg = _find_config_for_host(db, user, url)
+            if cfg:
+                tokens[url] = cfg.token
+    urls = {r["url"] for r in repos}
+    return {u: t for u, t in tokens.items() if u in urls and t}
 
 
 @app.get("/api/projects", dependencies=[Depends(require_user)])
@@ -748,11 +784,13 @@ def create_project(body: ProjectCreateBody, request: Request, user: User = Depen
         default_targets = _checked_targets([{"url": body.default_test_url, "note": ""}])
     else:
         default_targets = []
+    repo_tokens = _resolve_repo_tokens(db, user, repos) if repos else {}
     project = Project(
         id=uuid.uuid4().hex, name=name, description=body.description.strip()[:2000],
         source_type=body.source_type,
         git_url=repos[0]["url"] if repos else "",
         git_repos=dump_repos(repos),
+        repo_tokens=json.dumps(repo_tokens, ensure_ascii=False) if repo_tokens else "",
         git_auth_type=git_auth_type, git_token=git_token,
         default_test_url=default_targets[0]["url"] if default_targets else "",
         default_test_targets=dump_targets(default_targets),
@@ -790,9 +828,13 @@ def patch_project(project_id: str, body: ProjectPatchBody, request: Request, use
             raise HTTPException(400, "Git 项目必须至少保留一个仓库")
         project.git_repos = dump_repos(repos)
         project.git_url = repos[0]["url"] if repos else ""
+        # 重算各仓库凭据快照：保留仍存在地址的旧快照，新地址按域名从操作者 Git 配置解析
+        resolved = _resolve_repo_tokens(db, user, repos, load_repo_tokens(project.repo_tokens))
+        project.repo_tokens = json.dumps(resolved, ensure_ascii=False) if resolved else ""
     elif body.git_url and body.git_url.strip():
         project.git_url = body.git_url.strip()
         project.git_repos = dump_repos([{"url": body.git_url.strip(), "note": ""}])
+        project.repo_tokens = ""
     if body.default_test_targets is not None:
         targets = _checked_targets(body.default_test_targets)
         project.default_test_targets = dump_targets(targets)
@@ -880,11 +922,11 @@ def project_branches(project_id: str, repo_url: str = "", user: User = Depends(r
         url = repo_url
     else:
         url = repos[0]["url"]
+    auth_type, token = repo_credential(
+        load_repo_tokens(project.repo_tokens), url, project.git_auth_type, project.git_token,
+    )
     try:
-        branches = list_branches(
-            url, auth_type=project.git_auth_type,
-            token=project.git_token,
-        )
+        branches = list_branches(url, auth_type=auth_type, token=token)
     except SourceError as exc:
         raise HTTPException(400, str(exc))
     return {"items": branches}
@@ -1049,9 +1091,16 @@ def check_git_repo(
     url = body.git_url.strip()
     if not url:
         raise HTTPException(400, "仓库地址不能为空")
+    auth_type = body.auth_type
+    token = body.token.strip()
+    if not token:
+        # 未显式携带凭据：按域名从操作者个人 Git 配置自动解析（私有仓库「测试访问」免贴 token）
+        cfg = _find_config_for_host(db, user, url)
+        if cfg:
+            auth_type, token = "token", cfg.token
     started = time.monotonic()
     try:
-        branches = list_branches(url, body.auth_type, body.token)
+        branches = list_branches(url, auth_type, token)
     except SourceError as exc:
         _audit(db, request, "git.check", f"url={url} ok=False", user=user)
         return {"reachable": False, "detail": str(exc), "branches": [], "latency_ms": None}
@@ -1398,6 +1447,7 @@ def task_detail(task_id: str, db: Session = Depends(get_db), user: User = Depend
                 "cvss": f.cvss,
                 "cwe": f.cwe,
                 "endpoint": f.endpoint,
+                "target": f.target,
                 "has_poc": f.has_poc,
                 "description": f.description,
                 "description_zh": f.description_zh,
