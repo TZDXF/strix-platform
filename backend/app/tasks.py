@@ -12,6 +12,7 @@ from pathlib import Path
 from sqlalchemy import delete
 
 from .artifacts import archive_run
+from .cancel import cancel_requested, clear_cancel
 from .celery_app import celery_app
 from .config import get_settings
 from .db import SessionLocal
@@ -41,10 +42,53 @@ ZH_INSTRUCTION = (
 )
 
 
+def web_search_guide(mcp_url: str) -> str:
+    """联网搜索指令块：教智能体用沙箱 shell curl 内网 MCP 搜索端点。
+
+    端点为 Streamable HTTP MCP，实测支持无状态 JSON-RPC 直调（免 initialize/会话），
+    返回 SSE data: 行，content[0].text 内是再包一层的 JSON 结果串（title/link/content）。
+    指令进入根智能体任务文本；根智能体派生专项智能体时按需把命令带进子任务。
+    """
+    payload = (
+        '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"web_search_prime",'
+        '"arguments":{"search_query":"<english keywords>","location":"us"}}}'
+    )
+    return (
+        "Web research capability is ENABLED for this scan: an internal web-search gateway "
+        "is reachable from the sandbox shell. To search, run:\n"
+        f"curl -s -m 30 -X POST '{mcp_url}' "
+        "-H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' "
+        f"-d '{payload}' "
+        '| sed -n "s/^data://p" '
+        "| jq -r '.result.content[0].text | fromjson | .[] | \"\\(.title) - \\(.link)\\n\\(.content)\"'\n"
+        "Guidance: use it to research current CVE details, exploit/PoC approaches, payload "
+        "syntax and bypass techniques for the exact technologies in scope. Keep queries in "
+        "English and under 70 characters. Optional arguments: search_recency_filter "
+        "(oneDay/oneWeek/oneMonth/oneYear), content_size=high for deeper summaries, "
+        "search_domain_filter to restrict to specific sites (e.g. nvd.nist.gov). "
+        "Cross-check findings across multiple results before acting on them. If the gateway "
+        "is unreachable, continue the assessment without web research. When spawning "
+        "specialist agents whose task benefits from web research, include this command in "
+        "their task text."
+    )
+
+
 def _set_status(db, task, status: str) -> None:
     task.status = status
     task.updated_at = datetime.now(timezone.utc)
     db.commit()
+
+
+def _finish_as_cancelled(db, task, task_id: str, detail: str = "") -> dict:
+    """任务以「已取消」收尾：终态时间/时长/日志，不解析产物、不翻译、不发提醒邮件。"""
+    clear_cancel(task_id)
+    task.error = ""
+    task.finished_at = datetime.now(timezone.utc)
+    if task.started_at:
+        task.duration_sec = int((task.finished_at - task.started_at).total_seconds())
+    _log(task, f"[cancel] 任务已取消{('：' + detail) if detail else ''}，耗时 {task.duration_sec or 0} 秒")
+    _set_status(db, task, "cancelled")
+    return {"task_id": task_id, "cancelled": True}
 
 
 # 这些情况属正常跳过（未配置/无邮箱/开关关闭），不写进任务日志
@@ -173,6 +217,14 @@ def run_scan(self, task_id: str) -> dict:
     if task is None:
         db.close()
         return {"error": "task not found"}
+    if task.status in ("done", "failed", "cancelled"):
+        db.close()  # 终态任务重派发（如取消后到达的旧消息）：直接忽略
+        return {"task_id": task_id, "skipped": task.status}
+    if cancel_requested(task_id):
+        # 排队期间（pending）被取消：还没动过任何资源，直接落终态
+        result = _finish_as_cancelled(db, task, task_id, "任务在排队等待期间被取消")
+        db.close()
+        return result
 
     project = db.get(Project, task.project_id) if task.project_id else None
     creator = db.get(User, task.created_by) if task.created_by else None
@@ -254,6 +306,10 @@ def run_scan(self, task_id: str) -> dict:
         )
 
         # ---- Stage 2: strix 扫描（用户自定义指令 + 目标说明 + 中文报告提示词均通过 --instruction 注入）----
+        if cancel_requested(task_id):
+            result = _finish_as_cancelled(db, task, task_id, "源码获取完成后、扫描启动前被取消")
+            db.close()
+            return result
         _set_status(db, task, "scanning")
         _log(task, f"[scan] 模型: {task.model}（中文报告）")
         targets = effective_targets(task.test_targets, task.test_url)
@@ -290,6 +346,8 @@ def run_scan(self, task_id: str) -> dict:
             for i, t in enumerate(targets, 1):
                 lines.append(f"{i}. {t['url']}" + (f" — {t['note']}" if t["note"] else ""))
             instruction_parts.append("\n".join(lines))
+        if task.web_search and s.web_search_mcp_url:
+            instruction_parts.append(web_search_guide(s.web_search_mcp_url))
         instruction_parts.append(ZH_INSTRUCTION)
         instruction = "\n".join(instruction_parts).strip()
         result = execute_scan(
@@ -301,11 +359,18 @@ def run_scan(self, task_id: str) -> dict:
             instruction=instruction,
             llm_api_key=user_llm_key,
             log=lambda m: (_log(task, m), db.commit()),
+            cancel_check=lambda: cancel_requested(task_id),
         )
         task.exit_code = result["exit_code"]
         task.attempts = result["attempts"]
         task.timed_out = result["timed_out"]
         task.run_dir_name = result["run_dir_name"]
+
+        if result.get("cancelled"):
+            # 用户取消：不解析半成品产物、不归档、不翻译，直接落终态
+            result = _finish_as_cancelled(db, task, task_id, "引擎进程已被终止")
+            db.close()
+            return result
 
         # ---- Stage 3: 产物解析入库 ----
         _set_status(db, task, "parsing")

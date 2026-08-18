@@ -67,6 +67,11 @@ class Settings(BaseSettings):
     # 原样追加的额外 CLI 参数（shlex 切分，如 "--scope-mode diff --config /path.json"）
     strix_extra_args: str = ""
 
+    # 联网搜索（可选）：内网 MCP 搜索端点（Streamable HTTP，JSON-RPC 直调）。
+    # 配置后任务提交时可勾选「联网搜索」，引擎指令中注入调用指南，智能体经沙箱
+    # shell curl 该端点查询公开漏洞/利用资料；留空 = 功能关闭（勾选时提交报 400）
+    web_search_mcp_url: str = ""
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -56,6 +56,8 @@ services:
       TARGET_ALLOWLIST: ${TARGET_ALLOWLIST:-}
       STRIX_MAX_BUDGET: ${STRIX_MAX_BUDGET:-0}
       STRIX_EXTRA_ARGS: ${STRIX_EXTRA_ARGS:-}
+      # 联网搜索（可选）：内网 MCP 搜索端点；配置后任务提交时可勾选启用
+      WEB_SEARCH_MCP_URL: ${WEB_SEARCH_MCP_URL:-}
     volumes:
       - type: bind
         source: ${WORKSPACE_HOST_DIR:-./workspaces}
@@ -70,7 +72,8 @@ services:
 
   worker:
     build: ./backend
-    command: celery -A app.celery_app.celery_app worker --pool=solo --loglevel=info -n worker1
+    # --beat：内嵌 celery beat，每分钟轮询到期定时扫描计划（见 app/schedules.py）
+    command: celery -A app.celery_app.celery_app worker --pool=solo --beat --loglevel=info -n worker1
     environment:
       <<: *backend_env
       # strix 在容器内运行时，沙箱须加入 worker 所在网络，Caido 代理走容器 IP 直连；

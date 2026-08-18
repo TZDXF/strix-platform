@@ -6,12 +6,12 @@ import {
   RadioGroupRoot, RadioGroupItem, RadioGroupIndicator,
   CheckboxRoot, CheckboxIndicator,
 } from 'reka-ui'
-import { api, type GitRepoRef, type ProjectDetailData, type TestTarget, type User } from '../api'
+import { api, type GitRepoRef, type ProjectDetailData, type Schedule, type TestTarget, type User } from '../api'
 import RepoListField from '../components/RepoListField.vue'
 import TargetListField from '../components/TargetListField.vue'
 import { toast } from '../toast'
 import {
-  badge, btn, btnDanger, btnGhost, card, hint, h3, input, label, statusBadgeClass, tableTd, tableTh,
+  badge, btn, btnDanger, btnGhost, card, hint, h3, input, label, statusBadgeClass, tableTd, tableTh, taskStatusLabel,
 } from '../ui'
 
 const props = defineProps<{ projectId: string; user: User | null }>()
@@ -32,6 +32,7 @@ interface RepoBranchSel {
 
 const form = ref({
   scanMode: 'quick', model: '', blackbox: false, testTargets: [] as TestTarget[], instruction: '',
+  webSearch: false,
   repos: [] as RepoBranchSel[],
   uploadChoice: 'new' as 'history' | 'new', uploadId: '', file: null as File | null, fileName: '',
 })
@@ -102,6 +103,7 @@ async function refresh() {
   try {
     project.value = await api.getProject(props.projectId)
   } catch (e) { toast.error((e as Error).message) }
+  loadSchedules()  // 静默刷新：下次运行/最近触发随轮询更新
 }
 
 async function loadModels() {
@@ -138,6 +140,7 @@ function openLaunch() {
   const defaults = (project.value?.default_test_targets || []).map(t => ({ ...t }))
   form.value.testTargets = defaults
   form.value.blackbox = defaults.length > 0
+  form.value.webSearch = false  // 联网搜索默认不勾选
   form.value.repos = (project.value?.git_repos || []).map(r => ({
     url: r.url, note: r.note, branch: '', branches: [], loaded: false, loading: false,
   }))
@@ -183,6 +186,7 @@ async function launch() {
       repoBranches: isGit.value ? f.repos.map(r => ({ url: r.url, branch: r.branch })) : undefined,
       testTargets: f.blackbox ? targets : [],
       instruction: f.instruction.trim(),
+      webSearch: f.webSearch,
       model: f.model,
       uploadId: !isGit.value && f.uploadChoice === 'history' ? f.uploadId : '',
       file: !isGit.value && f.uploadChoice === 'new' ? f.file : null,
@@ -213,6 +217,131 @@ async function uploadStandalone(e: Event) {
 async function removeUpload(u: { id: string; filename: string }) {
   if (!confirm(`删除历史上传「${u.filename}」？`)) return
   try { await api.deleteUpload(props.projectId, u.id); toast.success(`已删除上传「${u.filename}」`); refresh() } catch (err) { toast.error((err as Error).message) }
+}
+
+// ---- 定时扫描计划 ----
+const schedules = ref<Schedule[]>([])
+const showSched = ref(false)
+const savingSched = ref(false)
+const editingSched = ref<Schedule | null>(null)  // null = 新建；非空 = 编辑该计划
+
+const CRON_PRESETS = [
+  { label: '每天 08:00', value: '0 8 * * *' },
+  { label: '每 6 小时', value: '0 */6 * * *' },
+  { label: '每周一 08:00', value: '0 8 * * 1' },
+  { label: '每个工作日 08:00', value: '0 8 * * 1-5' },
+  { label: '每月 1 日 09:00', value: '0 9 1 * *' },
+]
+
+const schedForm = ref({
+  name: '', cron: '0 8 * * *', scanMode: 'quick', model: '',
+  blackbox: false, testTargets: [] as TestTarget[], instruction: '', webSearch: false,
+  repos: [] as RepoBranchSel[], uploadId: '',
+})
+
+async function loadSchedules() {
+  try { schedules.value = (await api.listSchedules(props.projectId)).items } catch { /* 项目页容错：失败不影响其他数据 */ }
+}
+
+function openScheduleDialog(s?: Schedule) {
+  editingSched.value = s || null
+  schedForm.value = {
+    name: s?.name && s.name !== '未命名计划' ? s.name : '',
+    cron: s?.cron || '0 8 * * *',
+    scanMode: s?.scan_mode || 'quick',
+    model: s?.model || '',
+    blackbox: (s?.test_targets?.length || 0) > 0,
+    testTargets: (s?.test_targets || (project.value?.default_test_targets || [])).map(t => ({ ...t })),
+    instruction: s?.instruction || '',
+    webSearch: s?.web_search || false,
+    repos: (s?.repo_branches?.length
+      ? s.repo_branches
+      : (project.value?.git_repos || []).map(r => ({ url: r.url, branch: '' }))
+    ).map(r => ({ url: r.url, note: '', branch: r.branch, branches: [], loaded: false, loading: false })),
+    uploadId: s?.upload_id || '',
+  }
+  loadModels()
+  if (!schedForm.value.model) schedForm.value.model = defaultModel.value || models.value[0] || 'free'
+  if (isGit.value) loadSchedBranches()
+  else if (!schedForm.value.uploadId && project.value?.uploads.length) schedForm.value.uploadId = project.value.uploads[0].id
+  showSched.value = true
+}
+
+// 逐仓库加载分支（计划弹窗自己的仓库列表，默认分支排首位并自动选中）
+async function loadSchedBranches(idx?: number) {
+  const repos = schedForm.value.repos
+  const idxs = idx == null ? repos.map((_, i) => i) : [idx]
+  if (!idxs.length) return
+  idxs.forEach(i => { repos[i].loading = true })
+  try {
+    await Promise.all(idxs.map(async i => {
+      try {
+        repos[i].branches = (await api.listBranches(props.projectId, repos[i].url)).items || []
+        repos[i].loaded = true
+        if (repos[i].branches.length && !repos[i].branch) repos[i].branch = repos[i].branches[0]
+      } catch (e) {
+        toast.error(`获取仓库「${repoBaseName(repos[i].url)}」分支失败：${(e as Error).message}`)
+      }
+    }))
+  } finally {
+    idxs.forEach(i => { repos[i].loading = false })
+  }
+}
+
+async function saveSchedule() {
+  const f = schedForm.value
+  if (isGit.value && f.repos.some(r => !r.branch)) { toast.error('请为每个仓库选择扫描分支（可点「刷新」重试拉取）'); return }
+  const targets = cleanTargets(f.testTargets)
+  if (f.blackbox && !targets.length) { toast.error('已勾选黑盒测试，请至少填写一个黑盒测试地址，或取消勾选'); return }
+  if (!isGit.value && !f.uploadId) { toast.error('zip 项目的定时计划必须选择一个历史上传'); return }
+  const cron = f.cron.trim().replace(/\s+/g, ' ')
+  if (!cron) { toast.error('请填写执行周期（cron）'); return }
+  savingSched.value = true
+  try {
+    const payload = {
+      name: f.name.trim() || '未命名计划',
+      cron,
+      scan_mode: f.scanMode,
+      model: f.model,
+      instruction: f.instruction.trim(),
+      web_search: f.webSearch,
+      repoBranches: isGit.value ? f.repos.map(r => ({ url: r.url, branch: r.branch })) : [],
+      testTargets: f.blackbox ? targets : [],
+      uploadId: !isGit.value ? f.uploadId : '',
+    }
+    if (editingSched.value) {
+      await api.patchSchedule(editingSched.value.id, payload)
+      toast.success('定时计划已保存')
+    } else {
+      await api.createSchedule(props.projectId, payload)
+      toast.success('定时计划已创建')
+    }
+    showSched.value = false
+    loadSchedules()
+  } catch (e) { toast.error((e as Error).message) } finally { savingSched.value = false }
+}
+
+async function toggleSchedule(s: Schedule) {
+  try {
+    await api.patchSchedule(s.id, { enabled: !s.enabled })
+    toast.success(s.enabled ? `已停用「${s.name}」` : `已启用「${s.name}」，将按周期自动运行`)
+    loadSchedules()
+  } catch (e) { toast.error((e as Error).message) }
+}
+
+async function runScheduleNow(s: Schedule) {
+  if (!confirm(`立即按计划「${s.name}」的配置发起一次扫描？不影响原定周期。`)) return
+  try {
+    const res = await api.runScheduleNow(s.id)
+    toast.success(`任务已提交（${res.task_id.slice(0, 12)}…），见下方任务列表`)
+    loadSchedules()
+    refresh()
+  } catch (e) { toast.error((e as Error).message) }
+}
+
+async function removeSchedule(s: Schedule) {
+  if (!confirm(`删除定时计划「${s.name}」？已按它发起的历史任务不受影响。`)) return
+  try { await api.deleteSchedule(s.id); toast.success(`已删除计划「${s.name}」`); loadSchedules() } catch (e) { toast.error((e as Error).message) }
 }
 
 async function archiveProject() {
@@ -314,6 +443,62 @@ onUnmounted(() => clearInterval(timer))
           </tbody>
         </table>
         <p v-else :class="hint">暂无历史 zip，发起任务时直接上传即可。</p>
+      </div>
+
+      <!-- 定时扫描计划 -->
+      <div :class="card">
+        <div class="mb-2.5 flex flex-wrap items-center gap-2.5">
+          <h3 :class="[h3, 'mb-0']">定时扫描（{{ schedules.length }}）</h3>
+          <span class="text-xs text-muted">按周期自动以创建时的配置快照发起任务，周期按北京时间解释</span>
+          <div class="flex-1"></div>
+          <button v-if="!project.is_archived" :class="btnGhost" class="!px-3 !py-1 !text-xs" @click="openScheduleDialog()">新建定时计划</button>
+        </div>
+        <table v-if="schedules.length" class="w-full border-collapse">
+          <thead>
+            <tr>
+              <th :class="tableTh">名称 / 周期</th><th :class="tableTh">配置</th><th :class="tableTh">状态</th>
+              <th :class="tableTh">下次运行</th><th :class="tableTh">最近触发</th><th :class="tableTh">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="s in schedules" :key="s.id" class="hover:bg-accent/5">
+              <td :class="tableTd">
+                <div class="font-semibold">{{ s.name }}</div>
+                <div class="font-mono text-xs text-muted">{{ s.cron }}（{{ s.cron_desc }}）</div>
+                <div v-if="s.last_error" class="text-xs text-crit">{{ s.last_error }}</div>
+              </td>
+              <td :class="tableTd">
+                <div class="text-[13px]">{{ s.scan_mode }} · {{ s.model || '默认模型' }}</div>
+                <div class="text-xs text-muted">
+                  {{ s.repo_branches?.length || 0 }} 个仓库<template v-if="s.test_targets?.length"> · 黑盒 {{ s.test_targets.length }} 个地址</template>
+                </div>
+              </td>
+              <td :class="tableTd">
+                <span :class="statusBadgeClass(s.enabled ? 'done' : 'pending')">{{ s.enabled ? '已启用' : '已停用' }}</span>
+              </td>
+              <td :class="tableTd">
+                <span v-if="s.enabled && s.next_run_at" class="text-xs">{{ fmtTime(s.next_run_at) }}</span>
+                <span v-else class="text-xs text-muted">-</span>
+              </td>
+              <td :class="tableTd">
+                <template v-if="s.last_task_id">
+                  <a href="javascript:void(0)" class="font-mono text-xs text-accent hover:underline" @click="openTask(s.last_task_id)">{{ s.last_task_id.slice(0, 10) }}…</a>
+                  <span v-if="s.last_task_status" :class="[statusBadgeClass(s.last_task_status), 'ml-1']" :title="s.last_task_status">{{ taskStatusLabel[s.last_task_status] || s.last_task_status }}</span>
+                </template>
+                <span v-else class="text-xs text-muted">尚未运行</span>
+              </td>
+              <td :class="tableTd">
+                <div class="flex flex-wrap gap-x-2.5 gap-y-1 text-xs font-semibold">
+                  <a href="javascript:void(0)" class="text-accent hover:underline" @click="runScheduleNow(s)">立即运行</a>
+                  <a href="javascript:void(0)" class="hover:underline" :class="s.enabled ? 'text-med' : 'text-ok'" @click="toggleSchedule(s)">{{ s.enabled ? '停用' : '启用' }}</a>
+                  <a href="javascript:void(0)" class="text-muted hover:underline" @click="openScheduleDialog(s)">编辑</a>
+                  <a href="javascript:void(0)" class="text-crit hover:underline" @click="removeSchedule(s)">删除</a>
+                </div>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <p v-else :class="hint">暂无定时计划。点击「新建定时计划」，按 cron 周期自动扫描（如每天 08:00）。</p>
       </div>
 
       <div :class="card">
@@ -473,6 +658,14 @@ onUnmounted(() => clearInterval(timer))
                   </CheckboxRoot>
                   执行黑盒测试（扫描会向测试地址发送真实攻击流量）
                 </label>
+                <label class="mt-1.5 flex cursor-pointer items-center gap-1.5 text-[13px] text-text">
+                  <CheckboxRoot v-model="form.webSearch"
+                    class="flex h-4 w-4 cursor-pointer items-center justify-center rounded border border-border bg-panel2 data-state-checked:border-accent data-state-checked:bg-accent/20">
+                    <CheckboxIndicator class="text-xs leading-none text-accent">✓</CheckboxIndicator>
+                  </CheckboxRoot>
+                  启用联网搜索
+                  <span class="text-xs text-muted">（智能体可查询公开漏洞/利用资料辅助测试；默认关闭）</span>
+                </label>
               </div>
               <div v-if="form.blackbox" class="col-span-2">
                 <TargetListField
@@ -495,6 +688,163 @@ onUnmounted(() => clearInterval(timer))
               <div class="flex-1"></div>
               <button :class="btnGhost" @click="showLaunch = false">取消</button>
               <button :class="btn" :disabled="launching" @click="launch">{{ launching ? '提交中…' : '发布任务' }}</button>
+            </div>
+          </DialogContent>
+        </DialogPortal>
+      </DialogRoot>
+
+      <!-- 新建/编辑定时计划弹窗 -->
+      <DialogRoot v-model:open="showSched">
+        <DialogPortal>
+          <DialogOverlay class="fixed inset-0 z-50 bg-black/70" />
+          <DialogContent class="fixed top-1/2 left-1/2 z-50 max-h-[85vh] w-[680px] max-w-[94vw] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-[10px] border border-border bg-panel p-5">
+            <DialogTitle class="mb-4 text-base font-semibold text-text">
+              {{ editingSched ? `编辑定时计划「${editingSched.name}」` : '新建定时计划' }}
+            </DialogTitle>
+            <div class="grid grid-cols-2 gap-3.5">
+              <div>
+                <label :class="label">计划名称</label>
+                <input v-model="schedForm.name" type="text" placeholder="如：每日代码巡检" :class="input" />
+              </div>
+              <div>
+                <label :class="label">执行周期（cron，按北京时间）</label>
+                <input v-model="schedForm.cron" type="text" placeholder="0 8 * * *" class="w-full rounded-md border border-border bg-panel2 px-2.5 py-2 font-mono text-[13.5px] text-text outline-none focus:border-accent" />
+              </div>
+              <div class="col-span-2 flex flex-wrap items-center gap-1.5">
+                <span class="text-xs text-muted">常用周期：</span>
+                <button
+                  v-for="p in CRON_PRESETS" :key="p.value"
+                  class="cursor-pointer rounded-full border px-2.5 py-0.5 text-xs font-semibold transition-colors"
+                  :class="schedForm.cron === p.value ? 'border-accent bg-accent/12 text-accent' : 'border-border bg-panel2 text-muted hover:text-text'"
+                  @click="schedForm.cron = p.value"
+                >{{ p.label }}</button>
+              </div>
+              <div>
+                <label :class="label">扫描档位</label>
+                <SelectRoot v-model="schedForm.scanMode">
+                  <SelectTrigger :class="selectTrigger"><SelectValue /></SelectTrigger>
+                  <SelectPortal>
+                    <SelectContent :class="selectContent" position="popper">
+                      <SelectViewport>
+                        <SelectItem value="quick" :class="selectItem"><SelectItemText>quick（约 1 小时）</SelectItemText></SelectItem>
+                        <SelectItem value="standard" :class="selectItem"><SelectItemText>standard（0.5~1 小时+）</SelectItemText></SelectItem>
+                        <SelectItem value="deep" :class="selectItem"><SelectItemText>deep（1~4 小时+）</SelectItemText></SelectItem>
+                      </SelectViewport>
+                    </SelectContent>
+                  </SelectPortal>
+                </SelectRoot>
+              </div>
+              <div>
+                <label :class="label">模型（默认 {{ defaultModel || 'free' }}）</label>
+                <SelectRoot v-model="schedForm.model">
+                  <SelectTrigger :class="selectTrigger"><SelectValue placeholder="free" /></SelectTrigger>
+                  <SelectPortal>
+                    <SelectContent :class="selectContent" position="popper">
+                      <SelectViewport>
+                        <SelectItem v-for="m in models" :key="m" :value="m" :class="selectItem">
+                          <SelectItemText>{{ m }}</SelectItemText>
+                        </SelectItem>
+                      </SelectViewport>
+                    </SelectContent>
+                  </SelectPortal>
+                </SelectRoot>
+              </div>
+              <div v-if="isGit" class="col-span-2">
+                <div class="mb-1.5 flex items-center gap-2.5">
+                  <label :class="[label, '!mb-0']">
+                    扫描分支{{ schedForm.repos.length > 1 ? `（${schedForm.repos.length} 个仓库，各自选择分支）` : '' }}
+                  </label>
+                  <button
+                    :class="btnGhost" class="!px-3 !py-1 !text-xs"
+                    :disabled="schedForm.repos.some(r => r.loading)" @click="loadSchedBranches()"
+                  >
+                    {{ schedForm.repos.some(r => r.loading) ? '刷新中…' : '刷新' }}
+                  </button>
+                </div>
+                <div class="flex flex-col gap-2">
+                  <div
+                    v-for="(r, i) in schedForm.repos" :key="r.url"
+                    class="flex items-center gap-2.5 rounded-lg border border-border bg-panel2/40 px-2.5 py-2"
+                  >
+                    <span class="shrink-0 text-xs font-bold text-muted">{{ i + 1 }}</span>
+                    <div class="min-w-0 flex-1" :title="r.url">
+                      <div class="truncate font-mono text-[12.5px] font-semibold">{{ repoBaseName(r.url) }}</div>
+                    </div>
+                    <div class="w-48 shrink-0">
+                      <SelectRoot v-model="r.branch">
+                        <SelectTrigger :class="selectTrigger">
+                          <SelectValue :placeholder="r.loading ? '分支拉取中…' : '选择分支'" />
+                        </SelectTrigger>
+                        <SelectPortal>
+                          <SelectContent :class="selectContent" position="popper">
+                            <SelectViewport>
+                              <SelectItem v-for="b in r.branches" :key="b" :value="b" :class="selectItem">
+                                <SelectItemText>{{ b }}{{ r.branches[0] === b ? '（默认）' : '' }}</SelectItemText>
+                              </SelectItem>
+                            </SelectViewport>
+                          </SelectContent>
+                        </SelectPortal>
+                      </SelectRoot>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <template v-if="!isGit">
+                <div class="col-span-2">
+                  <label :class="label">选择历史上传（定时任务固定复用该压缩包）</label>
+                  <SelectRoot v-model="schedForm.uploadId">
+                    <SelectTrigger :class="selectTrigger"><SelectValue placeholder="选择历史上传" /></SelectTrigger>
+                    <SelectPortal>
+                      <SelectContent :class="selectContent" position="popper">
+                        <SelectViewport>
+                          <SelectItem v-for="u in project.uploads" :key="u.id" :value="u.id" :class="selectItem">
+                            <SelectItemText>{{ u.filename }}（{{ fmtSize(u.size_bytes) }}，{{ fmtTime(u.created_at) }}）</SelectItemText>
+                          </SelectItem>
+                        </SelectViewport>
+                      </SelectContent>
+                    </SelectPortal>
+                  </SelectRoot>
+                </div>
+              </template>
+              <div class="col-span-2">
+                <label :class="label">测试方式</label>
+                <label class="flex cursor-pointer items-center gap-1.5 text-[13px] text-text">
+                  <CheckboxRoot v-model="schedForm.blackbox"
+                    class="flex h-4 w-4 cursor-pointer items-center justify-center rounded border border-border bg-panel2 data-state-checked:border-accent data-state-checked:bg-accent/20">
+                    <CheckboxIndicator class="text-xs leading-none text-accent">✓</CheckboxIndicator>
+                  </CheckboxRoot>
+                  执行黑盒测试（扫描会向测试地址发送真实攻击流量）
+                </label>
+                <label class="mt-1.5 flex cursor-pointer items-center gap-1.5 text-[13px] text-text">
+                  <CheckboxRoot v-model="schedForm.webSearch"
+                    class="flex h-4 w-4 cursor-pointer items-center justify-center rounded border border-border bg-panel2 data-state-checked:border-accent data-state-checked:bg-accent/20">
+                    <CheckboxIndicator class="text-xs leading-none text-accent">✓</CheckboxIndicator>
+                  </CheckboxRoot>
+                  启用联网搜索
+                  <span class="text-xs text-muted">（每次触发的任务均生效；默认关闭）</span>
+                </label>
+              </div>
+              <div v-if="schedForm.blackbox" class="col-span-2">
+                <TargetListField
+                  v-model="schedForm.testTargets"
+                  label="黑盒测试地址（可添加多个，建议注明每个地址的作用）"
+                  hint="保存时快照；之后修改项目默认地址不影响已建计划。"
+                />
+              </div>
+              <div class="col-span-2">
+                <label :class="label">测试指令（可选，最长 4000 字符）</label>
+                <textarea
+                  v-model="schedForm.instruction"
+                  rows="3"
+                  placeholder="聚焦的漏洞类型或测试要求，随每次定时扫描注入"
+                  class="w-full resize-y rounded-md border border-border bg-panel2 px-2.5 py-2 text-[13.5px] text-text outline-none focus:border-accent"
+                ></textarea>
+              </div>
+            </div>
+            <div class="mt-4 flex items-center gap-2.5">
+              <p :class="hint" class="!mt-0 flex-1">保存后按周期自动发起任务；任务配置取保存时的快照，模型下架时自动回退平台默认。</p>
+              <button :class="btnGhost" @click="showSched = false">取消</button>
+              <button :class="btn" :disabled="savingSched" @click="saveSchedule">{{ savingSched ? '保存中…' : '保存计划' }}</button>
             </div>
           </DialogContent>
         </DialogPortal>

@@ -42,7 +42,27 @@ export function statusBadgeClass(status: string): string {
     case 'parsing': return `${badge} bg-[#9b7bff]/15 text-[#a78bfa]`
     case 'done': return `${badge} bg-ok/15 text-ok`
     case 'failed': return `${badge} bg-crit/15 text-crit`
+    case 'cancelled': return `${badge} bg-border/40 text-muted`
     default: return `${badge} bg-border/30 text-muted`
+  }
+}
+
+export const taskStatusLabel: Record<string, string> = {
+  pending: '等待中', fetching: '拉取代码', scanning: '扫描中',
+  parsing: '解析报告', done: '已完成', failed: '失败', cancelled: '已取消',
+}
+
+// 漏洞处置状态（人工维护）：待处理默认不额外显示徽标，其余状态行内标注
+export const findingStatusLabels: Record<string, string> = {
+  open: '待处理', fixed: '已修复', ignored: '已忽略', false_positive: '误报',
+}
+
+export function findingStatusBadgeClass(status: string): string {
+  switch (status) {
+    case 'fixed': return `${badge} bg-ok/15 text-ok`
+    case 'ignored': return `${badge} bg-border/30 text-muted`
+    case 'false_positive': return `${badge} bg-med/15 text-med`
+    default: return `${badge} bg-accent/15 text-accent`
   }
 }
 

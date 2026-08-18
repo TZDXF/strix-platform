@@ -13,7 +13,7 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Upload
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, or_, select
 from sqlalchemy.orm import Session
 
 from .artifacts import artifact_response_path, ensure_bucket, presigned_artifact_url
@@ -26,6 +26,7 @@ from .auth import (
     require_user,
     verify_password,
 )
+from .cancel import request_cancel
 from .config import get_settings
 from .db import get_db, init_db
 from .gitlab import GitLabError, list_projects as gitlab_list_projects, normalize_base_url, same_host, verify_token
@@ -35,8 +36,11 @@ from .mailer import (
     K_SENDER_NAME, K_SITE_URL, K_SSL, K_USE_TLS, K_USER,
     get_mail_settings, mail_configured, mail_settings_public, send_mail, set_mail_settings,
 )
-from .models import AuditEntry, Finding, GitConfig, PlatformModel, Project, ProjectUpload, Task, User
+from .models import (
+    FINDING_STATUSES, AuditEntry, Finding, GitConfig, PlatformModel, Project, ProjectUpload, Schedule, Task, User,
+)
 from .runner import read_run_artifacts  # noqa: F401（契约复用说明）
+from .schedules import cron_valid, fire_schedule, new_schedule_id, next_cron_run, schedule_out
 from .sources import (
     SourceError,
     dump_repos,
@@ -57,6 +61,7 @@ from .targets import (
     parse_targets,
     probe_target,
 )
+from .tasklog import append_log as _append_task_log
 from .tasks import new_task_id, run_scan
 
 settings = get_settings()
@@ -1027,9 +1032,11 @@ def _task_summary(t: Task, db: Session) -> dict:
         "test_url": targets[0]["url"] if targets else "",  # 兼容旧字段：首个地址
         "test_targets": targets,
         "instruction": t.instruction or "",
+        "web_search": bool(t.web_search),
         "report_lang": t.report_lang,
         "zh_status": t.zh_status or "",
         "model": t.model or "",
+        "schedule_id": t.schedule_id or "",
         "findings_count": t.findings_count,
         "severity_counts": json.loads(t.severity_counts) if t.severity_counts else {},
         "duration_sec": t.duration_sec,
@@ -1118,6 +1125,7 @@ async def create_task(
     test_url: str = Form(""),  # 旧版单地址（兼容旧客户端）
     test_targets: str = Form(""),  # 多目标列表：JSON [{"url","note"}]
     instruction: str = Form(""),
+    web_search: bool = Form(False),  # 联网搜索：指令注入内网 MCP 搜索指南（默认关闭）
     model: str = Form(""),
     branch: str = Form(""),  # 旧版单仓库分支（兼容旧客户端）
     repo_branches: str = Form(""),  # 多仓库各自分支：JSON [{"url","branch"}]
@@ -1155,6 +1163,10 @@ async def create_task(
     instruction = instruction.strip()
     if len(instruction) > 4000:
         raise HTTPException(400, "instruction 最长 4000 个字符")
+
+    # 联网搜索：需超管在环境变量配置 WEB_SEARCH_MCP_URL 后才可勾选
+    if web_search and not settings.web_search_mcp_url:
+        raise HTTPException(400, "平台未配置联网搜索端点（WEB_SEARCH_MCP_URL），请联系超管")
 
     task_id = new_task_id()
     upload_ref: ProjectUpload | None = None
@@ -1207,7 +1219,7 @@ async def create_task(
         upload_id=upload_ref.id if upload_ref else None,
         test_url=targets[0]["url"] if targets else "",
         test_targets=dump_targets(targets),
-        instruction=instruction, model=model, report_lang="zh", status="pending",
+        instruction=instruction, web_search=web_search, model=model, report_lang="zh", status="pending",
     )
     db.add(task)
     db.commit()
@@ -1215,7 +1227,8 @@ async def create_task(
         db, request, "task.submit",
         f"id={task_id} project={project_id} mode={scan_mode} model={model or 'default'} "
         f"source={source_type} repos={len(repo_refs)} branch={branch} upload={upload_ref.id if upload_ref else '-'} "
-        f"targets={dump_targets(targets) if targets else '-'} instruction={'yes' if instruction else 'no'}",
+        f"targets={dump_targets(targets) if targets else '-'} instruction={'yes' if instruction else 'no'} "
+        f"web_search={'yes' if web_search else 'no'}",
         user=user,
     )
     run_scan.delay(task_id)
@@ -1234,9 +1247,13 @@ def list_tasks(
 ):
     q = select(Task).order_by(desc(Task.created_at))
     count_q = select(func.count(Task.id))
-    if user.role != "admin":  # 普通用户只看自己的任务，超管看全部（可按创建人过滤）
-        q = q.where(Task.created_by == user.id)
-        count_q = count_q.where(Task.created_by == user.id)
+    if user.role != "admin":  # 普通用户：自己发起的任务 + 自己名下项目中的全部任务；超管看全部（可按创建人过滤）
+        visible = or_(
+            Task.created_by == user.id,
+            Task.project_id.in_(select(Project.id).where(Project.created_by == user.id)),
+        )
+        q = q.where(visible)
+        count_q = count_q.where(visible)
     elif created_by:
         q = q.where(Task.created_by == created_by)
         count_q = count_q.where(Task.created_by == created_by)
@@ -1256,7 +1273,10 @@ def _get_task_checked(db: Session, task_id: str, user: User) -> Task:
     if task is None:
         raise HTTPException(404, "任务不存在")
     if user.role != "admin" and task.created_by != user.id:
-        raise HTTPException(403, "无权访问该任务")
+        # 例外：项目创建人可访问自己名下项目中的任务（即使任务由他人/超管发起）
+        project = db.get(Project, task.project_id) if task.project_id else None
+        if project is None or project.created_by != user.id:
+            raise HTTPException(403, "无权访问该任务")
     return task
 
 
@@ -1265,11 +1285,16 @@ def _get_task_checked(db: Session, task_id: str, user: User) -> Task:
 
 @app.get("/api/stats", dependencies=[Depends(require_user)])
 def stats(db: Session = Depends(get_db), user: User = Depends(require_user)):
-    """统计汇总：普通用户仅统计自己创建的项目与任务，超管统计全平台。"""
+    """统计汇总：普通用户统计自己创建的项目与自己可见的任务（含名下项目中他人发起的），超管统计全平台。"""
     is_admin = user.role == "admin"
 
     def scope_tasks(q):
-        return q if is_admin else q.where(Task.created_by == user.id)
+        if is_admin:
+            return q
+        return q.where(or_(
+            Task.created_by == user.id,
+            Task.project_id.in_(select(Project.id).where(Project.created_by == user.id)),
+        ))
 
     def scope_projects(q):
         return q if is_admin else q.where(Project.created_by == user.id)
@@ -1455,6 +1480,9 @@ def task_detail(task_id: str, db: Session = Depends(get_db), user: User = Depend
                 "remediation_zh": f.remediation_zh,
                 "poc_description": f.poc_description,
                 "poc_code": f.poc_code,
+                "status": f.status or "open",
+                "note": f.note or "",
+                "status_updated_at": f.status_updated_at.isoformat() if f.status_updated_at else None,
             }
             for f in findings
         ],
@@ -1508,3 +1536,270 @@ def task_report_pdf(task_id: str, request: Request, db: Session = Depends(get_db
             raise HTTPException(500, f"PDF 生成失败: {exc}")
     _audit(db, request, "task.report_pdf", f"id={task_id}", user=user)
     return FileResponse(cache_path, filename=f"strix-report-{task_id[:10]}.pdf", media_type="application/pdf")
+
+
+# ===================== 任务取消 =====================
+
+
+@app.post("/api/tasks/{task_id}/cancel", dependencies=[Depends(require_user)])
+def cancel_task(task_id: str, request: Request, db: Session = Depends(get_db), user: User = Depends(require_user)):
+    """请求取消运行中的任务：写 Redis 标记，worker 轮询到后终止引擎并落「已取消」终态。
+
+    排队（pending）中的任务同样可取消：run_scan 启动时先查标记，未开工直接收尾。
+    """
+    task = _get_task_checked(db, task_id, user)
+    if task.status not in ("pending", "fetching", "scanning", "parsing"):
+        raise HTTPException(400, "任务已结束，无需取消")
+    if not request_cancel(task_id):
+        raise HTTPException(503, "Redis 暂不可用，取消请求下达失败；请稍后重试")
+    _append_task_log(task, "[cancel] 收到取消请求，正在终止任务（通常几秒内生效）")
+    db.commit()
+    _audit(db, request, "task.cancel_request", f"id={task_id} status={task.status}", user=user)
+    return {"ok": True, "status": task.status}
+
+
+# ===================== 漏洞处置状态 =====================
+
+
+class FindingPatchBody(BaseModel):
+    status: str
+    note: str | None = None  # None=不修改备注；空串=清空
+
+
+@app.patch("/api/findings/{finding_id}", dependencies=[Depends(require_user)])
+def patch_finding(
+    finding_id: int, body: FindingPatchBody, request: Request,
+    db: Session = Depends(get_db), user: User = Depends(require_user),
+):
+    """更新漏洞处置状态（待处理/已修复/已忽略/误报）与备注；权限同任务可见性。"""
+    finding = db.get(Finding, finding_id)
+    if finding is None:
+        raise HTTPException(404, "漏洞不存在")
+    _get_task_checked(db, finding.task_id, user)
+    if body.status not in FINDING_STATUSES:
+        raise HTTPException(400, f"status 必须是 {' / '.join(FINDING_STATUSES)} 之一")
+    finding.status = body.status
+    if body.note is not None:
+        finding.note = body.note.strip()[:2000]
+    finding.status_updated_at = datetime.now(timezone.utc)
+    finding.status_updated_by = user.id
+    db.commit()
+    _audit(db, request, "finding.patch", f"id={finding_id} task={finding.task_id} status={body.status}", user=user)
+    return {
+        "id": finding.id,
+        "status": finding.status,
+        "note": finding.note or "",
+        "status_updated_at": finding.status_updated_at.isoformat() if finding.status_updated_at else None,
+    }
+
+
+# ===================== 定时扫描 =====================
+
+
+def _get_schedule_checked(db: Session, schedule_id: str, user: User) -> Schedule:
+    sch = db.get(Schedule, schedule_id)
+    if sch is None:
+        raise HTTPException(404, "定时计划不存在")
+    project = db.get(Project, sch.project_id)
+    if project is None or (user.role != "admin" and project.created_by != user.id):
+        raise HTTPException(403, "无权访问该定时计划")
+    return sch
+
+
+def _schedule_repo_refs(project: Project, raw) -> list[dict]:
+    """校验计划快照的仓库分支列表（缺省 = 项目全部仓库各自默认分支）。"""
+    repos = effective_repos(project.git_repos, project.git_url)
+    if not repos:
+        raise HTTPException(400, "项目未绑定仓库")
+    parsed = parse_repo_branches(raw) if raw is not None else []
+    if not parsed:
+        return [{"url": r["url"], "branch": ""} for r in repos]
+    bound = {r["url"] for r in repos}
+    for r in parsed:
+        if r["url"] not in bound:
+            raise HTTPException(400, f"仓库 {r['url']} 不在项目绑定列表内")
+        if r["branch"] and not re.fullmatch(r"[A-Za-z0-9._/-]+", r["branch"]):
+            raise HTTPException(400, f"仓库 {r['url']} 的分支名不合法")
+    return parsed
+
+
+@app.get("/api/projects/{project_id}/schedules", dependencies=[Depends(require_user)])
+def list_schedules(project_id: str, user: User = Depends(require_user), db: Session = Depends(get_db)):
+    _get_project_checked(db, project_id, user)
+    rows = db.execute(
+        select(Schedule).where(Schedule.project_id == project_id).order_by(desc(Schedule.created_at))
+    ).scalars().all()
+    return {"items": [schedule_out(s, db) for s in rows]}
+
+
+class ScheduleCreateBody(BaseModel):
+    name: str = ""
+    cron: str
+    scan_mode: str = "quick"
+    model: str = ""
+    instruction: str = ""
+    web_search: bool = False
+    repo_branches: str | list | None = None
+    test_targets: str | list | None = None
+    upload_id: str = ""
+
+
+@app.post("/api/projects/{project_id}/schedules", dependencies=[Depends(require_user)])
+def create_schedule(
+    project_id: str, body: ScheduleCreateBody, request: Request,
+    db: Session = Depends(get_db), user: User = Depends(require_user),
+):
+    """创建定时扫描计划：模型/分支/黑盒目标在创建时快照保存，触发时按快照发起任务。"""
+    project = _get_project_checked(db, project_id, user)
+    if project.is_archived:
+        raise HTTPException(400, "项目已归档，无法创建定时计划；请先恢复项目")
+    cron = " ".join(body.cron.split())
+    err = cron_valid(cron)
+    if err:
+        raise HTTPException(400, err)
+    if body.scan_mode not in ("quick", "standard", "deep"):
+        raise HTTPException(400, "scan_mode 必须是 quick/standard/deep")
+    model = (body.model or "").strip()
+    if model:
+        if not valid_model_name(model):
+            raise HTTPException(400, "model 不合法")
+        if model not in platform_models(db):
+            raise HTTPException(400, "model 必须是平台可用模型之一，请联系超管在「设置」中确认")
+    elif not platform_models(db):
+        raise HTTPException(400, "平台尚未配置可用模型，请联系超管在「设置」中添加")
+    instruction = body.instruction.strip()
+    if len(instruction) > 4000:
+        raise HTTPException(400, "instruction 最长 4000 个字符")
+    if body.web_search and not settings.web_search_mcp_url:
+        raise HTTPException(400, "平台未配置联网搜索端点（WEB_SEARCH_MCP_URL），请联系超管")
+    targets = _checked_targets(body.test_targets) if body.test_targets is not None else []
+    repo_refs: list[dict] = []
+    upload_id = ""
+    if project.source_type == "git":
+        repo_refs = _schedule_repo_refs(project, body.repo_branches)
+    else:
+        upload = db.get(ProjectUpload, body.upload_id) if body.upload_id else None
+        if upload is None or upload.project_id != project_id:
+            raise HTTPException(400, "zip 项目的定时计划必须选择一个项目历史上的上传压缩包")
+        upload_id = upload.id
+    next_run = next_cron_run(cron, datetime.now(timezone.utc))
+    if next_run is None:
+        raise HTTPException(400, "该 cron 在未来 4 年内没有可触发的时刻，请检查表达式")
+
+    sch = Schedule(
+        id=new_schedule_id(), project_id=project_id, created_by=user.id,
+        name=(body.name.strip() or "未命名计划")[:128], cron=cron, enabled=True,
+        scan_mode=body.scan_mode, model=model, instruction=instruction, web_search=body.web_search,
+        repo_branches=json.dumps(repo_refs, ensure_ascii=False) if repo_refs else "",
+        upload_id=upload_id or None,
+        test_targets=dump_targets(targets) if targets else "",
+        next_run_at=next_run,
+    )
+    db.add(sch)
+    db.commit()
+    _audit(
+        db, request, "schedule.create",
+        f"id={sch.id} project={project_id} cron={cron} mode={body.scan_mode} model={model or 'default'}",
+        user=user,
+    )
+    return schedule_out(sch, db)
+
+
+class SchedulePatchBody(BaseModel):
+    name: str | None = None
+    cron: str = ""
+    enabled: bool | None = None
+    scan_mode: str = ""
+    model: str | None = None  # None=不修改；""=改为触发时用平台默认
+    instruction: str | None = None
+    web_search: bool | None = None
+    repo_branches: str | list | None = None
+    test_targets: str | list | None = None
+    upload_id: str | None = None
+
+
+@app.patch("/api/schedules/{schedule_id}", dependencies=[Depends(require_user)])
+def patch_schedule(
+    schedule_id: str, body: SchedulePatchBody, request: Request,
+    db: Session = Depends(get_db), user: User = Depends(require_user),
+):
+    sch = _get_schedule_checked(db, schedule_id, user)
+    project = db.get(Project, sch.project_id)
+    cron_changed = False
+    if body.name is not None:
+        sch.name = (body.name.strip() or "未命名计划")[:128]
+    if body.cron:
+        cron = " ".join(body.cron.split())
+        err = cron_valid(cron)
+        if err:
+            raise HTTPException(400, err)
+        sch.cron = cron
+        cron_changed = True
+    if body.enabled is not None:
+        sch.enabled = body.enabled
+    if body.scan_mode:
+        if body.scan_mode not in ("quick", "standard", "deep"):
+            raise HTTPException(400, "scan_mode 必须是 quick/standard/deep")
+        sch.scan_mode = body.scan_mode
+    if body.model is not None:
+        model = body.model.strip()
+        if model:
+            if not valid_model_name(model) or model not in platform_models(db):
+                raise HTTPException(400, "model 必须是平台可用模型之一")
+        sch.model = model
+    if body.instruction is not None:
+        if len(body.instruction) > 4000:
+            raise HTTPException(400, "instruction 最长 4000 个字符")
+        sch.instruction = body.instruction.strip()
+    if body.web_search is not None:
+        if body.web_search and not settings.web_search_mcp_url:
+            raise HTTPException(400, "平台未配置联网搜索端点（WEB_SEARCH_MCP_URL），请联系超管")
+        sch.web_search = body.web_search
+    if body.repo_branches is not None and project is not None and project.source_type == "git":
+        repo_refs = _schedule_repo_refs(project, body.repo_branches)
+        sch.repo_branches = json.dumps(repo_refs, ensure_ascii=False)
+    if body.test_targets is not None:
+        targets = _checked_targets(body.test_targets)
+        sch.test_targets = dump_targets(targets) if targets else ""
+    if body.upload_id is not None:
+        if body.upload_id:
+            upload = db.get(ProjectUpload, body.upload_id)
+            if upload is None or upload.project_id != sch.project_id:
+                raise HTTPException(400, "历史上传不存在")
+            sch.upload_id = upload.id
+        else:
+            sch.upload_id = None
+    # cron 变更或重新启用时从当下重算下次运行，避免启用后立即补跑一串错过的周期
+    if sch.enabled and (cron_changed or body.enabled is True):
+        next_run = next_cron_run(sch.cron, datetime.now(timezone.utc))
+        if next_run is None:
+            raise HTTPException(400, "该 cron 在未来 4 年内没有可触发的时刻，请检查表达式")
+        sch.next_run_at = next_run
+    if not sch.enabled:
+        sch.next_run_at = None
+    sch.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    _audit(db, request, "schedule.patch", f"id={schedule_id} enabled={body.enabled} cron={body.cron or '-'}", user=user)
+    return schedule_out(sch, db)
+
+
+@app.delete("/api/schedules/{schedule_id}", dependencies=[Depends(require_user)])
+def delete_schedule(schedule_id: str, request: Request, db: Session = Depends(get_db), user: User = Depends(require_user)):
+    """删除定时计划；已按它发起的历史任务不受影响。"""
+    sch = _get_schedule_checked(db, schedule_id, user)
+    name = sch.name
+    db.delete(sch)
+    db.commit()
+    _audit(db, request, "schedule.delete", f"id={schedule_id} name={name}", user=user)
+    return {"ok": True}
+
+
+@app.post("/api/schedules/{schedule_id}/run", dependencies=[Depends(require_user)])
+def run_schedule_now(schedule_id: str, request: Request, db: Session = Depends(get_db), user: User = Depends(require_user)):
+    """立即手动触发一次计划（不影响原周期；停用的计划也可用来测试配置）。"""
+    sch = _get_schedule_checked(db, schedule_id, user)
+    task_id, err = fire_schedule(db, sch, manual=True)
+    if task_id is None:
+        raise HTTPException(400, err or "触发失败")
+    _audit(db, request, "schedule.run_now", f"id={schedule_id} task={task_id}", user=user)
+    return {"task_id": task_id, "status": "pending"}

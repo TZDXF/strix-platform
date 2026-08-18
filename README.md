@@ -56,7 +56,7 @@ cp phase0/.env .env      # 或按下表配置；STRIX_BIN 指向 venv 里的 str
 cd backend
 uv sync
 uv run uvicorn app.main:app --port 8000
-uv run celery -A app.celery_app.celery_app worker --pool=solo --loglevel=info   # Windows 必须 --pool=solo
+uv run celery -A app.celery_app.celery_app worker --pool=solo --beat --loglevel=info   # Windows 必须 --pool=solo；--beat 驱动定时扫描
 
 # 前端（API_PROXY 可覆盖代理目标，默认 http://localhost:8000）
 cd frontend && npm install && npm run dev   # http://localhost:5173

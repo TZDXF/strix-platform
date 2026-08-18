@@ -78,9 +78,11 @@ export interface TaskSummary {
   test_url: string // 兼容旧字段：首个地址
   test_targets: TestTarget[]
   instruction: string
+  web_search: boolean // 联网搜索（指令注入内网 MCP 搜索指南）
   report_lang: 'en' | 'zh'
   zh_status: string
   model: string
+  schedule_id: string // 定时计划来源（空 = 手动发起）
   findings_count: number
   severity_counts: Record<string, number>
   duration_sec: number | null
@@ -89,6 +91,8 @@ export interface TaskSummary {
   total_tokens: number | null
   error: string
 }
+
+export type FindingStatus = 'open' | 'fixed' | 'ignored' | 'false_positive'
 
 export interface Finding {
   id: number
@@ -107,6 +111,44 @@ export interface Finding {
   remediation_zh: string
   poc_description: string
   poc_code: string
+  status: FindingStatus
+  note: string
+  status_updated_at: string | null
+}
+
+export interface Schedule {
+  id: string
+  project_id: string
+  name: string
+  cron: string
+  cron_desc: string
+  enabled: boolean
+  scan_mode: string
+  model: string
+  instruction: string
+  web_search: boolean
+  repo_branches: RepoBranch[]
+  test_targets: TestTarget[]
+  upload_id: string
+  next_run_at: string | null
+  last_run_at: string | null
+  last_task_id: string
+  last_task_status: string
+  last_error: string
+  created_by_name: string
+  created_at: string | null
+}
+
+export interface SchedulePayload {
+  name: string
+  cron: string
+  scan_mode: string
+  model: string
+  instruction: string
+  web_search?: boolean
+  repo_branches?: RepoBranch[]
+  test_targets?: TestTarget[]
+  upload_id?: string
 }
 
 export interface AgentUsage {
@@ -271,6 +313,7 @@ export interface SubmitTaskParams {
   repoBranches?: RepoBranch[]
   testTargets?: TestTarget[]
   instruction?: string
+  webSearch?: boolean
   model?: string
   branch?: string
   uploadId?: string
@@ -433,6 +476,7 @@ export const api = {
     if (p.branch) form.append('branch', p.branch)
     form.append('test_targets', JSON.stringify(p.testTargets || []))
     if (p.instruction) form.append('instruction', p.instruction)
+    if (p.webSearch) form.append('web_search', '1')
     if (p.model) form.append('model', p.model)
     if (p.branch) form.append('branch', p.branch)
     if (p.uploadId) form.append('upload_id', p.uploadId)
@@ -452,4 +496,22 @@ export const api = {
   getLog: (id: string) => request<{ log: string }>('GET', `/api/tasks/${id}/log`),
   downloadArtifacts: (id: string) => download(`/api/tasks/${id}/artifacts`, `${id}-artifacts.zip`),
   downloadPdf: (id: string) => download(`/api/tasks/${id}/report.pdf`, `strix-report-${id.slice(0, 10)}.pdf`),
+  cancelTask: (id: string) => request<{ ok: boolean; status: string }>('POST', `/api/tasks/${id}/cancel`),
+
+  // 漏洞处置状态
+  patchFinding: (id: number, patch: { status: FindingStatus; note?: string }) =>
+    request<{ id: number; status: FindingStatus; note: string; status_updated_at: string | null }>(
+      'PATCH', `/api/findings/${id}`, { json: patch },
+    ),
+
+  // 定时扫描计划
+  listSchedules: (projectId: string) =>
+    request<{ items: Schedule[] }>('GET', `/api/projects/${projectId}/schedules`),
+  createSchedule: (projectId: string, p: SchedulePayload) =>
+    request<Schedule>('POST', `/api/projects/${projectId}/schedules`, { json: p }),
+  patchSchedule: (id: string, patch: Partial<SchedulePayload> & { enabled?: boolean }) =>
+    request<Schedule>('PATCH', `/api/schedules/${id}`, { json: patch }),
+  deleteSchedule: (id: string) => request<{ ok: boolean }>('DELETE', `/api/schedules/${id}`),
+  runScheduleNow: (id: string) =>
+    request<{ task_id: string; status: string }>('POST', `/api/schedules/${id}/run`),
 }

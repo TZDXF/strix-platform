@@ -190,6 +190,38 @@ def _display_cmd(cmd: list[str], work_dir: Path) -> str:
     return " ".join(parts).replace(str(work_dir), ".")
 
 
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """终止子进程及其全部子孙（strix CLI 自身会派生 docker 等子进程）。
+
+    POSIX：Popen 以 start_new_session 启动，先 SIGTERM 进程组给 CLI 清理沙箱的
+    机会，10 秒未退再 SIGKILL；Windows 无进程组信号，用 taskkill /F /T 强杀树。
+    """
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True, timeout=30,
+            )
+        else:
+            import signal
+
+            pgid = os.getpgid(proc.pid)
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(pgid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    finally:
+        try:
+            proc.kill()  # 双保险：上面任何一步没杀掉时兜底
+        except OSError:
+            pass
+
+
 def execute_scan(
     work_dir: Path,
     src_dirs: list[Path],
@@ -199,14 +231,16 @@ def execute_scan(
     model: str = "",
     instruction: str = "",
     llm_api_key: str = "",
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict:
-    """运行 strix，返回 {exit_code, timed_out, run_dir_name, attempts}。
+    """运行 strix，返回 {exit_code, timed_out, cancelled, run_dir_name, attempts}。
 
     src_dirs 为白盒源码目录列表（多仓库任务每仓库一个目录）：strix 的 -t 可重复
     传多个目标，每个目录各占一个 -t，引擎为每个目标分配独立的 /workspace/<目录名>
     子目录并在根智能体任务里逐目标列出，漏洞的 target 字段可据此归属到仓库。
     test_targets 为黑盒目标列表 [{"url", "note"}]：每个地址各占一个 -t；
     note（地址作用说明）由调用方并入 instruction 注入。
+    cancel_check 返回 True 时终止进程树并放弃后续重试（结果 cancelled=True）。
     """
     s = get_settings()
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -235,12 +269,17 @@ def execute_scan(
 
     exit_code: int | None = None
     timed_out = False
+    cancelled = False
     attempts = 0
 
     for attempt in range(1, s.max_scan_attempts + 1):
+        if cancel_check and cancel_check():
+            cancelled = True
+            log("[scan] 检测到取消请求，停止执行")
+            break
         attempts = attempt
         log(f"[scan] 第 {attempt}/{s.max_scan_attempts} 次执行（超时 {timeout_sec // 60} 分钟）")
-        # tail 线程只在 proc.wait 期间运行，wait 返回（含超时）即 join，
+        # tail 线程只在 proc 存活期间运行，wait 返回（含超时/取消）即 join，
         # 保证 log 回调（写 DB）不与主线程并发
         stop_evt = threading.Event()
         mon = threading.Thread(target=_tail_strix_log, args=(work_dir, log, stop_evt), daemon=True)
@@ -248,21 +287,42 @@ def execute_scan(
         try:
             with scan_log.open("ab") as out:
                 out.write(f"\n===== attempt {attempt} {now_bj().strftime('%Y-%m-%dT%H:%M:%S')} =====\n".encode())
-                proc = subprocess.Popen(cmd, cwd=str(work_dir), stdout=out, stderr=subprocess.STDOUT, env=env)
-                try:
-                    exit_code = proc.wait(timeout=timeout_sec)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=60)
-                    exit_code = proc.returncode
-                    timed_out = True
+                # POSIX 下独立进程组：取消/超时可 killpg 整树而不伤 worker 自身
+                proc = subprocess.Popen(
+                    cmd, cwd=str(work_dir), stdout=out, stderr=subprocess.STDOUT, env=env,
+                    start_new_session=(os.name != "nt"),
+                )
+                # 等待期间每 2 秒轮询一次取消标记（跨进程经 Redis）；总时长仍受
+                # timeout_sec 约束，语义与原 proc.wait(timeout=...) 一致
+                started = time.monotonic()
+                while True:
+                    try:
+                        exit_code = proc.wait(timeout=2)
+                        break
+                    except subprocess.TimeoutExpired:
+                        if cancel_check and cancel_check():
+                            cancelled = True
+                            log("[scan] 收到取消请求，正在终止引擎进程…")
+                            _kill_tree(proc)
+                            proc.wait(timeout=60)
+                            exit_code = proc.returncode
+                            break
+                        if time.monotonic() - started >= timeout_sec:
+                            _kill_tree(proc)
+                            proc.wait(timeout=60)
+                            exit_code = proc.returncode
+                            timed_out = True
+                            break
         finally:
             stop_evt.set()
             mon.join(timeout=10)
-        log(f"[scan] 退出码 {exit_code}" + ("（超时被回收）" if timed_out else ""))
+        log(
+            f"[scan] 退出码 {exit_code}"
+            + ("（超时被回收）" if timed_out else "（用户取消）" if cancelled else "")
+        )
 
-        if timed_out:
-            break  # 超时是运维回收，不重试
+        if timed_out or cancelled:
+            break  # 运维回收/用户主动取消，不重试
 
         tail = ""
         try:
@@ -271,7 +331,14 @@ def execute_scan(
             pass
         if exit_code == 1 and RETRY_MARKER in tail:
             log("[scan] LLM 连接失败（网关 free 池间歇故障），30 秒后自动重试")
-            time.sleep(30)
+            for _ in range(30):  # 分段睡眠，重试等待期间仍响应取消
+                if cancel_check and cancel_check():
+                    cancelled = True
+                    break
+                time.sleep(1)
+            if cancelled:
+                log("[scan] 重试等待期间收到取消请求，停止执行")
+                break
             continue
         break
 
@@ -289,7 +356,7 @@ def execute_scan(
     if run_dir_name:
         log(f"[scan] run 目录: {run_dir_name}")
 
-    return {"exit_code": exit_code, "timed_out": timed_out, "run_dir_name": run_dir_name, "attempts": attempts}
+    return {"exit_code": exit_code, "timed_out": timed_out, "cancelled": cancelled, "run_dir_name": run_dir_name, "attempts": attempts}
 
 
 def read_run_artifacts(work_dir: Path, run_dir_name: str) -> tuple[dict, list[dict]]:

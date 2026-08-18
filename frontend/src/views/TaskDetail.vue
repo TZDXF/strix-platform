@@ -1,12 +1,15 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
-import { TabsRoot, TabsList, TabsTrigger, TabsContent, CheckboxRoot, CheckboxIndicator } from 'reka-ui'
-import { api, type AgentUsage, type Finding, type TaskDetail as TaskDetailData } from '../api'
+import {
+  TabsRoot, TabsList, TabsTrigger, TabsContent, CheckboxRoot, CheckboxIndicator,
+  SelectRoot, SelectTrigger, SelectValue, SelectPortal, SelectContent, SelectViewport, SelectItem, SelectItemText,
+} from 'reka-ui'
+import { api, type AgentUsage, type Finding, type FindingStatus, type TaskDetail as TaskDetailData } from '../api'
 import MarkdownRender from 'markstream-vue'
 import { toast } from '../toast'
 import {
-  btn, btnGhost, card, cardLifted, err as errCls, findingBarClass, hint, logPre,
-  sevBadgeClass, sevLabel, statusBadgeClass, tableTd, tableTh,
+  btn, btnDanger, btnGhost, card, cardLifted, err as errCls, findingBarClass, findingStatusBadgeClass,
+  findingStatusLabels, hint, logPre, sevBadgeClass, sevLabel, statusBadgeClass, tableTd, tableTh, taskStatusLabel,
 } from '../ui'
 
 const props = defineProps<{ taskId: string }>()
@@ -20,6 +23,52 @@ let timer: number | undefined
 
 const running = computed(() => ['pending', 'fetching', 'scanning', 'parsing'].includes(task.value?.status || ''))
 
+// ---- 任务取消（运行中可见；排队中的任务也可取消） ----
+const cancelling = ref(false)
+
+async function cancelTask() {
+  if (!confirm('确定取消该任务？正在运行的扫描引擎进程会被终止，已产生的部分结果不会入库。')) return
+  cancelling.value = true
+  try {
+    await api.cancelTask(props.taskId)
+    toast.success('取消请求已下达，任务通常在几秒内终止')
+    refresh()
+  } catch (e) { toast.error((e as Error).message) } finally { cancelling.value = false }
+}
+
+// ---- 漏洞处置状态：待处理 / 已修复 / 已忽略 / 误报 ----
+const FINDING_STATUS_OPTIONS: FindingStatus[] = ['open', 'fixed', 'ignored', 'false_positive']
+const editState = ref<Record<number, { status: FindingStatus; note: string }>>({})
+const savingFinding = ref(0)
+
+function ensureEdit(f: Finding) {
+  if (!editState.value[f.id]) editState.value[f.id] = { status: f.status, note: f.note }
+}
+
+function toggleExpand(f: Finding) {
+  expanded.value[f.id] = !expanded.value[f.id]
+  if (expanded.value[f.id]) ensureEdit(f)
+}
+
+async function saveFindingStatus(f: Finding) {
+  const st = editState.value[f.id]
+  if (!st) return
+  savingFinding.value = f.id
+  try {
+    const res = await api.patchFinding(f.id, { status: st.status, note: st.note })
+    f.status = res.status
+    f.note = res.note
+    f.status_updated_at = res.status_updated_at
+    toast.success('处置状态已保存')
+  } catch (e) { toast.error((e as Error).message) } finally { savingFinding.value = 0 }
+}
+
+const statusCounts = computed(() => {
+  const c: Record<string, number> = { open: 0, fixed: 0, ignored: 0, false_positive: 0 }
+  for (const f of task.value?.findings || []) if (f.status in c) c[f.status]++
+  return c
+})
+
 // 运行中日志持续追加，自动滚动到底部跟随最新输出
 watch(logText, async () => {
   if (!running.value) return
@@ -31,11 +80,6 @@ const reportMd = computed(() => task.value?.report_md || '')
 // 主题在 html.light 类上生效，监听类变化让报告渲染同步亮暗色
 const isDark = ref(!document.documentElement.classList.contains('light'))
 let themeObserver: MutationObserver | undefined
-
-const statusLabels: Record<string, string> = {
-  pending: '等待中', fetching: '拉取代码', scanning: '扫描中',
-  parsing: '解析报告', done: '已完成', failed: '失败',
-}
 
 const sevOrder = ['critical', 'high', 'medium', 'low', 'info']
 const sevGrid = computed(() => {
@@ -53,16 +97,22 @@ const sevBarCls: Record<string, string> = {
   critical: 'bg-crit', high: 'bg-high', medium: 'bg-med', low: 'bg-low', info: 'bg-accent',
 }
 
-// ---- 漏洞明细筛选：按严重度 + 是否含 PoC ----
+// ---- 漏洞明细筛选：按严重度 + 是否含 PoC + 仅看待处理 ----
 const sevFilter = ref('all')
 const onlyPoc = ref(false)
+const onlyOpen = ref(false)
 const filteredFindings = computed(() =>
   (task.value?.findings || []).filter(f =>
-    (sevFilter.value === 'all' || f.severity === sevFilter.value) && (!onlyPoc.value || f.has_poc)))
+    (sevFilter.value === 'all' || f.severity === sevFilter.value)
+    && (!onlyPoc.value || f.has_poc)
+    && (!onlyOpen.value || f.status === 'open')))
 const allExpanded = computed(() =>
   filteredFindings.value.length > 0 && filteredFindings.value.every(f => expanded.value[f.id]))
 function expandAll(open: boolean) {
-  for (const f of task.value?.findings || []) expanded.value[f.id] = open
+  for (const f of task.value?.findings || []) {
+    expanded.value[f.id] = open
+    if (open) ensureEdit(f)
+  }
 }
 
 // ---- 漏洞按目标分组：白盒各仓库 / 黑盒各地址 / 未标注 ----
@@ -186,8 +236,10 @@ onUnmounted(() => { clearInterval(timer); themeObserver?.disconnect() })
           <h1 class="flex flex-wrap items-center gap-2.5 text-[26px] leading-tight font-bold text-text">
             安全测试报告
             <span :class="statusBadgeClass(task.status)" :title="task.status">
-              {{ statusLabels[task.status] || task.status }}
+              {{ taskStatusLabel[task.status] || task.status }}
             </span>
+            <span v-if="task.schedule_id" class="inline-block rounded-full bg-accent/15 px-2.5 py-0.5 text-xs font-semibold text-accent" title="由定时计划自动发起">定时扫描</span>
+            <span v-if="task.web_search" class="inline-block rounded-full bg-[#9b7bff]/15 px-2.5 py-0.5 text-xs font-semibold text-[#a78bfa]" title="智能体可经内网搜索端点查询公开漏洞/利用资料">联网搜索</span>
             <span v-if="task.timed_out" :class="statusBadgeClass('failed')">超时终止</span>
             <span v-if="task.zh_status === 'pending'" class="inline-block rounded-full bg-[#9b7bff]/15 px-2.5 py-0.5 text-xs font-semibold text-[#a78bfa]">翻译中</span>
           </h1>
@@ -200,6 +252,9 @@ onUnmounted(() => { clearInterval(timer); themeObserver?.disconnect() })
         </div>
         <div class="flex-1"></div>
         <div class="flex shrink-0 items-center gap-2.5">
+          <button v-if="running" :class="btnDanger" :disabled="cancelling" @click="cancelTask">
+            {{ cancelling ? '取消中…' : '取消任务' }}
+          </button>
           <button v-if="task.has_artifacts" :class="btnGhost" @click="downloadArtifacts">下载产物 zip</button>
           <button v-if="task.status === 'done' && task.run_dir_name" :class="btn" @click="downloadPdf">导出 PDF 报告</button>
         </div>
@@ -254,10 +309,14 @@ onUnmounted(() => { clearInterval(timer); themeObserver?.disconnect() })
       <p v-if="task.status === 'done'" class="mb-[18px] text-[13px] text-muted">
         共发现 <span class="font-bold text-text">{{ task.findings_count }}</span> 个问题，其中
         <span :class="criticalPlus ? 'font-bold text-crit' : 'font-bold text-text'">严重 / 高危 {{ criticalPlus }}</span>
-        个。AI 辅助测试结果，建议人工复核。
+        个。待处理 <span class="font-bold text-text">{{ statusCounts.open }}</span> 个<template v-if="statusCounts.fixed || statusCounts.ignored || statusCounts.false_positive">
+          （已修复 {{ statusCounts.fixed }} / 已忽略 {{ statusCounts.ignored }} / 误报 {{ statusCounts.false_positive }}）</template>。AI 辅助测试结果，建议人工复核。
       </p>
       <p v-else-if="running" class="mb-[18px] text-[13px] text-muted">
-        任务{{ statusLabels[task.status] || task.status }}中，页面每 5 秒自动刷新，可先查看执行日志。
+        任务{{ taskStatusLabel[task.status] || task.status }}中，页面每 5 秒自动刷新，可先查看执行日志。
+      </p>
+      <p v-else-if="task.status === 'cancelled'" class="mb-[18px] text-[13px] text-muted">
+        任务已被取消：扫描引擎在执行中终止，未解析/保留部分结果。可重新发起任务。
       </p>
       <div v-if="task.error" :class="errCls" class="mb-[18px]">{{ task.error }}</div>
 
@@ -310,6 +369,13 @@ onUnmounted(() => { clearInterval(timer); themeObserver?.disconnect() })
               </CheckboxRoot>
               仅看有 PoC
             </label>
+            <label class="flex cursor-pointer items-center gap-1.5 text-xs text-muted" title="隐藏已修复 / 已忽略 / 误报的漏洞">
+              <CheckboxRoot v-model="onlyOpen"
+                class="flex h-3.5 w-3.5 cursor-pointer items-center justify-center rounded border border-border bg-panel2 data-state-checked:border-accent data-state-checked:bg-accent/20">
+                <CheckboxIndicator class="text-[10px] leading-none text-accent">✓</CheckboxIndicator>
+              </CheckboxRoot>
+              仅看待处理
+            </label>
             <button
               class="cursor-pointer rounded-md border border-border bg-transparent px-2.5 py-1 text-xs font-semibold text-muted transition-colors hover:border-accent hover:text-accent"
               @click="expandAll(!allExpanded)"
@@ -339,10 +405,11 @@ onUnmounted(() => { clearInterval(timer); themeObserver?.disconnect() })
               class="mb-2.5 overflow-hidden rounded-xl border border-border border-l-4" :class="findingBarClass(f.severity)">
             <button
               class="flex w-full cursor-pointer items-center gap-2.5 bg-panel2/60 px-3.5 py-2.5 text-left transition-colors hover:bg-panel2"
-              @click="expanded[f.id] = !expanded[f.id]"
+              @click="toggleExpand(f)"
             >
               <span :class="sevBadgeClass(f.severity)">{{ (sevLabel[f.severity] || f.severity).toUpperCase() }}</span>
-              <span class="min-w-0 flex-1 truncate text-[14px] font-semibold text-text">{{ title(f) }}</span>
+              <span v-if="f.status && f.status !== 'open'" :class="findingStatusBadgeClass(f.status)">{{ findingStatusLabels[f.status] || f.status }}</span>
+              <span class="min-w-0 flex-1 truncate text-[14px] font-semibold text-text" :class="f.status === 'ignored' || f.status === 'false_positive' ? 'opacity-60' : ''">{{ title(f) }}</span>
               <span class="hidden shrink-0 text-xs text-muted sm:inline">
                 CVSS {{ f.cvss ?? '-' }} · {{ f.cwe || '-' }} · {{ f.has_poc ? '有 PoC' : '无 PoC' }}
               </span>
@@ -352,6 +419,44 @@ onUnmounted(() => { clearInterval(timer); themeObserver?.disconnect() })
               >▼</span>
             </button>
             <div v-if="expanded[f.id]" class="px-4 pt-1 pb-4 text-[13.5px] leading-relaxed text-body">
+              <!-- 处置状态（人工维护：待处理/已修复/已忽略/误报 + 备注） -->
+              <div v-if="editState[f.id]" class="mt-3 rounded-lg border border-border bg-panel2/40 px-3.5 py-2.5">
+                <div class="flex flex-wrap items-center gap-2.5">
+                  <span class="shrink-0 text-xs font-semibold tracking-wide text-muted">处置状态</span>
+                  <div class="w-32">
+                    <SelectRoot v-model="editState[f.id]!.status">
+                      <SelectTrigger class="flex w-full items-center justify-between rounded-md border border-border bg-panel2 px-2.5 py-1.5 text-[13px] text-text outline-none focus:border-accent">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectPortal>
+                        <SelectContent class="z-50 max-h-72 min-w-[var(--reka-select-trigger-width)] overflow-hidden rounded-md border border-border bg-panel2 py-1 shadow-lg" position="popper">
+                          <SelectViewport>
+                            <SelectItem
+                              v-for="s in FINDING_STATUS_OPTIONS" :key="s" :value="s"
+                              class="cursor-pointer rounded-md px-2.5 py-1.5 text-[13px] text-text data-highlighted:bg-accent/15 data-highlighted:outline-none"
+                            >
+                              <SelectItemText>{{ findingStatusLabels[s] }}</SelectItemText>
+                            </SelectItem>
+                          </SelectViewport>
+                        </SelectContent>
+                      </SelectPortal>
+                    </SelectRoot>
+                  </div>
+                  <div class="flex-1"></div>
+                  <span v-if="f.status_updated_at" class="text-[11px] text-muted">上次更新 {{ fmtTime(f.status_updated_at) }}</span>
+                  <button
+                    class="cursor-pointer rounded-md border border-accent bg-accent/10 px-3 py-1 text-xs font-semibold text-accent transition-colors hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-50"
+                    :disabled="savingFinding === f.id"
+                    @click="saveFindingStatus(f)"
+                  >{{ savingFinding === f.id ? '保存中…' : '保存' }}</button>
+                </div>
+                <textarea
+                  v-model="editState[f.id]!.note"
+                  rows="2"
+                  placeholder="备注（可选）：修复说明 / 忽略原因 / 复测结论等，最长 2000 字"
+                  class="mt-2 w-full resize-y rounded-md border border-border bg-panel2 px-2.5 py-1.5 text-xs text-text outline-none focus:border-accent"
+                ></textarea>
+              </div>
               <h4 class="mt-3 mb-1.5 text-xs font-semibold tracking-wide text-muted">端点 / 目标</h4>
               <div class="break-all rounded-lg bg-panel2 px-3 py-2 font-mono text-xs">
                 <template v-if="f.target">{{ f.target }}<br /></template>{{ f.endpoint || '-' }}

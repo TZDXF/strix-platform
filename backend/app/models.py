@@ -108,9 +108,11 @@ class Task(Base):
     started_at = Column(DateTime(timezone=True), nullable=True)
     finished_at = Column(DateTime(timezone=True), nullable=True)
 
-    # pending -> fetching -> scanning -> parsing -> translating -> done | failed
+    # pending -> fetching -> scanning -> parsing -> translating -> done | failed | cancelled
     status = Column(String(16), default="pending", index=True)
     scan_mode = Column(String(16), default="quick")
+    # 定时扫描来源（schedule.id；空 = 手动发起）
+    schedule_id = Column(String(32), default="", index=True)
     source_type = Column(String(8))  # git | zip
     source_ref = Column(Text, default="")  # git URL（多仓库时为首个仓库）或上传文件名
     branch = Column(String(255), default="")  # 旧版单仓库扫描分支（兼容存量任务）
@@ -121,6 +123,7 @@ class Task(Base):
     # 黑盒测试地址列表：JSON [{"url": "...", "note": "作用说明"}]；非空字符串时优先生效
     test_targets = Column(Text, default="")
     instruction = Column(Text, default="")  # 用户自定义测试指令（--instruction，可选）
+    web_search = Column(Boolean, default=False)  # 联网搜索：指令中注入内网 MCP 搜索调用指南
     report_lang = Column(String(8), default="zh")  # 固定中文报告；保留字段兼容历史 en 任务
     zh_status = Column(String(16), default="")  # 翻译状态："" | pending | done | failed
 
@@ -146,12 +149,52 @@ class Task(Base):
     error = Column(Text, default="")
 
 
+class Schedule(Base):
+    """定时扫描计划：按 cron 周期（北京时间）以创建时的快照配置自动发起任务。
+
+    模型 / 分支 / 黑盒目标等在创建时快照保存，之后项目仓库列表变化不影响已建计划
+    （仓库被移除时触发侧按现绑定列表校验并记录 last_error）。
+    """
+
+    __tablename__ = "schedules"
+
+    id = Column(String(32), primary_key=True)  # uuid4 hex
+    project_id = Column(String(32), ForeignKey("projects.id"), index=True, nullable=False)
+    created_by = Column(Integer, ForeignKey("users.id"), index=True)
+    name = Column(String(128), default="")
+    cron = Column(String(64), default="")  # 5 字段 cron，按北京时间解释
+    enabled = Column(Boolean, default=True)
+    # 任务配置快照（与手动发起任务的字段一一对应）
+    scan_mode = Column(String(16), default="quick")
+    model = Column(String(64), default="")  # 留空 = 触发时用平台默认模型
+    instruction = Column(Text, default="")
+    web_search = Column(Boolean, default=False)  # 触发任务时是否注入联网搜索指南
+    repo_branches = Column(Text, default="")  # JSON [{"url","branch"}]；分支留空 = 各仓库默认分支
+    upload_id = Column(String(32), ForeignKey("project_uploads.id"), nullable=True)  # zip 项目复用的历史上传
+    test_targets = Column(Text, default="")  # JSON [{"url","note"}]
+    # 调度状态
+    next_run_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    last_run_at = Column(DateTime(timezone=True), nullable=True)
+    last_task_id = Column(String(32), default="")
+    last_error = Column(Text, default="")
+    created_at = Column(DateTime(timezone=True), default=_now)
+    updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+
+FINDING_STATUSES = ("open", "fixed", "ignored", "false_positive")
+
+
 class Finding(Base):
     __tablename__ = "findings"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     task_id = Column(String(32), ForeignKey("tasks.id"), index=True)
     vuln_id = Column(String(64), default="")
+    # 漏洞处置状态（人工维护，重新扫描生成的新任务各自独立）
+    status = Column(String(16), default="open", index=True)  # open | fixed | ignored | false_positive
+    note = Column(Text, default="")  # 处置备注（修复说明 / 忽略原因等）
+    status_updated_at = Column(DateTime(timezone=True), nullable=True)
+    status_updated_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     title = Column(Text, default="")
     severity = Column(String(16), default="info", index=True)
     cvss = Column(Float, nullable=True)

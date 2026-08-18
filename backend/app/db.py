@@ -33,6 +33,10 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         ("title_zh", "TEXT DEFAULT ''"),
         ("description_zh", "TEXT DEFAULT ''"),
         ("remediation_zh", "TEXT DEFAULT ''"),
+        ("status", "VARCHAR(16) DEFAULT 'open'"),
+        ("note", "TEXT DEFAULT ''"),
+        ("status_updated_at", "TIMESTAMP WITH TIME ZONE"),
+        ("status_updated_by", "INTEGER"),
     ],
     "audit_entries": [
         ("user_id", "INTEGER"),
@@ -53,6 +57,11 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         ("agents_usage", "TEXT DEFAULT ''"),
         ("test_targets", "TEXT DEFAULT ''"),
         ("repo_branches", "TEXT DEFAULT ''"),
+        ("schedule_id", "VARCHAR(32) DEFAULT ''"),
+        ("web_search", "BOOLEAN DEFAULT FALSE"),
+    ],
+    "schedules": [
+        ("web_search", "BOOLEAN DEFAULT FALSE"),
     ],
 }
 
