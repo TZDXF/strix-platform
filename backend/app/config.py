@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     admin_initial_password: str = "strix-admin-123"
 
     # 工作目录（任务源码、扫描工作区、产物归档）
-    workspace_root: str = "./workspaces"
+    workspace_root: str = "./docker/data/workspaces"
 
     # strix 引擎
     strix_bin: str = "strix"

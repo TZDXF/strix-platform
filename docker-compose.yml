@@ -8,7 +8,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-strix}
       POSTGRES_DB: strix
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - ./docker/data/postgres:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U strix"]
       interval: 5s
@@ -29,7 +29,7 @@ services:
       RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-strix-platform-secret}
       RUSTFS_VOLUMES: /data
     volumes:
-      - rustfsdata:/data
+      - ./docker/data/rustfs:/data
     # 首次启动后手动创建桶 strix-platform（见 README）
 
   api:
@@ -60,7 +60,7 @@ services:
       WEB_SEARCH_MCP_URL: ${WEB_SEARCH_MCP_URL:-}
     volumes:
       - type: bind
-        source: ${WORKSPACE_HOST_DIR:-./workspaces}
+        source: ${WORKSPACE_HOST_DIR:-./docker/data/workspaces}
         target: ${WORKSPACE_CONTAINER_ROOT:-/data/workspaces}
     depends_on:
       postgres:
@@ -84,7 +84,7 @@ services:
       - strix-sandbox
     volumes:
       - type: bind
-        source: ${WORKSPACE_HOST_DIR:-./workspaces}
+        source: ${WORKSPACE_HOST_DIR:-./docker/data/workspaces}
         target: ${WORKSPACE_CONTAINER_ROOT:-/data/workspaces}
       - /var/run/docker.sock:/var/run/docker.sock   # strix 沙箱需要 Docker
     depends_on:
@@ -100,9 +100,7 @@ services:
     ports:
       - "80:80"
 
-volumes:
-  pgdata:
-  rustfsdata:
+# 所有数据已改为 bind mount 映射到 ./docker/data/ 下
 
 networks:
   strix-sandbox:
