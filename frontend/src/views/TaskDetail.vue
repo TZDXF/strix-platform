@@ -227,7 +227,8 @@ onUnmounted(() => { clearInterval(timer); themeObserver?.disconnect() })
 
 <template>
   <div>
-    <a href="#/tasks" class="mb-3 inline-block text-sm font-semibold text-accent hover:underline">&larr; 返回任务列表</a>
+    <a v-if="task?.project_id" :href="`#/project/${task.project_id}`" class="mb-3 inline-block text-sm font-semibold text-accent hover:underline">&larr; 返回项目页</a>
+    <a v-else href="#/tasks" class="mb-3 inline-block text-sm font-semibold text-accent hover:underline">&larr; 返回任务列表</a>
 
     <template v-if="task">
       <!-- 页头：标题 + 状态 + 元信息，右上为报告操作 -->

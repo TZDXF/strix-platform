@@ -235,6 +235,7 @@ export function setSession(token: string, user: User): void {
 export function clearSession(): void {
   localStorage.removeItem(TOKEN_KEY)
   localStorage.removeItem(USER_KEY)
+  window.dispatchEvent(new CustomEvent('session-expired'))
 }
 export function updateStoredUser(user: User): void {
   localStorage.setItem(USER_KEY, JSON.stringify(user))
@@ -274,7 +275,7 @@ async function download(url: string, filename: string): Promise<void> {
   const resp = await fetch(url, { headers: { Authorization: 'Bearer ' + getToken() } })
   if (resp.status === 401) {
     clearSession()
-    location.hash = '#/login'
+    if (location.hash !== '#/login') location.hash = '#/login'
     throw new Error('登录已过期，请重新登录')
   }
   if (!resp.ok) {

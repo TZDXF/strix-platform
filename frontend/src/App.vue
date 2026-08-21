@@ -34,6 +34,12 @@ function logout() {
   location.hash = '#/login'
 }
 
+function onSessionExpired() {
+  token.value = ''
+  user.value = null
+}
+window.addEventListener('session-expired', onSessionExpired)
+
 function onLogin(logged: User) {
   token.value = getToken()
   user.value = logged
@@ -61,7 +67,10 @@ onMounted(() => {
   if (!token.value && route.value !== '#/login') location.hash = '#/login'
   else if (token.value && (route.value === '#/' || route.value === '#/login')) location.hash = '#/welcome'
 })
-onUnmounted(() => window.removeEventListener('hashchange', onHash))
+onUnmounted(() => {
+  window.removeEventListener('hashchange', onHash)
+  window.removeEventListener('session-expired', onSessionExpired)
+})
 </script>
 
 <template>
