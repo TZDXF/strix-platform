@@ -246,7 +246,7 @@ def execute_scan(
     work_dir.mkdir(parents=True, exist_ok=True)
     before = _list_runs(work_dir)
 
-    cmd = [s.strix_bin, "-n"]
+    cmd = ["strix", "-n"]
     for d in src_dirs:
         cmd += ["-t", str(d)]
     for t in test_targets:

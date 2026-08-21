@@ -1,8 +1,4 @@
-"""平台可用模型：存于 platform_models 表，由超管在设置页维护。
-
-首次启动若表为空，用环境变量 FREE_MODELS 播种（保证存量部署升级后模型列表不丢），
-之后以表内数据为准。超管通过「密钥查询网关 /models → 挑选加入」的方式扩充列表。
-"""
+"""平台可用模型：存于 platform_models 表，由超管在设置页维护。"""
 
 from __future__ import annotations
 
@@ -23,14 +19,8 @@ def valid_model_name(name: str) -> bool:
 
 
 def seed_platform_models(db: Session) -> None:
-    """表为空时从 FREE_MODELS 环境变量播种，默认值取 STRIX_LLM（不在列表内则取第一个）。"""
-    if db.execute(select(PlatformModel.id).limit(1)).scalar() is not None:
-        return
-    s = get_settings()
-    names = [m.strip() for m in s.free_models.split(",") if m.strip()]
-    for i, name in enumerate(names):
-        db.add(PlatformModel(name=name, is_default=(name == s.strix_llm) or (i == 0 and s.strix_llm not in names)))
-    db.commit()
+    """（保留钩子；表已有数据时为空操作。）"""
+    pass
 
 
 def platform_models(db: Session) -> list[str]:

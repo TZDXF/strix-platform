@@ -89,7 +89,7 @@ def _startup() -> None:
     db = SessionLocal()
     try:
         bootstrap_admin(db)
-        seed_platform_models(db)  # 首次启动用 FREE_MODELS 播种平台模型表，之后以表内数据为准
+        seed_platform_models(db)
     finally:
         db.close()
     if not ensure_bucket():

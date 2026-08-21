@@ -38,15 +38,13 @@ services:
       DATABASE_URL: postgresql+psycopg2://strix:${POSTGRES_PASSWORD:-strix}@postgres:5432/strix
       REDIS_URL: redis://redis:6379/0
       SECRET_KEY: ${SECRET_KEY:?must set SECRET_KEY}
-      ADMIN_INITIAL_PASSWORD: ${ADMIN_INITIAL_PASSWORD:-strix-admin-123}
+      ADMIN_INITIAL_PASSWORD: ${ADMIN_INITIAL_PASSWORD:-admin}
       # strix 沙箱由宿主 daemon 创建、bind mount 源码目录，因此容器内的工作区路径
       # 必须同时是 daemon 可解析的路径：Docker Desktop 下宿主磁盘挂在其 VM 的
       # /run/desktop/mnt/host/<盘符>/ 下，WORKSPACE_CONTAINER_ROOT 需指向该路径；
       # 原生 Linux 部署则把 WORKSPACE_HOST_DIR 与 WORKSPACE_CONTAINER_ROOT 设为同一宿主绝对路径
       WORKSPACE_ROOT: ${WORKSPACE_CONTAINER_ROOT:-/data/workspaces}
-      STRIX_BIN: strix
       STRIX_LLM: ${STRIX_LLM:-free}
-      FREE_MODELS: ${FREE_MODELS:-free}
       LLM_API_BASE: ${LLM_API_BASE:?must set LLM_API_BASE}
       S3_ENABLED: "true"
       S3_ENDPOINT: http://rustfs:9000

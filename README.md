@@ -26,7 +26,7 @@ docker-compose.yml  postgres + redis + rustfs + api + worker + frontend
 
 1. **用户管理**：超管（admin）/ 普通用户（user）两种角色，账号只能由超管创建（用户管理页），
    支持重置密码、启用/停用、升降角色；系统保留至少一个可用超管。
-   首次启动自动创建 `admin`，密码取 `ADMIN_INITIAL_PASSWORD`（默认 `strix-admin-123`，请尽快修改）。
+   首次启动自动创建 `admin`，密码取 `ADMIN_INITIAL_PASSWORD`（默认 `admin`，请尽快修改）。
 2. **任务列表**：普通用户只看自己的任务，超管查看全部（含提交人列）。
 3. **项目化任务发布**：先创建项目（Git 地址可配置 Personal Access Token 凭据；或 zip 上传型项目），
    在项目内发起扫描：Git 项目拉取远端**分支列表**供选择（默认分支排首位）；
@@ -50,7 +50,7 @@ docker run -d --name strix-pg -e POSTGRES_USER=strix -e POSTGRES_PASSWORD=strix 
 docker run -d --name strix-redis -p 6379:6379 redis:7-alpine
 
 # 环境变量统一放仓库根目录 .env（docker compose 与后端共用；backend/.env 可选覆盖）
-cp phase0/.env .env      # 或按下表配置；STRIX_BIN 指向 venv 里的 strix 可执行文件
+cp phase0/.env .env      # 或按下表配置
 
 # 后端（uv 管理，Python 3.12+，含 strix-agent==1.5.3）
 cd backend
@@ -62,7 +62,7 @@ uv run celery -A app.celery_app.celery_app worker --pool=solo --beat --loglevel=
 cd frontend && npm install && npm run dev   # http://localhost:5173
 ```
 
-首次启动用 `admin` / `ADMIN_INITIAL_PASSWORD`（默认 `strix-admin-123`）登录，
+首次启动用 `admin` / `ADMIN_INITIAL_PASSWORD`（默认 `admin`）登录，
 在「用户管理」给同事开号后请立即修改默认密码。
 
 ## 服务器部署（Docker Compose，Linux + Docker）
@@ -129,13 +129,11 @@ docker compose up -d --build     # 仅重建有变化的镜像，数据卷（pg/
 | 变量 | 说明 | 默认 |
 |------|------|------|
 | `SECRET_KEY` | 登录令牌签名密钥（必填） | - |
-| `ADMIN_INITIAL_PASSWORD` | 初始超管密码（用户库为空时生效） | `strix-admin-123` |
+| `ADMIN_INITIAL_PASSWORD` | 初始超管密码（用户库为空时生效） | `admin` |
 | `TOKEN_EXPIRY_HOURS` | 登录有效期（小时） | 24 |
 | `DATABASE_URL` / `REDIS_URL` | 依赖连接 | 本机默认 |
 | `LLM_API_BASE` / `STRIX_LLM` | 公司 LLM 网关（OpenAI 兼容）与默认模型；API 密钥由用户在「设置」页个人配置，平台无统一密钥 | `free` |
-| `FREE_MODELS` | 提交任务时可选的免费模型列表（逗号分隔） | `free` |
 | `WORKSPACE_ROOT` | 任务源码/工作区/上传目录 | `./workspaces` |
-| `STRIX_BIN` | strix 可执行文件路径（dev 为 `backend/.venv` 内路径） | `strix` |
 | `S3_ENABLED` / `S3_ENDPOINT` / `S3_*` | RustFS 对象存储；false 时产物留本地磁盘 | false |
 | `TARGET_ALLOWLIST` | 黑盒目标允许清单（域名后缀/CIDR，逗号分隔） | 空=仅内网/回环 |
 | `MAX_UPLOAD_MB` | zip 上限 | 500 |

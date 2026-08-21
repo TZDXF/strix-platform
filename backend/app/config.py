@@ -22,22 +22,17 @@ class Settings(BaseSettings):
     # 登录令牌有效期（小时）
     token_expiry_hours: int = 24
     # 首次启动时自动创建的超管账号密码（用户库为空时生效）
-    admin_initial_password: str = "strix-admin-123"
+    admin_initial_password: str = "admin"
 
     # 工作目录（任务源码、扫描工作区、产物归档）
     workspace_root: str = "./docker/data/workspaces"
 
-    # strix 引擎
-    strix_bin: str = "strix"
+    # strix 引擎版本（仅用于健康检查回显与任务日志，容器内 strix 二进制已固定在 venv PATH）
     strix_version: str = "1.5.3"
 
     # LLM（公司统一网关），worker 注入给 strix 子进程；密钥由用户个人配置，平台不再持有统一密钥
     llm_api_base: str = ""
     strix_llm: str = "free"  # 平台模型表为空时的最终回退
-
-    # 首次启动播种 platform_models 表用的模型列表（逗号分隔）；
-    # 之后模型列表以表内数据为准，由超管在「设置」页通过网关密钥查询并添加
-    free_models: str = "free"
 
     # 对象存储（RustFS，S3 API）；未启用时产物留在本地磁盘
     s3_enabled: bool = False
