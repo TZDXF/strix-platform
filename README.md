@@ -117,7 +117,7 @@ docker compose up -d --build     # 仅重建有变化的镜像，数据卷（pg/
 | 任务日志含 `DOCKER NOT INSTALLED`，秒退退出码 1 | worker 容器内无 `docker` CLI 或未挂载 docker.sock。镜像已内置 `docker-cli`（见 `backend/Dockerfile`），若仍出现请确认 compose 中 worker 挂载了 `/var/run/docker.sock`，并重新 `docker compose build worker && docker compose up -d worker` |
 | 归档阶段 `NoSuchBucket` | 正常部署不会出现（api 启动与上传时均自动建桶）；若出现多为 RustFS 密钥与 `.env` 不一致，或 api 启动日志中有 `[startup] S3 归档桶不可用`，检查 `RUSTFS_*` 配置后重启 api |
 | 首个任务卡在 scanning 很久 | 首次扫描需拉取沙箱镜像，可在宿主机预拉取：`docker pull ghcr.io/usestrix/strix-sandbox:<tag>` |
-| 任务日志含 `invalid mount config ... bind source path does not exist`，秒退退出码 1 | 沙箱容器的 bind mount 由宿主 daemon 解析路径，worker 容器内的工作区路径在宿主机不存在。Docker Desktop 下需把工作区 bind 到 VM 可见路径（`.env` 中 `WORKSPACE_CONTAINER_ROOT=/run/desktop/mnt/host/<盘符>/...`）；原生 Linux 下把 `WORKSPACE_HOST_DIR` 与 `WORKSPACE_CONTAINER_ROOT` 设为同一宿主绝对路径 |
+| 任务日志含 `invalid mount config ... bind source path does not exist`，秒退退出码 1 | 沙箱容器的 bind mount 由宿主 daemon 解析路径，worker 容器内的工作区路径须是 daemon 可见的同一路径。compose 的 entrypoint 启动时自动探测对齐（Docker Desktop 映射到 VM 内 `/run/desktop/mnt/host/<盘符>/...`，原生 Linux/macOS 直接用宿主绝对路径），无需手工配置；如需强制指定可设置 `WORKSPACE_CONTAINER_ROOT`（注意相对路径无效：daemon 侧只认其自身命名空间的绝对路径） |
 | `SECRET_KEY` / `LLM_API_BASE` 启动报错 | `.env` 未填写必填项，对照 `.env.deploy.example` |
 
 > Worker 挂载了 `/var/run/docker.sock`（strix 沙箱通过宿主机 Docker 启动分析容器，镜像内已安装 docker-cli）。
