@@ -1,13 +1,17 @@
-"""容器入口：自动把 WORKSPACE_ROOT 对齐为宿主 Docker daemon 可见的同一路径。
+"""容器入口：诊断工作区路径是否已与宿主 Docker daemon 对齐，并转发启动命令。
 
-背景：strix 沙箱容器由宿主 daemon 经 docker.sock 创建，源码目录以 bind mount
-挂入沙箱，挂载源路径按 daemon 所在命名空间解析。worker 容器内的工作区路径
-（默认 /data/workspaces）在 Docker Desktop 的 VM 里不存在，沙箱创建会报
-"bind source path does not exist"（HTTP 400）。这里在启动时查询自身容器的
-挂载配置反推 daemon 可见路径（Docker Desktop 为 /run/desktop/mnt/host/<盘符>/…，
-原生 Linux/macOS 即宿主绝对路径，daemon 本就可解析），并在容器内建符号链接
-指向实际挂载点，使「容器内文件操作」与「传给 daemon 的挂载源」共用同一串路径。
-WORKSPACE_CONTAINER_ROOT 显式配置时优先采用，跳过探测。
+背景：strix 沙箱由宿主 daemon 经 docker.sock 创建，bind mount 源路径按 daemon
+所在命名空间解析，且 strix 内部会对目标路径做 realpath（符号链接会被还原），
+因此工作区必须在容器内「真实挂载」于 daemon 可见的同一路径上——这只能在
+compose 创建容器时确定，由仓库根目录的 ./deploy.sh 自动探测注入
+（WORKSPACE_HOST_DIR / WORKSPACE_CONTAINER_ROOT），或按 README 手工设置。
+
+本脚本不再改写路径，只做两件事：
+1. 检测到「容器内挂载点 ≠ daemon 可见路径」时输出明确的修复指引（常见于
+   绕过 deploy.sh 直接 docker compose 的场景，症状为沙箱创建报
+   "bind source path does not exist"，HTTP 400）；
+2. exec 真正的启动命令；未收到命令（如 compose 设了 entrypoint 却漏了
+   command）时响亮失败，避免伪装成正常退出。
 """
 
 from __future__ import annotations
@@ -30,19 +34,16 @@ def _daemon_visible_path(source: str) -> str | None:
     return None
 
 
-def resolve_workspace_root() -> str | None:
+def check_alignment() -> None:
     root = os.environ.get("WORKSPACE_ROOT", DEFAULT_ROOT)
-    explicit = os.environ.get("WORKSPACE_CONTAINER_ROOT", "").strip()
-    if explicit:
-        return explicit
+    if os.environ.get("WORKSPACE_CONTAINER_ROOT", "").strip():
+        return  # 显式配置：compose 已把挂载点对齐到该路径，无需多言
     try:
         import docker
 
-        client = docker.from_env(timeout=5)
-        ctr = client.containers.get(socket.gethostname())
-    except Exception as exc:  # api 容器无 docker.sock、本机直跑等场景：保持原值
-        print(f"[entrypoint] 工作区路径保持 {root}（未探测到自身容器：{exc}）", file=sys.stderr)
-        return None
+        ctr = docker.from_env(timeout=5).containers.get(socket.gethostname())
+    except Exception:
+        return  # api 容器无 docker.sock、本机直跑：不涉及沙箱创建，保持安静
     source = next(
         (
             m.get("Source")
@@ -52,37 +53,22 @@ def resolve_workspace_root() -> str | None:
         None,
     )
     if not source:
-        print(f"[entrypoint] 工作区路径保持 {root}（自身挂载中未找到 {root}）", file=sys.stderr)
-        return None
+        return
     visible = _daemon_visible_path(source)
-    if not visible or visible == root:
-        return visible
-    # 把 daemon 可见路径链到现有挂载点；若该位置残留同名空目录则先移除
-    os.makedirs(os.path.dirname(visible), exist_ok=True)
-    try:
-        if os.path.islink(visible) or not os.path.lexists(visible):
-            os.symlink(root, visible)
-        elif os.path.isdir(visible) and not os.listdir(visible):
-            os.rmdir(visible)
-            os.symlink(root, visible)
-        else:
-            print(f"[entrypoint] {visible} 已存在且非空，跳过符号链接", file=sys.stderr)
-            return None
-    except OSError as exc:
-        print(f"[entrypoint] 建立符号链接失败：{exc}", file=sys.stderr)
-        return None
-    print(f"[entrypoint] WORKSPACE_ROOT 对齐为 daemon 可见路径: {visible}", file=sys.stderr)
-    return visible
+    if visible and visible != root:
+        print(
+            f"[entrypoint] 警告：工作区在容器内挂载于 {root}，但宿主 daemon 只认 "
+            f"{visible}。strix 创建沙箱时会报 'bind source path does not exist'。\n"
+            "[entrypoint] 请改用仓库根目录 ./deploy.sh 部署（自动对齐），或在 .env 设置\n"
+            f"[entrypoint] WORKSPACE_CONTAINER_ROOT={visible}",
+            file=sys.stderr,
+        )
 
 
 def main() -> None:
-    resolved = resolve_workspace_root()
-    if resolved:
-        os.environ["WORKSPACE_ROOT"] = resolved
+    check_alignment()
     cmd = sys.argv[1:]
     if not cmd:
-        # compose 设置了 entrypoint 却没给 command 时会发生：静默退出 0 会伪装成
-        # 正常启动，必须响亮失败
         print("[entrypoint] 未提供启动命令（检查 compose 的 command 或镜像 CMD）", file=sys.stderr)
         sys.exit(1)
     os.execvp(cmd[0], cmd)

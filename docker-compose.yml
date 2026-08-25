@@ -34,20 +34,19 @@ services:
 
   api:
     build: ./backend
-    # 启动时自动把 WORKSPACE_ROOT 对齐为宿主 daemon 可见路径（见 app/entrypoint.py），
-    # 无需手工配置 WORKSPACE_CONTAINER_ROOT；显式设置该变量时优先采用
+    # 启动命令必须显式给出（设置了 entrypoint 后 compose 不再继承镜像 CMD）；
+    # entrypoint 仅做工作区路径诊断，路径对齐由仓库根目录 ./deploy.sh 自动注入
     entrypoint: ["python", "-m", "app.entrypoint"]
-    # 设置了 entrypoint 后 compose 不再继承镜像 CMD，启动命令必须在此显式给出
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     environment: &backend_env
       DATABASE_URL: postgresql+psycopg2://strix:${POSTGRES_PASSWORD:-strix}@postgres:5432/strix
       REDIS_URL: redis://redis:6379/0
       SECRET_KEY: ${SECRET_KEY:?must set SECRET_KEY}
       ADMIN_INITIAL_PASSWORD: ${ADMIN_INITIAL_PASSWORD:-admin}
-      # strix 沙箱由宿主 daemon 创建、bind mount 源码目录，工作区路径须是 daemon
-      # 可解析的路径。entrypoint 会在启动时自动探测对齐（Docker Desktop 映射到
-      # /run/desktop/mnt/host/<盘符>/…，原生 Linux 直接用宿主绝对路径）；
-      # 如需手工指定，设 WORKSPACE_CONTAINER_ROOT 即可跳过自动探测
+      # strix 沙箱由宿主 daemon 创建、bind mount 源码目录，工作区须在容器内真实
+      # 挂载于 daemon 可见的同一路径（strix 会对路径做 realpath，符号链接无效）。
+      # 路径含平台差异，由 ./deploy.sh 自动探测注入 WORKSPACE_HOST_DIR /
+      # WORKSPACE_CONTAINER_ROOT；手工部署时按 README 设置这两个变量
       WORKSPACE_ROOT: ${WORKSPACE_CONTAINER_ROOT:-/data/workspaces}
       STRIX_LLM: ${STRIX_LLM:-free}
       LLM_API_BASE: ${LLM_API_BASE:?must set LLM_API_BASE}
