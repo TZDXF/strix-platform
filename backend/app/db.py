@@ -50,6 +50,7 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         ("default_test_targets", "TEXT DEFAULT ''"),
         ("git_repos", "TEXT DEFAULT ''"),
         ("repo_tokens", "TEXT DEFAULT ''"),
+        ("git_config_id", "VARCHAR(32)"),
     ],
     "tasks": [
         ("input_tokens", "BIGINT"),

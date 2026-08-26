@@ -149,8 +149,23 @@ def load_repo_tokens(repo_tokens_json: str) -> dict[str, str]:
     return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str) and v}
 
 
-def repo_credential(repo_tokens: dict[str, str], url: str, project_auth_type: str, project_token: str) -> tuple[str, str]:
-    """单个仓库的克隆/探测凭据：仓库级快照优先，项目级 PAT 兜底；返回 (auth_type, token)。"""
+def repo_credential(
+    repo_tokens: dict[str, str],
+    url: str,
+    project_auth_type: str,
+    project_token: str,
+    bound_config: tuple[str, str] | None = None,
+) -> tuple[str, str]:
+    """单个仓库的克隆/探测凭据；返回 (auth_type, token)。
+
+    优先级：项目绑定的个人 Git 配置实时令牌（同域仓库）> 仓库级快照 > 项目级 PAT。
+    bound_config 为 (base_url, token)：绑定配置换令牌后所有同域项目自动跟随，无需改项目；
+    配置被删或失效时由调用方传 None，回退到快照兜底。
+    """
+    from .gitlab import same_host
+
+    if bound_config and bound_config[1] and same_host(bound_config[0], url):
+        return "token", bound_config[1]
     token = repo_tokens.get(url) or (project_token if project_auth_type == "token" else "")
     return ("token", token) if token else ("", "")
 

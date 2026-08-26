@@ -18,8 +18,8 @@ export interface TestTarget {
 export interface GitRepoRef {
   url: string
   note: string
-  /** 凭据来源（仅展示，后端给出）：repo=已保存该仓库专属令牌；project=旧版项目级 PAT；none=无凭据 */
-  credential?: 'repo' | 'project' | 'none'
+  /** 凭据来源（仅展示，后端给出）：config=绑定的个人 Git 配置实时令牌；repo=已保存该仓库专属令牌；project=旧版项目级 PAT；none=无凭据 */
+  credential?: 'config' | 'repo' | 'project' | 'none'
   /** 该仓库专属访问令牌：仅创建/编辑提交时携带，保存后后端不回显（编辑留空=保持已存令牌） */
   token?: string
 }
@@ -38,6 +38,8 @@ export interface Project {
   git_repos: GitRepoRef[]
   git_auth_type: '' | 'token'
   has_credentials: boolean
+  git_config_id: string // 绑定的个人 Git 配置 id（空=未绑定，走凭据快照兜底）
+  git_config_name: string // 绑定的 Git 配置显示名（未绑定为空）
   is_archived: boolean
   default_test_url: string // 兼容旧字段：首个地址
   default_test_targets: TestTarget[]

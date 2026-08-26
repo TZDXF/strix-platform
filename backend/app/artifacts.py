@@ -57,13 +57,20 @@ def ensure_bucket(retries: int = 10, delay_sec: float = 3.0) -> bool:
     if not s.s3_enabled:
         return False
     for attempt in range(1, retries + 1):
+        t0 = time.perf_counter()
         try:
             client = _s3_client()
             if s.s3_bucket in [b["Name"] for b in client.list_buckets()["Buckets"]]:
                 return True
             client.create_bucket(Bucket=s.s3_bucket)
             return True
-        except Exception:
+        except Exception as e:
+            cost = time.perf_counter() - t0
+            print(
+                f"[startup] S3 建桶第 {attempt}/{retries} 次失败（本次耗时 {cost:.1f}s，"
+                f"endpoint={s.s3_endpoint}）：{type(e).__name__}: {e}",
+                flush=True,
+            )
             if attempt == retries:
                 return False
             time.sleep(delay_sec)

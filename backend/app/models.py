@@ -60,6 +60,9 @@ class Project(Base):
     # 访问凭据（仅创建人/超管可写，接口永不回显明文）；仅支持 Personal Access Token
     git_auth_type = Column(String(8), default="")  # "" | token
     git_token = Column(Text, default="")  # PAT 明文（`token` 或 `user:token`），仅后端使用
+    # 绑定的个人 Git 配置（GitConfig.id）：克隆时实时取该配置的最新令牌，配置换令牌项目自动跟随；
+    # repo_tokens / git_token 快照仅在配置被删或失效时兜底
+    git_config_id = Column(String(32), ForeignKey("git_configs.id"), nullable=True)
     default_test_url = Column(Text, default="")  # 旧版单地址（兼容存量数据，读取时回退用）
     # 默认黑盒测试地址列表：JSON [{"url": "...", "note": "作用说明"}]；非空字符串时优先生效
     default_test_targets = Column(Text, default="")

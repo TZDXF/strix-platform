@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import socket
 import sys
+import time
 
 DEFAULT_ROOT = "/data/workspaces"
 
@@ -66,7 +67,9 @@ def check_alignment() -> None:
 
 
 def main() -> None:
+    t0 = time.perf_counter()
     check_alignment()
+    print(f"[entrypoint] 工作区路径诊断完成，耗时 {time.perf_counter() - t0:.1f}s", flush=True)
     cmd = sys.argv[1:]
     if not cmd:
         print("[entrypoint] 未提供启动命令（检查 compose 的 command 或镜像 CMD）", file=sys.stderr)

@@ -169,7 +169,7 @@ async function create() {
         .filter(t => t.url),
     }
     if (form.value.source_type === 'git' && gitMode.value === 'import') {
-      // 凭据由后端从所选 Git 配置逐仓库复制（令牌不回显，前端拿不到）
+      // 项目绑定的个人 Git 配置：克隆时实时取该配置的最新令牌（换令牌项目自动跟随）
       payload.git_config_id = selectedConfig.value
     }
     await api.createProject(payload)
@@ -373,6 +373,7 @@ onMounted(() => {
                       {{ loadingRepos ? '加载中…' : '刷新' }}
                     </button>
                   </div>
+                  <p :class="hint + ' mt-1.5'">项目将绑定此 Git 配置：配置更新令牌后自动生效，无需修改项目中的密钥。</p>
                 </div>
                 <div class="col-span-2">
                   <label :class="label">搜索仓库（按名称 / 路径）</label>

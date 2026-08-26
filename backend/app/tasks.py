@@ -18,7 +18,7 @@ from .config import get_settings
 from .db import SessionLocal
 from .llm_models import default_model
 from .mailer import notify_task_finished
-from .models import Finding, Project, ProjectUpload, Task, User
+from .models import Finding, GitConfig, Project, ProjectUpload, Task, User
 from .runner import execute_scan, read_run_artifacts
 from .sources import (
     SourceError,
@@ -273,13 +273,16 @@ def run_scan(self, task_id: str) -> dict:
         source_dirs: list[Path]
         if task.source_type == "git":
             git_log = lambda m: (_log(task, m), db.commit())  # noqa: E731
-            # 每个仓库各自的凭据：仓库级令牌快照（逐仓库填写/从个人 Git 配置按域名解析）优先，项目级 PAT 兜底
+            # 每个仓库各自的凭据：绑定的个人 Git 配置实时令牌（配置换令牌项目自动跟随）优先，
+            # 仓库级快照次之，项目级 PAT 兜底（配置被删/失效时回退快照）
             repo_tokens = load_repo_tokens(project.repo_tokens) if project else {}
             proj_auth = project.git_auth_type if project else ""
             proj_token = project.git_token if project else ""
+            bound_cfg = db.get(GitConfig, project.git_config_id) if project and project.git_config_id else None
+            bound = (bound_cfg.base_url, bound_cfg.token) if bound_cfg and bound_cfg.token else None
 
             def _clone(url: str, dest, branch: str) -> None:
-                auth, tok = repo_credential(repo_tokens, url, proj_auth, proj_token)
+                auth, tok = repo_credential(repo_tokens, url, proj_auth, proj_token, bound_config=bound)
                 clone_git(url, dest, git_log, branch=branch, auth_type=auth, token=tok)
 
             if len(repo_refs) > 1:

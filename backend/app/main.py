@@ -9,6 +9,9 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+# 模块导入计时起点：置于第三方重型导入之前，用于定位「uvicorn 起得慢」是导入慢还是 startup 慢
+_IMPORT_T0 = time.perf_counter()
+
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -66,6 +69,8 @@ from .tasks import new_task_id, run_scan
 
 settings = get_settings()
 
+print(f"[startup] app.main 模块导入完成，耗时 {time.perf_counter() - _IMPORT_T0:.1f}s", flush=True)
+
 app = FastAPI(title="Strix 内部安全测试平台", version="0.2.0")
 
 app.add_middleware(
@@ -78,7 +83,15 @@ app.add_middleware(
 
 @app.on_event("startup")
 def _startup() -> None:
+    _t0 = time.perf_counter()
+
+    def _step(name: str, _mark=[_t0]) -> None:
+        now = time.perf_counter()
+        print(f"[startup] {name} 完成，本步耗时 {now - _mark[0]:.1f}s，累计 {now - _t0:.1f}s", flush=True)
+        _mark[0] = now
+
     init_db()
+    _step("init_db（建表/补列）")
     ws = Path(settings.workspace_root)
     ws.mkdir(parents=True, exist_ok=True)
     (ws / "uploads").mkdir(exist_ok=True)
@@ -92,8 +105,15 @@ def _startup() -> None:
         seed_platform_models(db)
     finally:
         db.close()
-    if not ensure_bucket():
-        print("[startup] S3 归档桶不可用（RustFS 未就绪或密钥错误），任务归档将失败；不影响扫描本身")
+    _step("bootstrap_admin + seed_platform_models")
+    if ensure_bucket():
+        _step("ensure_bucket（S3 建桶探测）")
+    else:
+        print(
+            f"[startup] S3 归档桶不可用（RustFS 未就绪或密钥错误），任务归档将失败；不影响扫描本身；"
+            f"该步骤累计耗时 {time.perf_counter() - _t0:.1f}s",
+            flush=True,
+        )
 
 
 def _audit(db: Session, request: Request, action: str, detail: str = "", user=None) -> None:
@@ -623,7 +643,7 @@ def patch_git_config(config_id: str, body: GitConfigPatchBody, request: Request,
 
 @app.delete("/api/git-configs/{config_id}", dependencies=[Depends(require_user)])
 def delete_git_config(config_id: str, request: Request, user: User = Depends(require_user), db: Session = Depends(get_db)):
-    """删除 Git 配置；已用它创建的项目凭据已单独保存，不受影响。"""
+    """删除 Git 配置；绑定它的项目克隆时自动回退到创建时的凭据快照/项目级 PAT，不受影响。"""
     config = _get_git_config_checked(db, config_id, user)
     db.delete(config)
     db.commit()
@@ -653,8 +673,12 @@ def _project_out(p: Project, db: Session) -> dict:
     targets = effective_targets(p.default_test_targets, p.default_test_url)
     repos = effective_repos(p.git_repos, p.git_url)
     repo_tokens = load_repo_tokens(p.repo_tokens)
+    bound = db.get(GitConfig, p.git_config_id) if p.git_config_id else None
 
     def _cred(url: str) -> str:
+        # 绑定的个人 Git 配置实时令牌优先（配置换令牌项目自动跟随）
+        if bound and bound.token and same_host(bound.base_url, url):
+            return "config"
         if url in repo_tokens:
             return "repo"  # 仓库级专属令牌（表单逐仓库填写，或从个人 Git 配置按域名解析）
         return "project" if p.git_token else "none"  # 旧版项目级 PAT 兜底 / 无凭据
@@ -668,7 +692,9 @@ def _project_out(p: Project, db: Session) -> dict:
         "git_repos": [{**r, "credential": _cred(r["url"])} for r in repos],
         # 仅支持 PAT；存量 ssh 配置一律视为未配置凭据
         "git_auth_type": "token" if p.git_auth_type == "token" else "",
-        "has_credentials": bool(p.git_token),
+        "has_credentials": bool(p.git_token) or bool(bound and bound.token),
+        "git_config_id": p.git_config_id or "",  # 绑定的个人 Git 配置（空=未绑定，走快照兜底）
+        "git_config_name": (bound.name or bound.base_url) if bound else "",
         "default_test_url": targets[0]["url"] if targets else "",  # 兼容旧字段：首个地址
         "default_test_targets": targets,
         "is_archived": bool(p.is_archived),
@@ -777,7 +803,8 @@ def create_project(body: ProjectCreateBody, request: Request, user: User = Depen
         if git_auth_type == "token" and not git_token:
             raise HTTPException(400, "选择 token 认证时必须填写 token")
         if body.git_config_id:
-            # 从个人 Git 配置导入：校验归属与服务地址（每个仓库都须与配置同域），凭据复制自配置
+            # 绑定个人 Git 配置：校验归属与服务地址（每个仓库都须与配置同域）；
+            # 克隆时实时取该配置的最新令牌（配置换令牌项目自动跟随），此处复制一份仅作删除后的兜底
             config = _get_git_config_checked(db, body.git_config_id, user)
             for r in repos:
                 if not same_host(config.base_url, r["url"]):
@@ -797,6 +824,7 @@ def create_project(body: ProjectCreateBody, request: Request, user: User = Depen
         git_repos=dump_repos(repos),
         repo_tokens=json.dumps(repo_tokens, ensure_ascii=False) if repo_tokens else "",
         git_auth_type=git_auth_type, git_token=git_token,
+        git_config_id=(body.git_config_id or None) if body.source_type == "git" else None,
         default_test_url=default_targets[0]["url"] if default_targets else "",
         default_test_targets=dump_targets(default_targets),
         created_by=user.id,
@@ -812,6 +840,7 @@ class ProjectPatchBody(BaseModel):
     description: str = ""
     git_url: str = ""  # 旧版单仓库（兼容旧客户端，仅在未提交列表时生效）
     git_repos: str | list | None = None  # 仓库列表：None=不修改；否则全量替换
+    git_config_id: str | None = None  # 绑定的个人 Git 配置：None=不修改；""=解绑；非空=换绑（校验归属与同域）
     git_auth_type: str | None = None  # None=不修改，""=清除凭据
     git_token: str = ""
     default_test_url: str = ""  # 旧版单地址（兼容旧客户端，仅在未提交列表时生效）
@@ -840,6 +869,17 @@ def patch_project(project_id: str, body: ProjectPatchBody, request: Request, use
         project.git_url = body.git_url.strip()
         project.git_repos = dump_repos([{"url": body.git_url.strip(), "note": ""}])
         project.repo_tokens = ""
+    if body.git_config_id is not None and project.source_type == "git":
+        # 换绑/解绑个人 Git 配置：换绑时校验归属，且绑定后仓库列表须全部与配置同域
+        new_id = body.git_config_id.strip()
+        if not new_id:
+            project.git_config_id = None
+        elif new_id != (project.git_config_id or ""):
+            config = _get_git_config_checked(db, new_id, user)
+            for r in effective_repos(project.git_repos, project.git_url):
+                if not same_host(config.base_url, r["url"]):
+                    raise HTTPException(400, f"仓库 {r['url']} 与所选 Git 配置的服务地址不一致")
+            project.git_config_id = config.id
     if body.default_test_targets is not None:
         targets = _checked_targets(body.default_test_targets)
         project.default_test_targets = dump_targets(targets)

@@ -6,7 +6,7 @@ import {
   RadioGroupRoot, RadioGroupItem, RadioGroupIndicator,
   CheckboxRoot, CheckboxIndicator,
 } from 'reka-ui'
-import { api, type GitRepoRef, type ProjectDetailData, type Schedule, type TestTarget, type User } from '../api'
+import { api, type GitConfig, type GitRepoRef, type ProjectDetailData, type Schedule, type TestTarget, type User } from '../api'
 import RepoListField from '../components/RepoListField.vue'
 import TargetListField from '../components/TargetListField.vue'
 import { toast } from '../toast'
@@ -54,10 +54,20 @@ const isGit = computed(() => project.value?.source_type === 'git')
 
 const showEdit = ref(false)
 const savingEdit = ref(false)
+// reka-ui SelectItem 不允许 value=""，用哨兵值表示「不绑定」
+const NO_CONFIG = '__none__'
+const gitConfigs = ref<GitConfig[]>([])
 const editForm = ref({
   name: '', description: '', git_repos: [] as GitRepoRef[],
+  git_config_id: NO_CONFIG, // 绑定的个人 Git 配置（哨兵值=不绑定）
   clearProjectToken: false, default_test_targets: [] as TestTarget[],
 })
+
+async function loadEditGitConfigs() {
+  try {
+    gitConfigs.value = (await api.listGitConfigs()).items
+  } catch { /* 静默：加载失败仍可编辑其他字段 */ }
+}
 
 function openEdit() {
   const p = project.value
@@ -66,8 +76,10 @@ function openEdit() {
     name: p.name, description: p.description,
     // 令牌不回显：行内 token 置空，留空提交=保持各仓库已存令牌
     git_repos: (p.git_repos || []).map(r => ({ ...r, token: '' })),
+    git_config_id: p.git_config_id || NO_CONFIG,
     clearProjectToken: false, default_test_targets: (p.default_test_targets || []).map(t => ({ ...t })),
   }
+  if (isGit.value) loadEditGitConfigs()
   showEdit.value = true
 }
 
@@ -77,6 +89,9 @@ async function saveEdit() {
   if (isGit.value && !repos.length) { toast.error('Git 项目必须至少保留一个仓库'); return }
   savingEdit.value = true
   try {
+    // 仅绑定变化时提交 git_config_id（""=解绑，非空=换绑）；不变更则不传（后端缺省=不修改）
+    const nextConfigId = editForm.value.git_config_id === NO_CONFIG ? '' : editForm.value.git_config_id
+    const prevConfigId = project.value?.git_config_id || ''
     await api.patchProject(props.projectId, {
       name: editForm.value.name.trim(),
       description: editForm.value.description.trim(),
@@ -85,6 +100,7 @@ async function saveEdit() {
         git_repos: repos,
         // 旧版项目级统一 PAT：仅在用户勾选清除时提交清空（现在凭据按仓库单独配置）
         ...(editForm.value.clearProjectToken ? { git_auth_type: '' } : {}),
+        ...(nextConfigId !== prevConfigId ? { git_config_id: nextConfigId } : {}),
       } : {}),
       default_test_targets: cleanTargets(editForm.value.default_test_targets),
     })
@@ -92,6 +108,20 @@ async function saveEdit() {
     showEdit.value = false
     refresh()
   } catch (e) { toast.error((e as Error).message) } finally { savingEdit.value = false }
+}
+
+// 每仓库凭据徽标：config=绑定 Git 配置实时令牌；repo=仓库专属令牌；project=旧版项目级 PAT；none=无凭据
+function credLabel(c?: string) {
+  return c === 'config' ? '配置令牌' : c === 'repo' ? '仓库令牌' : c === 'project' ? '项目级令牌' : '无凭据'
+}
+function credBadgeClass(c?: string) {
+  return c === 'config' ? 'bg-ok/15 text-ok' : c === 'repo' ? 'bg-accent/15 text-accent' : c === 'project' ? 'bg-accent/15 text-accent' : 'bg-border/30 text-muted'
+}
+function credTitle(c?: string) {
+  if (c === 'config') return '使用项目绑定的个人 Git 配置实时令牌：配置更新令牌后自动跟随，无需修改项目'
+  if (c === 'repo') return '已保存该仓库专属令牌（表单手动填写）'
+  if (c === 'project') return '使用旧版项目级统一 PAT'
+  return '无凭据（仅公开仓库可克隆）'
 }
 
 const selectTrigger = 'flex w-full items-center justify-between rounded-md border border-border bg-panel2 px-2.5 py-2 text-[13.5px] text-text outline-none focus:border-accent disabled:opacity-50'
@@ -402,10 +432,13 @@ onUnmounted(() => clearInterval(timer))
                 <span v-if="r.note" class="font-normal text-muted">（{{ r.note }}）</span>
                 <span
                   class="ml-1 inline-block rounded-full px-1.5 py-0.5 align-middle text-[10.5px] font-semibold"
-                  :class="r.credential === 'repo' ? 'bg-ok/15 text-ok' : (r.credential === 'project' ? 'bg-accent/15 text-accent' : 'bg-border/30 text-muted')"
-                  :title="r.credential === 'repo' ? '已保存该仓库专属令牌（手动填写或从个人 Git 配置按域名解析）' : (r.credential === 'project' ? '使用旧版项目级统一 PAT' : '无凭据（仅公开仓库可克隆）')"
-                >{{ r.credential === 'repo' ? '仓库令牌' : (r.credential === 'project' ? '项目级令牌' : '无凭据') }}</span>
+                  :class="credBadgeClass(r.credential)"
+                  :title="credTitle(r.credential)"
+                >{{ credLabel(r.credential) }}</span>
               </div>
+            </div>
+            <div v-if="project.git_config_id" class="mt-1.5 text-[11px] font-normal text-muted">
+              绑定 Git 配置：<span class="font-semibold text-text">{{ project.git_config_name }}</span>（配置更新令牌后自动生效）
             </div>
           </div>
           <div class="rounded-lg bg-panel2 px-3 py-2.5">
@@ -864,6 +897,27 @@ onUnmounted(() => clearInterval(timer))
               <div>
                 <label :class="label">描述（可选，清空后提交则保持原描述）</label>
                 <input v-model="editForm.description" type="text" placeholder="项目说明 / 负责人 / 测试范围" :class="input" />
+              </div>
+              <div v-if="isGit && gitConfigs.length" class="col-span-2">
+                <label :class="label">绑定的个人 Git 配置</label>
+                <div class="w-[320px]">
+                  <SelectRoot v-model="editForm.git_config_id">
+                    <SelectTrigger :class="selectTrigger"><SelectValue /></SelectTrigger>
+                    <SelectPortal>
+                      <SelectContent :class="selectContent" position="popper">
+                        <SelectViewport>
+                          <SelectItem :value="NO_CONFIG" :class="selectItem">
+                            <SelectItemText>不绑定（按已存令牌快照 / 公开仓库）</SelectItemText>
+                          </SelectItem>
+                          <SelectItem v-for="c in gitConfigs" :key="c.id" :value="c.id" :class="selectItem">
+                            <SelectItemText>{{ c.name }}（{{ c.base_url }}）</SelectItemText>
+                          </SelectItem>
+                        </SelectViewport>
+                      </SelectContent>
+                    </SelectPortal>
+                  </SelectRoot>
+                </div>
+                <p :class="hint + ' mt-1.5'">绑定后克隆时实时使用该配置的最新令牌：在「设置」里更新令牌即对所有同域仓库自动生效，无需修改本项目。要求所有仓库地址与该配置的 Git 服务一致。</p>
               </div>
               <div v-if="isGit" class="col-span-2">
                 <RepoListField

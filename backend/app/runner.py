@@ -68,7 +68,8 @@ def _summarize_strix_line(line: str, state: dict) -> str | None:
     """把一行 strix.log 翻译成任务日志摘要；无关注行返回 None。
 
     只挑对用户有信息量的生命周期事件（引擎/沙箱/智能体/轮次/阶段性结果/告警），
-    逐轮的调试噪声（Calling LLM、Tracing disabled、报表落盘等）不转发。
+    以及证明 AI 通路存活的事件：LLM 调用与工具执行按间隔采样转发（首次必报，
+    之后每 20/25 次报一次），其余逐行调试噪声（Tracing disabled、报表落盘等）不转发。
     """
     m = re.search(r"Starting Strix scan (\S+) \(image=([^,]+), max_turns=(\d+)", line)
     if m:
@@ -106,6 +107,22 @@ def _summarize_strix_line(line: str, state: dict) -> str | None:
         if n == 1 or n % 5 == 0:  # 逐轮全转发太密（deep 可达数百轮），第 1 轮 + 每 5 轮采样
             return f"[scan] {m.group(2)} 第 {n} 轮"
         return None
+    if "Calling LLM" in line:  # openai.agents 每次发起 LLM 请求打一行 DEBUG
+        state["llm_calls"] += 1
+        n = state["llm_calls"]
+        state["last_action"] = f"第 {n} 次 LLM 调用尚未返回（等待模型响应）"
+        if n == 1 or n % 20 == 0:  # 首次必报（确认 AI 通路），之后采样
+            return f"[scan] 调用 LLM（第 {n} 次）"
+        return None
+    m = re.search(r"Invoking tool (\S+)", line)
+    if m:
+        state["tool_calls"] += 1
+        state["last_tool"] = m.group(1)
+        n = state["tool_calls"]
+        state["last_action"] = f"工具 {m.group(1)} 执行中（第 {n} 次工具调用）"
+        if n == 1 or n % 25 == 0:  # 首次必报（引擎开始干活），之后采样
+            return f"[scan] 执行工具 {m.group(1)}（第 {n} 次）"
+        return None
     m = re.search(r"Wrote SARIF 2\.1\.0 report: .*?\((\d+) results\)", line)
     if m:
         n = int(m.group(1))
@@ -122,18 +139,37 @@ def _summarize_strix_line(line: str, state: dict) -> str | None:
     return None
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _scan_log_tail(work_dir: Path, limit: int = 300) -> str:
+    """取 scan.log（strix CLI 的 stdout/stderr）尾部的可读文本，用于启动卡点诊断。"""
+    try:
+        text = (work_dir / "scan.log").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    tail = _ANSI_RE.sub("", text).strip()[-limit:].replace("\n", " ⏎ ")
+    return re.sub(r"\S*strix_runs/\S*", "<run目录>", tail)
+
+
 def _tail_strix_log(work_dir: Path, log: Callable[[str], None], stop: threading.Event) -> None:
     """后台 tail 最新 strix_runs/*/strix.log，把关键事件转发进任务日志。
 
     仅在 execute_scan 等待子进程期间运行（wait 返回即被 join），log 回调
     不会与主线程并发使用 DB 会话。
     """
-    state: dict = {"agents": {}, "results": -1, "turn": None}
+    state: dict = {
+        "agents": {}, "results": -1, "turn": None,
+        "llm_calls": 0, "tool_calls": 0, "last_tool": "", "last_action": "",
+    }
     offsets: dict[Path, int] = {}
     current: Path | None = None
     buf = b""
     last_msg = ""
     last_event = time.monotonic()
+    last_content = time.monotonic()  # 最近一次从 strix.log 读到新内容（含未转发行）
+    last_raw = ""                    # strix.log 最新一行原文，供长时间无进展时诊断
+    warned_no_log = False
     started = time.monotonic()
 
     while not stop.is_set():
@@ -157,18 +193,41 @@ def _tail_strix_log(work_dir: Path, log: Callable[[str], None], stop: threading.
                     buf += chunk
                     *complete, buf = buf.split(b"\n")
                     for raw in complete:
-                        msg = _summarize_strix_line(raw.decode("utf-8", "replace"), state)
+                        text = raw.decode("utf-8", "replace")
+                        if text.strip():
+                            last_raw = text
+                        msg = _summarize_strix_line(text, state)
                         # 相邻去重：同一事件会由 session_manager 与 runner 各写一条（如沙箱就绪）
                         if msg and msg != last_msg:
                             log(msg)
                             last_msg = msg
                             last_event = time.monotonic()
+                    last_content = time.monotonic()
+            elif not warned_no_log and time.monotonic() - started >= 90:
+                warned_no_log = True
+                hint = _scan_log_tail(work_dir)
+                log(
+                    "[scan][警告] 引擎日志 strix_runs/*/strix.log 迟迟未生成，引擎可能卡在启动阶段"
+                    + (f"（如拉取沙箱镜像）；scan.log 尾部: {hint}" if hint else "；且 scan.log 无输出")
+                )
             if time.monotonic() - last_event >= _HEARTBEAT_SILENCE:
                 mins = int((time.monotonic() - started) // 60)
-                tip = f"（{state['turn'][0]} 第 {state['turn'][1]} 轮）" if state["turn"] else ""
+                tips = []
+                if state["turn"]:
+                    tips.append(f"{state['turn'][0]} 第 {state['turn'][1]} 轮")
+                if state["llm_calls"]:
+                    tips.append(f"已调用 LLM {state['llm_calls']} 次")
                 if state["results"] > 0:
-                    tip += f"，已确认 {state['results']} 个问题"
-                log(f"[scan] 运行中… 已执行 {mins} 分钟{tip}")
+                    tips.append(f"已确认 {state['results']} 个问题")
+                suffix = f"（{' · '.join(tips)}）" if tips else "（尚未出现引擎日志）" if current is None else ""
+                log(f"[scan] 运行中… 已执行 {mins} 分钟{suffix}")
+                stale = int(time.monotonic() - last_content)
+                if current is not None and stale >= _HEARTBEAT_SILENCE:
+                    # 引擎日志有文件但长时间无新内容：贴出最后一行帮助定位卡点
+                    detail = re.sub(r"\S*strix_runs/\S+", "<run目录>", last_raw)[:200]
+                    log(f"[scan][诊断] 引擎日志已 {stale} 秒无新内容，最后一行: {detail or '-'}")
+                    where = state.get("last_action") or "引擎启动阶段"
+                    log(f"[scan][诊断] 卡点推测: {where}；若持续无变化可检查容器与 LLM 网关连通性")
                 last_event = time.monotonic()
         except Exception:  # noqa: BLE001 —— 监控线程任何异常都不能影响扫描本身
             time.sleep(1)
