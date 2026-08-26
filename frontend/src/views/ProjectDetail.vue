@@ -32,10 +32,13 @@ interface RepoBranchSel {
 
 const form = ref({
   scanMode: 'quick', model: '', blackbox: false, testTargets: [] as TestTarget[], instruction: '',
-  webSearch: false,
+  webSearch: false, timeoutDisabled: false,
   repos: [] as RepoBranchSel[],
   uploadChoice: 'new' as 'history' | 'new', uploadId: '', file: null as File | null, fileName: '',
 })
+
+// 各档位默认超时上限（与后端 config.py 的 timeout_* 默认值对应，仅作提示文案）
+const MODE_LIMITS: Record<string, string> = { quick: '2 小时', standard: '4 小时', deep: '8 小时' }
 
 // 提交前统一清洗：trim + 丢弃未填地址的行（地址列表与仓库列表同构，共用）
 function cleanTargets<T extends { url: string; note: string }>(list: T[]): T[] {
@@ -171,6 +174,7 @@ function openLaunch() {
   form.value.testTargets = defaults
   form.value.blackbox = defaults.length > 0
   form.value.webSearch = false  // 联网搜索默认不勾选
+  form.value.timeoutDisabled = false  // 超时终止默认开启（按档位默认时长回收）
   form.value.repos = (project.value?.git_repos || []).map(r => ({
     url: r.url, note: r.note, branch: '', branches: [], loaded: false, loading: false,
   }))
@@ -217,6 +221,7 @@ async function launch() {
       testTargets: f.blackbox ? targets : [],
       instruction: f.instruction.trim(),
       webSearch: f.webSearch,
+      timeoutDisabled: f.timeoutDisabled,
       model: f.model,
       uploadId: !isGit.value && f.uploadChoice === 'history' ? f.uploadId : '',
       file: !isGit.value && f.uploadChoice === 'new' ? f.file : null,
@@ -602,6 +607,17 @@ onUnmounted(() => clearInterval(timer))
                     </SelectContent>
                   </SelectPortal>
                 </SelectRoot>
+              </div>
+              <div class="col-span-2">
+                <label class="flex cursor-pointer items-center gap-1.5 text-[13px] text-text">
+                  <CheckboxRoot v-model="form.timeoutDisabled"
+                    class="flex h-4 w-4 cursor-pointer items-center justify-center rounded border border-border bg-panel2 data-state-checked:border-accent data-state-checked:bg-accent/20">
+                    <CheckboxIndicator class="text-xs leading-none text-accent">✓</CheckboxIndicator>
+                  </CheckboxRoot>
+                  不限时运行（关闭超时终止）
+                  <span class="text-xs text-muted">（{{ form.scanMode }} 档位默认超时 {{ MODE_LIMITS[form.scanMode] || '-' }}；多仓库 / 大型项目常跑不满一个档位时长，
+                    勾选后引擎不会被超时回收，跑完为止，可随时在任务页手动取消）</span>
+                </label>
               </div>
               <div v-if="isGit" class="col-span-2">
                 <div class="mb-1.5 flex items-center gap-2.5">

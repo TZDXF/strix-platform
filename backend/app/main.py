@@ -1073,6 +1073,7 @@ def _task_summary(t: Task, db: Session) -> dict:
         "test_targets": targets,
         "instruction": t.instruction or "",
         "web_search": bool(t.web_search),
+        "timeout_disabled": bool(t.timeout_disabled),
         "report_lang": t.report_lang,
         "zh_status": t.zh_status or "",
         "model": t.model or "",
@@ -1166,6 +1167,7 @@ async def create_task(
     test_targets: str = Form(""),  # 多目标列表：JSON [{"url","note"}]
     instruction: str = Form(""),
     web_search: bool = Form(False),  # 联网搜索：指令注入内网 MCP 搜索指南（默认关闭）
+    timeout_disabled: bool = Form(False),  # 关闭超时终止：忽略档位默认时长，引擎跑完为止
     model: str = Form(""),
     branch: str = Form(""),  # 旧版单仓库分支（兼容旧客户端）
     repo_branches: str = Form(""),  # 多仓库各自分支：JSON [{"url","branch"}]
@@ -1259,7 +1261,8 @@ async def create_task(
         upload_id=upload_ref.id if upload_ref else None,
         test_url=targets[0]["url"] if targets else "",
         test_targets=dump_targets(targets),
-        instruction=instruction, web_search=web_search, model=model, report_lang="zh", status="pending",
+        instruction=instruction, web_search=web_search, timeout_disabled=timeout_disabled,
+        model=model, report_lang="zh", status="pending",
     )
     db.add(task)
     db.commit()
@@ -1268,7 +1271,7 @@ async def create_task(
         f"id={task_id} project={project_id} mode={scan_mode} model={model or 'default'} "
         f"source={source_type} repos={len(repo_refs)} branch={branch} upload={upload_ref.id if upload_ref else '-'} "
         f"targets={dump_targets(targets) if targets else '-'} instruction={'yes' if instruction else 'no'} "
-        f"web_search={'yes' if web_search else 'no'}",
+        f"web_search={'yes' if web_search else 'no'} timeout={'off' if timeout_disabled else 'default'}",
         user=user,
     )
     run_scan.delay(task_id)

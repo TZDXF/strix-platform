@@ -291,6 +291,7 @@ def execute_scan(
     instruction: str = "",
     llm_api_key: str = "",
     cancel_check: Callable[[], bool] | None = None,
+    timeout_disabled: bool = False,
 ) -> dict:
     """运行 strix，返回 {exit_code, timed_out, cancelled, run_dir_name, attempts}。
 
@@ -300,6 +301,8 @@ def execute_scan(
     test_targets 为黑盒目标列表 [{"url", "note"}]：每个地址各占一个 -t；
     note（地址作用说明）由调用方并入 instruction 注入。
     cancel_check 返回 True 时终止进程树并放弃后续重试（结果 cancelled=True）。
+    timeout_disabled=True 时不限时运行：跳过档位默认时长的超时回收（多仓库/大型
+    项目扫描常超出档位上限），仅保留用户取消通道。
     """
     s = get_settings()
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -337,7 +340,11 @@ def execute_scan(
             log("[scan] 检测到取消请求，停止执行")
             break
         attempts = attempt
-        log(f"[scan] 第 {attempt}/{s.max_scan_attempts} 次执行（超时 {timeout_sec // 60} 分钟）")
+        log(
+            f"[scan] 第 {attempt}/{s.max_scan_attempts} 次执行（"
+            + ("不限时运行" if timeout_disabled else f"超时 {timeout_sec // 60} 分钟")
+            + "）"
+        )
         # tail 线程只在 proc 存活期间运行，wait 返回（含超时/取消）即 join，
         # 保证 log 回调（写 DB）不与主线程并发
         stop_evt = threading.Event()
@@ -352,7 +359,8 @@ def execute_scan(
                     start_new_session=(os.name != "nt"),
                 )
                 # 等待期间每 2 秒轮询一次取消标记（跨进程经 Redis）；总时长仍受
-                # timeout_sec 约束，语义与原 proc.wait(timeout=...) 一致
+                # timeout_sec 约束（timeout_disabled 时不限时，仅响应取消），
+                # 语义与原 proc.wait(timeout=...) 一致
                 started = time.monotonic()
                 while True:
                     try:
@@ -366,7 +374,7 @@ def execute_scan(
                             proc.wait(timeout=60)
                             exit_code = proc.returncode
                             break
-                        if time.monotonic() - started >= timeout_sec:
+                        if not timeout_disabled and time.monotonic() - started >= timeout_sec:
                             _kill_tree(proc)
                             proc.wait(timeout=60)
                             exit_code = proc.returncode

@@ -242,6 +242,7 @@ onUnmounted(() => { clearInterval(timer); themeObserver?.disconnect() })
             <span v-if="task.schedule_id" class="inline-block rounded-full bg-accent/15 px-2.5 py-0.5 text-xs font-semibold text-accent" title="由定时计划自动发起">定时扫描</span>
             <span v-if="task.web_search" class="inline-block rounded-full bg-[#9b7bff]/15 px-2.5 py-0.5 text-xs font-semibold text-[#a78bfa]" title="智能体可经内网搜索端点查询公开漏洞/利用资料">联网搜索</span>
             <span v-if="task.timed_out" :class="statusBadgeClass('failed')">超时终止</span>
+            <span v-if="task.timeout_disabled" class="inline-block rounded-full bg-border/30 px-2.5 py-0.5 text-xs font-semibold text-muted" title="发起任务时关闭了超时终止，引擎不受档位默认时长限制">不限时</span>
             <span v-if="task.zh_status === 'pending'" class="inline-block rounded-full bg-[#9b7bff]/15 px-2.5 py-0.5 text-xs font-semibold text-[#a78bfa]">翻译中</span>
           </h1>
           <p class="mt-1.5 text-[13px] text-muted">

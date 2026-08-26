@@ -363,6 +363,7 @@ def run_scan(self, task_id: str) -> dict:
             llm_api_key=user_llm_key,
             log=lambda m: (_log(task, m), db.commit()),
             cancel_check=lambda: cancel_requested(task_id),
+            timeout_disabled=bool(task.timeout_disabled),
         )
         task.exit_code = result["exit_code"]
         task.attempts = result["attempts"]

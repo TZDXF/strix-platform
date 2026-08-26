@@ -81,6 +81,7 @@ export interface TaskSummary {
   test_targets: TestTarget[]
   instruction: string
   web_search: boolean // 联网搜索（指令注入内网 MCP 搜索指南）
+  timeout_disabled: boolean // 发起时关闭了超时终止（不限时运行）
   report_lang: 'en' | 'zh'
   zh_status: string
   model: string
@@ -317,6 +318,7 @@ export interface SubmitTaskParams {
   testTargets?: TestTarget[]
   instruction?: string
   webSearch?: boolean
+  timeoutDisabled?: boolean
   model?: string
   branch?: string
   uploadId?: string
@@ -480,6 +482,7 @@ export const api = {
     form.append('test_targets', JSON.stringify(p.testTargets || []))
     if (p.instruction) form.append('instruction', p.instruction)
     if (p.webSearch) form.append('web_search', '1')
+    if (p.timeoutDisabled) form.append('timeout_disabled', '1')
     if (p.model) form.append('model', p.model)
     if (p.branch) form.append('branch', p.branch)
     if (p.uploadId) form.append('upload_id', p.uploadId)

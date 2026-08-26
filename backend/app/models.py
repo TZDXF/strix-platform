@@ -127,6 +127,8 @@ class Task(Base):
     test_targets = Column(Text, default="")
     instruction = Column(Text, default="")  # 用户自定义测试指令（--instruction，可选）
     web_search = Column(Boolean, default=False)  # 联网搜索：指令中注入内网 MCP 搜索调用指南
+    # 关闭超时终止：True 时忽略档位默认时长（quick 2h / standard 4h / deep 8h），引擎跑完为止
+    timeout_disabled = Column(Boolean, default=False)
     report_lang = Column(String(8), default="zh")  # 固定中文报告；保留字段兼容历史 en 任务
     zh_status = Column(String(16), default="")  # 翻译状态："" | pending | done | failed
 

@@ -144,7 +144,7 @@ git pull
 | `S3_ENABLED` / `S3_ENDPOINT` / `S3_*` | RustFS 对象存储；false 时产物留本地磁盘 | false |
 | `TARGET_ALLOWLIST` | 黑盒目标允许清单（域名后缀/CIDR，逗号分隔） | 空=仅内网/回环 |
 | `MAX_UPLOAD_MB` | zip 上限 | 500 |
-| `TIMEOUT_QUICK/STANDARD/DEEP` | 任务超时秒数（Phase 0 实测校准） | 7200/14400/28800 |
+| `TIMEOUT_QUICK/STANDARD/DEEP` | 任务超时秒数（Phase 0 实测校准）；发起任务时可勾选「不限时运行」按任务关闭超时终止 | 7200/14400/28800 |
 | `MAX_SCAN_ATTEMPTS` | LLM 连接失败重试次数 | 3 |
 | `STRIX_MAX_BUDGET` | 单任务 LLM 预算上限（美元）；>0 时传 `--max-budget` | 0=不限 |
 | `STRIX_EXTRA_ARGS` | 原样追加的 strix CLI 参数（shlex 切分，如 `--scope-mode full`） | 空 |
@@ -156,6 +156,7 @@ git pull
 3. 项目内「发起扫描任务」：Git 项目选分支，zip 项目选历史上传/新上传；可选档位
    （quick/standard/deep 全开放）、模型、黑盒地址、中文报告、测试指令
    （聚焦的漏洞类型 / 测试要求 / 测试账号，透传 `--instruction`，留空则全量扫描）。
+   多仓库 / 大型项目可勾选「不限时运行」，按任务关闭档位默认的超时终止。
 4. 任务列表实时刷新状态：`pending → fetching → scanning → parsing → (translating) → done/failed`。
 5. 报告页查看：严重级别概览 + 漏洞明细（可展开 PoC）+ 官方执行摘要；可导出 PDF、下载产物 zip
    （漏洞 JSON/CSV/MD、SARIF、执行日志）。
