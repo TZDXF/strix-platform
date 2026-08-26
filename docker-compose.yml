@@ -2,7 +2,7 @@ name: strix-platform
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:15
     environment:
       POSTGRES_USER: strix
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-strix}
@@ -15,7 +15,7 @@ services:
       retries: 10
 
   redis:
-    image: redis:7-alpine
+    image: redis:7.2
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
