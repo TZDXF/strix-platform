@@ -1,7 +1,8 @@
 """扫描结果中文翻译：调用公司 LLM 网关（OpenAI 兼容 /chat/completions）。
 
-用于 report_lang=zh 的任务：即便提示词已要求中文撰写，也作为兜底把
-标题/描述/修复建议翻译成简体中文存入 *_zh 字段。
+由任务页按钮手动触发（POST /api/tasks/{task_id}/translate）：把标题/描述/
+修复建议翻译成简体中文存入 *_zh 字段。流程内不再自动翻译——提示词已要求
+中文撰写，仅当报告仍为英文时按需补翻。
 """
 
 from __future__ import annotations

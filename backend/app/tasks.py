@@ -33,7 +33,6 @@ from .sources import (
 )
 from .targets import effective_targets
 from .tasklog import append_log as _log
-from .translate import translate_findings_task
 
 ZH_INSTRUCTION = (
     "Please write the entire report in Simplified Chinese (简体中文): "
@@ -454,12 +453,6 @@ def run_scan(self, task_id: str) -> dict:
         _set_status(db, task, "done")
         _notify(db, task, task_id)
 
-        # ---- Stage 5: 中文翻译（提示词要求中文撰写失败时的兜底）----
-        if task.findings_count > 0:
-            task.zh_status = "pending"
-            db.commit()
-            _log(task, "[translate] 调度中文翻译任务")
-            translate_findings_task.delay(task_id)
         return {"task_id": task_id, "exit_code": task.exit_code, "findings": task.findings_count}
 
     except SourceError as exc:

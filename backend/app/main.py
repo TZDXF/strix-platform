@@ -14,12 +14,12 @@ _IMPORT_T0 = time.perf_counter()
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import desc, func, or_, select
 from sqlalchemy.orm import Session
 
-from .artifacts import artifact_response_path, ensure_bucket, presigned_artifact_url
+from .artifacts import artifact_response_path, ensure_bucket, open_s3_artifact
 from .auth import (
     bootstrap_admin,
     client_ip,
@@ -66,6 +66,7 @@ from .targets import (
 )
 from .tasklog import append_log as _append_task_log
 from .tasks import new_task_id, run_scan
+from .translate import translate_findings_task
 
 settings = get_settings()
 
@@ -1545,10 +1546,15 @@ def task_artifacts(task_id: str, request: Request, db: Session = Depends(get_db)
         raise HTTPException(404, "产物尚未归档")
     _audit(db, request, "task.artifacts", f"id={task_id}", user=user)
     if task.artifacts_ref.startswith("s3://"):
-        url = presigned_artifact_url(task.artifacts_ref)
-        if url:
-            return {"url": url}
-        raise HTTPException(502, "对象存储不可用")
+        # rustfs 仅在 compose 内网可达，浏览器无法访问预签名直链，由后端代理流出
+        opened = open_s3_artifact(task.artifacts_ref)
+        if opened is None:
+            raise HTTPException(502, "对象存储不可用")
+        body, length = opened
+        headers = {"Content-Disposition": f'attachment; filename="{task_id}-artifacts.zip"'}
+        if length:
+            headers["Content-Length"] = str(length)
+        return StreamingResponse(body, media_type="application/zip", headers=headers)
     path = artifact_response_path(task.artifacts_ref)
     if path is None:
         raise HTTPException(404, "产物文件缺失")
@@ -1581,7 +1587,7 @@ def task_report_pdf(task_id: str, request: Request, db: Session = Depends(get_db
     return FileResponse(cache_path, filename=f"strix-report-{task_id[:10]}.pdf", media_type="application/pdf")
 
 
-# ===================== 任务取消 =====================
+# ===================== 任务取消 / 手动中文翻译 =====================
 
 
 @app.post("/api/tasks/{task_id}/cancel", dependencies=[Depends(require_user)])
@@ -1599,6 +1605,31 @@ def cancel_task(task_id: str, request: Request, db: Session = Depends(get_db), u
     db.commit()
     _audit(db, request, "task.cancel_request", f"id={task_id} status={task.status}", user=user)
     return {"ok": True, "status": task.status}
+
+
+@app.post("/api/tasks/{task_id}/translate", dependencies=[Depends(require_user)])
+def translate_task(task_id: str, request: Request, db: Session = Depends(get_db), user: User = Depends(require_user)):
+    """手动触发漏洞明细中文翻译（任务页按钮调用，流程内不再自动翻译）。
+
+    用任务创建者的个人 AI 密钥经 LLM 网关把标题/描述/修复建议译为简体中文
+    写入 *_zh 字段；仅已完成且有发现的任务可触发，翻译中不可重复下发。
+    """
+    task = _get_task_checked(db, task_id, user)
+    if task.status != "done":
+        raise HTTPException(400, "任务尚未完成，无法翻译")
+    if task.findings_count <= 0:
+        raise HTTPException(400, "本次扫描没有发现漏洞，无需翻译")
+    if (task.zh_status or "") == "pending":
+        raise HTTPException(400, "中文翻译正在进行中，请稍候")
+    creator = db.get(User, task.created_by) if task.created_by else None
+    if not (creator and (creator.llm_api_key or "")):
+        raise HTTPException(400, "提交人未配置个人 AI 密钥，无法翻译（可在个人设置填写后再试）")
+    task.zh_status = "pending"
+    db.commit()
+    _append_task_log(task, "[translate] 用户手动触发中文翻译")
+    translate_findings_task.delay(task_id)
+    _audit(db, request, "task.translate", f"id={task_id}", user=user)
+    return {"ok": True}
 
 
 # ===================== 漏洞处置状态 =====================

@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 import zipfile
 from pathlib import Path
+from typing import Any
 
 from .config import get_settings
 
@@ -97,23 +98,20 @@ def artifact_response_path(artifacts_ref: str) -> Path | None:
     return p if p.is_file() else None
 
 
-def presigned_artifact_url(artifacts_ref: str, expires: int = 3600) -> str | None:
-    import boto3
-    from botocore.client import Config as BotoConfig
+def open_s3_artifact(artifacts_ref: str) -> tuple[Any, int] | None:
+    """按 s3:// 引用打开对象，返回 (响应体流, ContentLength)；引用不匹配返回 None。
 
+    rustfs 仅存在于 compose 内网、未对宿主机暴露端口，浏览器无法访问预签名
+    链接，故由 API 层代理流出而非生成直链。
+    """
     s = get_settings()
     prefix = f"s3://{s.s3_bucket}/"
     if not artifacts_ref.startswith(prefix):
         return None
     key = artifacts_ref[len(prefix):]
-    client = boto3.client(
-        "s3",
-        endpoint_url=s.s3_endpoint,
-        aws_access_key_id=s.s3_access_key,
-        aws_secret_access_key=s.s3_secret_key,
-        config=BotoConfig(signature_version="s3v4"),
-        region_name="us-east-1",
-    )
-    return client.generate_presigned_url(
-        "get_object", Params={"Bucket": s.s3_bucket, "Key": key}, ExpiresIn=expires
-    )
+    try:
+        obj = _s3_client().get_object(Bucket=s.s3_bucket, Key=key)
+    except Exception:
+        # 连接失败、key 缺失等一律交由调用方给出统一错误提示
+        return None
+    return obj["Body"], obj.get("ContentLength") or 0

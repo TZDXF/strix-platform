@@ -2,7 +2,8 @@ name: strix-platform
 
 services:
   postgres:
-    image: postgres:15
+    # 宿主 ./docker/data/postgres 由 PG16 初始化；换成 15 会因数据目录不兼容拒启
+    image: postgres:16
     environment:
       POSTGRES_USER: strix
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-strix}

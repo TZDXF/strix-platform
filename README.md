@@ -15,8 +15,8 @@ frontend/   Vue 3 + Vite（登录 / 项目 / 任务 / 用户管理 / 报告页�
 backend/    FastAPI + Celery + SQLAlchemy
               ├─ app/main.py      API（用户认证 + 项目 + 任务 + 报告/产物）
               ├─ app/auth.py      账号体系（PBKDF2 口令 + HMAC 签名令牌）
-              ├─ app/tasks.py     流水线：fetch → scan → parse → archive → translate
-              ├─ app/translate.py 中文报告兜底翻译（LLM 网关）
+              ├─ app/tasks.py     流水线：fetch → scan → parse → archive
+              ├─ app/translate.py 中文翻译（LLM 网关，任务页按钮手动触发）
               ├─ app/mailer.py    邮件提醒（SMTP 配置存库 + 任务完成/失败通知）
               └─ app/runner.py    strix 子进程执行器（失败自动重试）
 docker-compose.yml  postgres + redis + rustfs + api + worker + frontend
@@ -32,8 +32,9 @@ docker-compose.yml  postgres + redis + rustfs + api + worker + frontend
    在项目内发起扫描：Git 项目拉取远端**分支列表**供选择（默认分支排首位）；
    zip 项目可选**历史上传**复用或**新上传**（新上传自动存入历史）。
 4. **PDF 导出**：报告页一键导出官方风格 PDF（复用 strix 内置 reportlab 渲染，结果本地缓存）。
-5. **中文报告**：发起任务可选「中文报告」——通过 `--instruction` 提示词要求 strix 用简体中文撰写，
-   扫描完成后再经 LLM 网关把标题/描述/修复建议翻译入库兜底（`*_zh` 字段，前端可切换）。
+5. **中文报告**：发起任务即通过 `--instruction` 提示词要求 strix 用简体中文撰写；
+   流程内不做自动翻译——如报告仍为英文，可在任务详情页点「翻译成中文」，
+   经 LLM 网关把标题/描述/修复建议翻译入库（`*_zh` 字段，前端可切换）。
 6. **报告页**：对齐 `strix view` 官方报告结构——严重级别概览网格（严重/高危/中危/低危/提示）、
    官方执行摘要报告（`penetration_test_report.md`，Markdown 渲染）、逐条漏洞明细
    （彩色级别条 / CVSS / CWE / PoC 说明与脚本）。

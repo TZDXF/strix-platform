@@ -36,6 +36,19 @@ async function cancelTask() {
   } catch (e) { toast.error((e as Error).message) } finally { cancelling.value = false }
 }
 
+// ---- 手动触发中文翻译（流程内不自动翻译，报告为英文或明细缺中文时按需补翻） ----
+const translatingZh = ref(false)
+
+async function translateNow() {
+  if (!confirm('确定将漏洞明细翻译为简体中文？将使用提交人的个人 AI 密钥调用 LLM 网关。')) return
+  translatingZh.value = true
+  try {
+    await api.translateTask(props.taskId)
+    toast.success('翻译已开始，完成后页面自动展示中文内容')
+    refresh()
+  } catch (e) { toast.error((e as Error).message) } finally { translatingZh.value = false }
+}
+
 // ---- 漏洞处置状态：待处理 / 已修复 / 已忽略 / 误报 ----
 const FINDING_STATUS_OPTIONS: FindingStatus[] = ['open', 'fixed', 'ignored', 'false_positive']
 const editState = ref<Record<number, { status: FindingStatus; note: string }>>({})
@@ -258,6 +271,10 @@ onUnmounted(() => { clearInterval(timer); themeObserver?.disconnect() })
             {{ cancelling ? '取消中…' : '取消任务' }}
           </button>
           <button v-if="task.has_artifacts" :class="btnGhost" @click="downloadArtifacts">下载产物 zip</button>
+          <button
+            v-if="task.status === 'done' && task.findings_count > 0 && task.zh_status !== 'pending'"
+            :class="btnGhost" :disabled="translatingZh" @click="translateNow"
+          >{{ translatingZh ? '请求中…' : '翻译成中文' }}</button>
           <button v-if="task.status === 'done' && task.run_dir_name" :class="btn" @click="downloadPdf">导出 PDF 报告</button>
         </div>
       </div>
@@ -386,6 +403,9 @@ onUnmounted(() => { clearInterval(timer); themeObserver?.disconnect() })
 
           <div v-if="task.zh_status === 'pending'" :class="hint">
             中文翻译进行中，稍后自动刷新；当前可先查看原文。
+          </div>
+          <div v-else-if="task.zh_status === 'failed'" :class="hint">
+            中文翻译失败（常见于个人 AI 密钥额度或网关连接问题），可点击页头「翻译成中文」重试。
           </div>
           <div v-if="task.findings.length === 0 && task.status === 'done'" :class="hint">
             本次扫描未发现漏洞（退出码 {{ task.exit_code }}）。
