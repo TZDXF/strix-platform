@@ -18,6 +18,7 @@ backend/    FastAPI + Celery + SQLAlchemy
               ├─ app/tasks.py     流水线：fetch → scan → parse → archive
               ├─ app/translate.py 中文翻译（LLM 网关，任务页按钮手动触发）
               ├─ app/mailer.py    邮件提醒（SMTP 配置存库 + 任务完成/失败通知）
+              ├─ app/replay.py    执行过程回放（解析 strix.log 生成事件时间线）
               └─ app/runner.py    strix 子进程执行器（失败自动重试）
 docker-compose.yml  postgres + redis + rustfs + api + worker + frontend
 ```
@@ -38,9 +39,13 @@ docker-compose.yml  postgres + redis + rustfs + api + worker + frontend
 6. **报告页**：对齐 `strix view` 官方报告结构——严重级别概览网格（严重/高危/中危/低危/提示）、
    官方执行摘要报告（`penetration_test_report.md`，Markdown 渲染）、逐条漏洞明细
    （彩色级别条 / CVSS / CWE / PoC 说明与脚本）。
-7. **系统设置页（仅超管）**：集中管理平台级配置——平台模型管理（网关密钥查询可用模型后加入平台、
+7. **执行过程回放**：任务详情「智能体」页可回放具体执行过程——解析引擎日志 `strix.log`
+   生成事件时间线（引擎启停 / 智能体派生与收工 / 工具调用 / 漏洞落盘 / 告警错误），
+   播放器支持倍速播放、时间轴拖动定位、执行密度图、各智能体并发泳道与事件流筛选；
+   工作区日志被清理后自动回退解析产物 zip 中的存档（解析结果缓存入库）。
+8. **系统设置页（仅超管）**：集中管理平台级配置——平台模型管理（网关密钥查询可用模型后加入平台、
    指定默认模型）与邮件提醒（SMTP 服务器/端口/加密方式/发件人，可真实发送测试邮件验证连通）。
-8. **邮件提醒**：超管在「系统设置」配置 SMTP 后，扫描任务完成/失败时平台自动向创建者
+9. **邮件提醒**：超管在「系统设置」配置 SMTP 后，扫描任务完成/失败时平台自动向创建者
    在「个人设置」填写的通知邮箱发送结果摘要邮件（严重度分布、耗时、失败原因、任务链接）。
 
 ## 本地开发
@@ -160,7 +165,8 @@ git pull
    多仓库 / 大型项目可勾选「不限时运行」，按任务关闭档位默认的超时终止。
 4. 任务列表实时刷新状态：`pending → fetching → scanning → parsing → (translating) → done/failed`。
 5. 报告页查看：严重级别概览 + 漏洞明细（可展开 PoC）+ 官方执行摘要；可导出 PDF、下载产物 zip
-   （漏洞 JSON/CSV/MD、SARIF、执行日志）。
+   （漏洞 JSON/CSV/MD、SARIF、执行日志）。「智能体」页可回放具体执行过程
+   （倍速播放 / 拖动定位 / 智能体并发泳道 / 事件流筛选）。
 6. （可选）超管在「系统设置」配置邮件提醒（SMTP），用户在「个人设置 → 通知邮箱」填写收件地址；
    任务完成或失败时会自动收到提醒邮件。
 
