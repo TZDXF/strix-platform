@@ -86,3 +86,13 @@ export function findingBarClass(sev: string): string {
     default: return 'border-l-low'
   }
 }
+
+// 漏洞严重度分布条（列表列共用）：固定展示顺序 + 占比条配色 + 中文悬停明细
+export const sevOrder = ['critical', 'high', 'medium', 'low', 'info']
+export const sevBarCls: Record<string, string> = {
+  critical: 'bg-crit', high: 'bg-high', medium: 'bg-med', low: 'bg-low', info: 'bg-accent',
+}
+export function sevDistTitle(counts: Record<string, number> | null | undefined): string {
+  const c = counts || {}
+  return sevOrder.filter(s => c[s]).map(s => `${sevLabel[s]} ${c[s]}`).join(' / ') || '无'
+}

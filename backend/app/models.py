@@ -151,6 +151,8 @@ class Task(Base):
     artifacts_ref = Column(Text, default="")  # 本地 zip 路径 或 s3://key
     report_md = Column(Text, default="")  # 官方执行摘要报告（penetration_test_report.md）
     log = Column(Text, default="")  # 关键执行日志（滚动截断）
+    # 执行过程回放时间线（replay.parse_strix_timeline 的 JSON 缓存，智能体页回放用）
+    execution_events = Column(Text, default="")
     error = Column(Text, default="")
 
 

@@ -3,7 +3,7 @@ import { ref, onMounted, onUnmounted } from 'vue'
 import { api, type TaskSummary, type User } from '../api'
 import { toast } from '../toast'
 import {
-  badge, card, hint, h3, statusBadgeClass, tableTd, tableTh, taskStatusLabel,
+  badge, card, hint, h3, sevBarCls, sevDistTitle, sevOrder, statusBadgeClass, tableTd, tableTh, taskStatusLabel,
 } from '../ui'
 
 const props = defineProps<{ user: User | null }>()
@@ -40,10 +40,6 @@ function fmtTokens(t: TaskSummary) {
   if (t.total_tokens == null) return '-'
   return t.total_tokens > 10000 ? Math.round(t.total_tokens / 10000) / 100 + 'M' : String(t.total_tokens)
 }
-function sevCounts(t: TaskSummary) {
-  const c = t.severity_counts || {}
-  return ['critical', 'high', 'medium', 'low', 'info'].filter(k => c[k]).map(k => `${k[0].toUpperCase()}:${c[k]}`).join(' ') || '-'
-}
 function open(id: string) { location.hash = `#/task/${id}` }
 
 onMounted(() => { refresh(); timer = window.setInterval(refresh, 5000) })
@@ -58,7 +54,7 @@ onUnmounted(() => clearInterval(timer))
         <tr>
           <th :class="tableTh">任务</th><th :class="tableTh">项目</th><th :class="tableTh">状态</th>
           <th :class="tableTh">分支/来源</th><th :class="tableTh">模式</th><th :class="tableTh">模型</th>
-          <th :class="tableTh">发现</th><th :class="tableTh">耗时</th>
+          <th :class="tableTh">漏洞严重度分布</th><th :class="tableTh">耗时</th>
           <th :class="tableTh">tokens</th><th :class="tableTh">提交人</th><th :class="tableTh">提交时间</th>
           <th :class="tableTh">操作</th>
         </tr>
@@ -78,7 +74,16 @@ onUnmounted(() => clearInterval(timer))
           </td>
           <td :class="tableTd">{{ t.scan_mode }}</td>
           <td :class="tableTd">{{ t.model || '-' }}</td>
-          <td :class="tableTd">{{ t.findings_count > 0 ? sevCounts(t) : (t.status === 'done' ? '无' : '-') }}</td>
+          <td :class="tableTd">
+            <div v-if="t.findings_count > 0" class="flex items-center gap-2" :title="sevDistTitle(t.severity_counts)">
+              <span class="text-[13px] font-semibold">{{ t.findings_count }}</span>
+              <div class="flex h-2.5 w-24 overflow-hidden rounded-full bg-panel2">
+                <div v-for="s in sevOrder.filter(k => t.severity_counts?.[k])" :key="s"
+                  :class="sevBarCls[s]" :style="{ width: `${(t.severity_counts[s] / t.findings_count) * 100}%` }"></div>
+              </div>
+            </div>
+            <span v-else class="text-xs text-muted">{{ t.status === 'done' ? '无' : '-' }}</span>
+          </td>
           <td :class="tableTd">{{ fmtDur(t.duration_sec) }}</td>
           <td :class="tableTd">{{ fmtTokens(t) }}</td>
           <td :class="tableTd">{{ t.created_by_name }}</td>

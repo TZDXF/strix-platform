@@ -168,6 +168,40 @@ export interface AgentUsage {
   status: string
 }
 
+// 执行过程回放（replay.py 解析 strix.log 的产物；t 均为相对起点的秒数）
+export type ReplayEventKind = 'engine' | 'agent' | 'tool' | 'turn' | 'finding' | 'warn' | 'error'
+
+export interface ReplayEvent {
+  t: number
+  k: ReplayEventKind
+  m: string
+}
+
+export interface ReplayAgent {
+  id: string
+  name: string
+  parent: string
+  parent_name: string
+  t0: number
+  t1: number | null // null = 没观测到收工（异常终止）
+  status: string
+}
+
+export interface ReplayData {
+  run: string
+  image: string
+  model: string
+  max_turns: number
+  started_at: string // ISO8601 北京时间（含 +08:00）
+  finished_at: string
+  duration_sec: number
+  totals: { turns: number; llm_calls: number; tool_calls: number; agents: number; findings: number }
+  agents: ReplayAgent[]
+  bucket_sec: number
+  activity: number[][] // [轮次数, 工具数, LLM 调用数] × n 个时间桶
+  events: ReplayEvent[]
+}
+
 export interface TaskDetail extends TaskSummary {
   started_at: string | null
   finished_at: string | null
@@ -500,6 +534,8 @@ export const api = {
     }),
   getTask: (id: string) => request<TaskDetail>('GET', `/api/tasks/${id}`),
   getLog: (id: string) => request<{ log: string }>('GET', `/api/tasks/${id}/log`),
+  getReplay: (id: string) =>
+    request<{ available: boolean; reason?: string; data?: ReplayData }>('GET', `/api/tasks/${id}/replay`),
   downloadArtifacts: (id: string) => download(`/api/tasks/${id}/artifacts`, `${id}-artifacts.zip`),
   downloadPdf: (id: string) => download(`/api/tasks/${id}/report.pdf`, `strix-report-${id.slice(0, 10)}.pdf`),
   cancelTask: (id: string) => request<{ ok: boolean; status: string }>('POST', `/api/tasks/${id}/cancel`),

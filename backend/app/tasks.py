@@ -40,6 +40,20 @@ ZH_INSTRUCTION = (
     "Keep technical identifiers (CVE/CWE, code, endpoints) unchanged."
 )
 
+LOCAL_RANGE_GUIDE = (
+    "Black-box validation scope note: this scan has NO externally provided black-box test "
+    "targets, so no live environment is in scope and NO traffic may leave the sandbox. "
+    "To validate findings empirically you MAY build and run the application locally INSIDE "
+    "your sandbox container, provision its supporting database yourself and seed it with "
+    "SQL/data bundled in the repository or synthetic values you create. Constraints: "
+    "(1) send requests only to loopback addresses of your own sandbox (127.0.0.1/localhost); "
+    "if any other host is somehow reachable from the sandbox, do NOT probe or attack it; "
+    "(2) clean up temporary rows you inserted once validation completes; "
+    "(3) when reporting a finding validated this way, set its target to the actual local "
+    "base URL you tested (e.g., http://127.0.0.1:<port>/<context>) so report readers can "
+    "tell verification ran against your self-provisioned local instance, not a real system."
+)
+
 
 def web_search_guide(mcp_url: str) -> str:
     """联网搜索指令块：教智能体用沙箱 shell curl 内网 MCP 搜索端点。
@@ -321,6 +335,8 @@ def run_scan(self, task_id: str) -> dict:
                 "[scan] 黑盒目标: "
                 + "；".join(f"{t['url']}（{t['note']}）" if t["note"] else t["url"] for t in targets),
             )
+        else:
+            _log(task, "[scan] 未配置黑盒目标：授权引擎在沙箱内自建本地靶场（构建并运行应用、自备数据库）做 PoC 实测，仅限沙箱回环地址")
         # 用户指令在首位，其后依次是仓库结构 / 黑盒目标说明块，最后是中文报告要求
         instruction_parts: list[str] = [task.instruction] if task.instruction else []
         if task.source_type == "git" and len(repo_refs) > 1:
@@ -348,6 +364,9 @@ def run_scan(self, task_id: str) -> dict:
             for i, t in enumerate(targets, 1):
                 lines.append(f"{i}. {t['url']}" + (f" — {t['note']}" if t["note"] else ""))
             instruction_parts.append("\n".join(lines))
+        else:
+            # 无黑盒目标时明确授权边界：允许沙箱内自建靶场做实测，禁止出沙箱流量
+            instruction_parts.append(LOCAL_RANGE_GUIDE)
         if task.web_search and s.web_search_mcp_url:
             instruction_parts.append(web_search_guide(s.web_search_mcp_url))
         instruction_parts.append(ZH_INSTRUCTION)

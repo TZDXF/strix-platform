@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import io
 import json
 import re
 import time
 import uuid
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -43,6 +45,7 @@ from .models import (
     FINDING_STATUSES, AuditEntry, Finding, GitConfig, PlatformModel, Project, ProjectUpload, Schedule, Task, User,
 )
 from .runner import read_run_artifacts  # noqa: F401（契约复用说明）
+from .replay import parse_strix_timeline, zip_member_strix_log
 from .schedules import cron_valid, fire_schedule, new_schedule_id, next_cron_run, schedule_out
 from .sources import (
     SourceError,
@@ -1537,6 +1540,78 @@ def task_detail(task_id: str, db: Session = Depends(get_db), user: User = Depend
 def task_log(task_id: str, db: Session = Depends(get_db), user: User = Depends(require_user)):
     task = _get_task_checked(db, task_id, user)
     return {"log": task.log or ""}
+
+
+def _strix_log_source(task: Task) -> tuple[str | None, float | None, str]:
+    """定位本次运行的 strix.log 全文：工作区运行目录 → 产物 zip（本地 / S3）。
+
+    返回 (日志全文, mtime 提示, 失败原因)；找不到时前两项为 None。
+    工作区优先精确匹配任务记录的 run 目录，其次取日志最新的一个运行目录
+    （重试场景 run_dir_name 可能为空或与最终成功尝试不一致）。
+    """
+    ws = Path(get_settings().workspace_root)
+    run_base = ws / task.id / "scan" / "strix_runs"
+    files: list[Path] = []
+    if run_base.is_dir():
+        if task.run_dir_name and (run_base / task.run_dir_name / "strix.log").is_file():
+            files = [run_base / task.run_dir_name / "strix.log"]
+        else:
+            files = sorted(
+                (d / "strix.log" for d in run_base.iterdir() if (d / "strix.log").is_file()),
+                key=lambda p: p.stat().st_mtime,
+            )
+            files = [files[-1]] if files else []
+    if files:
+        try:
+            return files[0].read_text(encoding="utf-8", errors="replace"), files[0].stat().st_mtime, ""
+        except OSError:
+            pass  # 磁盘读取失败继续走归档兜底
+
+    ref = task.artifacts_ref
+    if not ref:
+        return None, None, "引擎日志不在工作区且该任务没有归档产物"
+    try:
+        if ref.startswith("s3://"):
+            # rustfs 仅内网可达，由后端代理读取；对象整体读入内存再解包（strix.log 通常 <10MB）
+            opened = open_s3_artifact(ref)
+            if opened is None:
+                return None, None, "对象存储不可用或归档已缺失"
+            body, _length = opened
+            with zipfile.ZipFile(io.BytesIO(body.read())) as zfp:
+                got = zip_member_strix_log(zfp, task.run_dir_name or "")
+                return (got[0], got[1], "") if got else (None, None, "归档产物中缺少引擎日志")
+        path = artifact_response_path(ref)
+        if path is None:
+            return None, None, "本地归档文件缺失"
+        with zipfile.ZipFile(path) as zfp:
+            got = zip_member_strix_log(zfp, task.run_dir_name or "")
+            return (got[0], got[1], "") if got else (None, None, "归档产物中缺少引擎日志")
+    except (OSError, zipfile.BadZipFile):
+        return None, None, "归档产物不可用（zip 损坏或读取失败）"
+
+
+@app.get("/api/tasks/{task_id}/replay", dependencies=[Depends(require_user)])
+def task_replay(task_id: str, db: Session = Depends(get_db), user: User = Depends(require_user)):
+    """执行过程回放时间线：优先返回缓存解析结果，缺缓存时从日志源现场解析并回填。"""
+    task = _get_task_checked(db, task_id, user)
+    cached = (task.execution_events or "").strip()
+    if cached:
+        try:
+            return {"available": True, "data": json.loads(cached)}
+        except ValueError:
+            pass  # 缓存损坏按无缓存处理，现场重算并覆盖
+    log_text, mtime_hint, reason = _strix_log_source(task)
+    if log_text is None:
+        return {"available": False, "reason": reason}
+    data = parse_strix_timeline(log_text, mtime_hint)
+    if data is None:
+        return {"available": False, "reason": "日志中没有可识别的执行过程事件"}
+    try:
+        task.execution_events = json.dumps(data, ensure_ascii=False)
+        db.commit()
+    except Exception:  # noqa: BLE001 —— 缓存失败不影响本次返回
+        db.rollback()
+    return {"available": True, "data": data}
 
 
 @app.get("/api/tasks/{task_id}/artifacts", dependencies=[Depends(require_user)])

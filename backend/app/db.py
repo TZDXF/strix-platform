@@ -34,6 +34,7 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         ("schedule_id", "VARCHAR(32) DEFAULT ''"),
         ("web_search", "BOOLEAN DEFAULT FALSE"),
         ("timeout_disabled", "BOOLEAN DEFAULT FALSE"),
+        ("execution_events", "TEXT DEFAULT ''"),
     ],
     "findings": [
         ("poc_description", "TEXT DEFAULT ''"),

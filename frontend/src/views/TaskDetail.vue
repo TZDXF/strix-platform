@@ -5,6 +5,7 @@ import {
   SelectRoot, SelectTrigger, SelectValue, SelectPortal, SelectContent, SelectViewport, SelectItem, SelectItemText,
 } from 'reka-ui'
 import { api, type AgentUsage, type Finding, type FindingStatus, type TaskDetail as TaskDetailData } from '../api'
+import ReplayPlayer from '../components/ReplayPlayer.vue'
 import MarkdownRender from 'markstream-vue'
 import { toast } from '../toast'
 import {
@@ -128,10 +129,16 @@ function expandAll(open: boolean) {
   }
 }
 
-// ---- 漏洞按目标分组：白盒各仓库 / 黑盒各地址 / 未标注 ----
+// ---- 漏洞按目标分组：白盒各仓库 / 黑盒各地址 / 智能体自建靶场 / 未标注 ----
 // target 由引擎逐条填写（受影响仓库或源码路径 / 黑盒地址），与任务绑定的仓库和
-// 黑盒地址匹配归类；匹配不上的 URL 视为黑盒、本地路径视为白盒（兼容历史任务）
-interface FindingGroup { key: string; kind: 'whitebox' | 'blackbox' | 'unknown'; name: string; findings: Finding[] }
+// 黑盒地址匹配归类；匹配不上的 URL 视为黑盒、本地路径视为白盒（兼容历史任务）。
+// 未配置黑盒目标时引擎可能自建本地靶场实测，回环地址即归入「智能体自建靶场」
+interface FindingGroup { key: string; kind: 'whitebox' | 'blackbox' | 'agentlocal' | 'unknown'; name: string; findings: Finding[] }
+
+const LOOPBACK_HOST = /^(localhost|127\.\d+\.\d+\.\d+|\[?::1\]?)$/i
+function isLoopbackUrl(u: string): boolean {
+  try { return LOOPBACK_HOST.test(new URL(u).hostname) } catch { return false }
+}
 
 function repoNameOf(url: string): string {
   const seg = url.replace(/\/+$/, '').split(/[/:]/).pop() || url
@@ -157,7 +164,10 @@ function groupOf(f: Finding): { key: string; kind: FindingGroup['kind']; name: s
       return { key: `bb:${tt.url}`, kind: 'blackbox', name: tt.url }
     }
   }
-  if (/^https?:\/\//i.test(t)) return { key: `bb:${t}`, kind: 'blackbox', name: t }
+  if (/^https?:\/\//i.test(t)) {
+    const kind = isLoopbackUrl(t) ? 'agentlocal' : 'blackbox'
+    return { key: `${kind}:${t}`, kind, name: t }
+  }
   const base = t.split(/[\\/]/).filter(Boolean).pop() || t
   return { key: `wb:${base}`, kind: 'whitebox', name: base }
 }
@@ -170,8 +180,9 @@ const findingGroups = computed<FindingGroup[]>(() => {
     if (!g) { g = { key, kind, name, findings: [] }; map.set(key, g) }
     g.findings.push(f)
   }
-  // 分组排序：白盒仓库（按任务绑定顺序）→ 黑盒地址（按配置顺序）→ 未标注
-  const rank = (g: FindingGroup) => (g.kind === 'whitebox' ? 0 : g.kind === 'blackbox' ? 1 : 2)
+  // 分组排序：白盒仓库（按任务绑定顺序）→ 黑盒地址（按配置顺序）→ 自建靶场 → 未标注
+  const kindRank: Record<FindingGroup['kind'], number> = { whitebox: 0, blackbox: 1, agentlocal: 2, unknown: 3 }
+  const rank = (g: FindingGroup) => kindRank[g.kind]
   const pos = (g: FindingGroup) =>
     g.kind === 'whitebox' ? repoDefs.value.findIndex(r => g.key === `wb:${r.name}`)
       : g.kind === 'blackbox' ? targetDefs.value.findIndex(t => g.key === `bb:${t.url}`)
@@ -288,13 +299,17 @@ onUnmounted(() => { clearInterval(timer); themeObserver?.disconnect() })
         </div>
       </div>
 
-      <!-- 黑盒测试地址（每条含作用说明） -->
+      <!-- 黑盒测试地址（每条含作用说明）；未配置时说明引擎可自建本地靶场实测 -->
       <div v-if="task.test_targets?.length" class="mb-[18px] rounded-xl border border-border bg-panel px-4 py-3 text-[13px] leading-relaxed text-body shadow-soft">
         <div class="mb-1 font-semibold text-muted">黑盒测试地址（{{ task.test_targets.length }} 个）：</div>
         <div v-for="t in task.test_targets" :key="t.url" class="break-all">
           <span class="font-mono">{{ t.url }}</span>
           <span v-if="t.note" class="text-muted"> —— {{ t.note }}</span>
         </div>
+      </div>
+      <div v-else-if="task.findings.some(f => /^https?:\/\//i.test((f.target || '').trim()) && isLoopbackUrl(f.target.trim()))" class="mb-[18px] rounded-xl border border-med/40 bg-med/[.06] px-4 py-3 text-[13px] leading-relaxed text-body shadow-soft">
+        <div class="font-semibold text-muted">未配置黑盒测试地址</div>
+        本次任务未提供任何黑盒目标。部分漏洞的 PoC 由引擎在<span class="font-semibold">扫描沙箱内自建的本地实例</span>上实测（构建并运行应用、自备数据库与测试数据），相关结论仅代表本地靶场行为，不代表真实环境响应；实测流量全部局限于沙箱内部。
       </div>
 
       <!-- 测试指令 -->
@@ -418,8 +433,9 @@ onUnmounted(() => { clearInterval(timer); themeObserver?.disconnect() })
             <div class="mb-2.5 flex flex-wrap items-center gap-2 border-b border-border pb-2">
               <span
                 class="shrink-0 rounded-full px-2.5 py-0.5 text-[11px] font-bold"
-                :class="g.kind === 'whitebox' ? 'bg-accent/15 text-accent' : g.kind === 'blackbox' ? 'bg-high/15 text-high' : 'bg-panel2 text-muted'"
-              >{{ g.kind === 'whitebox' ? '白盒' : g.kind === 'blackbox' ? '黑盒' : '其他' }}</span>
+                :class="g.kind === 'whitebox' ? 'bg-accent/15 text-accent' : g.kind === 'blackbox' ? 'bg-high/15 text-high' : g.kind === 'agentlocal' ? 'bg-med/15 text-med' : 'bg-panel2 text-muted'"
+                :title="g.kind === 'agentlocal' ? '任务未配置黑盒地址，该结果由智能体在扫描沙箱内自建本地实例（自备数据库）实测得出，非真实环境响应' : undefined"
+              >{{ g.kind === 'whitebox' ? '白盒' : g.kind === 'blackbox' ? '黑盒' : g.kind === 'agentlocal' ? '智能体自建靶场' : '其他' }}</span>
               <span class="min-w-0 break-all text-[13.5px] font-semibold text-text">{{ g.name }}</span>
               <span class="shrink-0 text-xs text-muted">{{ g.findings.length }} 条</span>
             </div>
@@ -577,6 +593,9 @@ onUnmounted(() => { clearInterval(timer); themeObserver?.disconnect() })
           <div :class="hint" class="mt-2.5">
             智能体按启动时间排序；Root Agent 负责调度，各专项智能体（SQLi / XSS / SSRF 等）由其按需派生，token 为该智能体全部 LLM 请求的累计值。
           </div>
+
+          <!-- 执行过程回放：解析 strix.log 事件时间线，虚拟时钟重演（含拖动定位 / 倍速 / 泳道） -->
+          <ReplayPlayer v-if="['done', 'failed'].includes(task.status) && task.run_dir_name" :task-id="task.id" />
         </TabsContent>
 
         <!-- 官方执行摘要报告（strix view 同款 penetration_test_report.md），markstream-vue 渲染 -->
