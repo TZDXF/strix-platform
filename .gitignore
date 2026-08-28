@@ -30,3 +30,5 @@ Thumbs.db
 docker/data/
 
 *.tar
+
+.zcode/

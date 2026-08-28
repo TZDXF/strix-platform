@@ -1636,30 +1636,27 @@ def task_artifacts(task_id: str, request: Request, db: Session = Depends(get_db)
     return FileResponse(path, filename=f"{task_id}-artifacts.zip", media_type="application/zip")
 
 
-@app.get("/api/tasks/{task_id}/report.pdf", dependencies=[Depends(require_user)])
-def task_report_pdf(task_id: str, request: Request, db: Session = Depends(get_db), user: User = Depends(require_user)):
-    """导出官方风格 PDF 报告（复用 strix 自带 reportlab 渲染，结果缓存本地）。"""
+@app.get("/api/tasks/{task_id}/report.md", dependencies=[Depends(require_user)])
+def task_report_md(task_id: str, request: Request, db: Session = Depends(get_db), user: User = Depends(require_user)):
+    """导出 Markdown 渗透测试报告（与 strix 报告同源数据，结果缓存本地）。"""
     task = _get_task_checked(db, task_id, user)
     if not task.run_dir_name:
         raise HTTPException(404, "任务还没有可导出的报告")
-    # v2: 启用 CJK 字体修复中文乱码；改名以自动失效旧版乱码缓存
-    cache_path = Path(settings.workspace_root) / "reports" / f"{task_id}.v2.pdf"
+    cache_path = Path(settings.workspace_root) / "reports" / f"{task_id}.md"
     if not cache_path.is_file():
         run_dir = Path(settings.workspace_root) / task_id / "scan" / "strix_runs" / task.run_dir_name
         if not run_dir.is_dir():
-            raise HTTPException(404, "run 工作区已清理，无法生成 PDF（可下载产物 zip 归档）")
-        from app.pdf_fonts import apply_cjk_fonts
-        from strix.interface.viewer.report_pdf import generate_report_pdf
+            raise HTTPException(404, "run 工作区已清理，无法生成报告（可下载产物 zip 归档）")
+        from app.report_md import generate_report_md
 
         try:
-            apply_cjk_fonts()
             cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_path.write_bytes(generate_report_pdf(run_dir))
+            cache_path.write_text(generate_report_md(run_dir), encoding="utf-8")
         except Exception as exc:  # noqa: BLE001
             cache_path.unlink(missing_ok=True)
-            raise HTTPException(500, f"PDF 生成失败: {exc}")
-    _audit(db, request, "task.report_pdf", f"id={task_id}", user=user)
-    return FileResponse(cache_path, filename=f"strix-report-{task_id[:10]}.pdf", media_type="application/pdf")
+            raise HTTPException(500, f"报告生成失败: {exc}")
+    _audit(db, request, "task.report_md", f"id={task_id}", user=user)
+    return FileResponse(cache_path, filename=f"strix-report-{task_id[:10]}.md", media_type="text/markdown")
 
 
 # ===================== 任务取消 / 手动中文翻译 =====================

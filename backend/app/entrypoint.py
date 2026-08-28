@@ -2,16 +2,13 @@
 
 背景：strix 沙箱由宿主 daemon 经 docker.sock 创建，bind mount 源路径按 daemon
 所在命名空间解析，且 strix 内部会对目标路径做 realpath（符号链接会被还原），
-因此工作区必须在容器内「真实挂载」于 daemon 可见的同一路径上——这只能在
-compose 创建容器时确定，由仓库根目录的 ./deploy.sh 自动探测注入
-（WORKSPACE_HOST_DIR / WORKSPACE_CONTAINER_ROOT），或按 README 手工设置。
+因此工作区必须在容器内「真实挂载」于 daemon 可见的同一路径上。
 
-本脚本不再改写路径，只做两件事：
-1. 检测到「容器内挂载点 ≠ daemon 可见路径」时输出明确的修复指引（常见于
-   绕过 deploy.sh 直接 docker compose 的场景，症状为沙箱创建报
-   "bind source path does not exist"，HTTP 400）；
-2. exec 真正的启动命令；未收到命令（如 compose 设了 entrypoint 却漏了
-   command）时响亮失败，避免伪装成正常退出。
+默认部署（docker-compose.yml）已用固定名具名卷承载工作区，并把容器内挂载点
+设为该卷在 daemon 侧的存储路径（worker/api 与沙箱三方路径天然同串对齐），
+无需任何平台探测。本脚本保留为防线：若有人覆盖 WORKSPACE_ROOT 或改回平台
+相关 bind 部署导致不对齐，启动时明确提示——否则症状只剩 strix 报
+"bind source path does not exist"（HTTP 400），难以定位。
 """
 
 from __future__ import annotations
@@ -21,47 +18,48 @@ import socket
 import sys
 import time
 
-DEFAULT_ROOT = "/data/workspaces"
+DEFAULT_ROOT = "/var/lib/docker/volumes/strix-platform_workspaces/_data"
 
 
-def _daemon_visible_path(source: str) -> str | None:
-    """把 bind mount 的宿主 Source 翻译成 daemon 解析 bind source 时的等价路径。"""
-    s = source.replace("\\", "/")
-    if len(s) > 2 and s[1] == ":":  # Windows 盘符 → Docker Desktop VM 内的挂载点
-        rest = s[2:].lstrip("/")
-        return f"/run/desktop/mnt/host/{s[0].lower()}/{rest}"
-    if s.startswith("/"):  # VM 路径或原生 Linux/macOS 宿主绝对路径，daemon 均可直接解析
-        return s
+def _daemon_visible_path(mount: dict) -> str | None:
+    """取该挂载在 daemon 命名空间里的等价可见路径；无法判定返回 None。"""
+    mtype = mount.get("Type") or ("volume" if mount.get("Name") else "bind")
+    source = (mount.get("Source") or "").replace("\\", "/")
+    if mtype == "volume":
+        return source  # 具名卷的宿主侧存储路径，daemon 可直接解析
+    if len(source) > 2 and source[1] == ":":  # Windows 盘符 → Docker Desktop VM 挂载点
+        rest = source[2:].lstrip("/")
+        return f"/run/desktop/mnt/host/{source[0].lower()}/{rest}"
+    if source.startswith("/"):  # macOS/Linux 宿主绝对路径，daemon 直接解析
+        return source
     return None
 
 
 def check_alignment() -> None:
     root = os.environ.get("WORKSPACE_ROOT", DEFAULT_ROOT)
     if os.environ.get("WORKSPACE_CONTAINER_ROOT", "").strip():
-        return  # 显式配置：compose 已把挂载点对齐到该路径，无需多言
+        return  # 显式旧式配置：视为运维自管对齐，不再多言
     try:
         import docker
 
         ctr = docker.from_env(timeout=5).containers.get(socket.gethostname())
     except Exception:
         return  # api 容器无 docker.sock、本机直跑：不涉及沙箱创建，保持安静
-    source = next(
-        (
-            m.get("Source")
-            for m in ctr.attrs.get("Mounts", [])
-            if m.get("Type") == "bind" and m.get("Destination") == root
-        ),
+    mount = next(
+        (m for m in ctr.attrs.get("Mounts", []) if m.get("Destination") == root),
         None,
     )
-    if not source:
+    if not mount:
         return
-    visible = _daemon_visible_path(source)
+    visible = _daemon_visible_path(mount)
     if visible and visible != root:
         print(
-            f"[entrypoint] 警告：工作区在容器内挂载于 {root}，但宿主 daemon 只认 "
-            f"{visible}。strix 创建沙箱时会报 'bind source path does not exist'。\n"
-            "[entrypoint] 请改用仓库根目录 ./deploy.sh 部署（自动对齐），或在 .env 设置\n"
-            f"[entrypoint] WORKSPACE_CONTAINER_ROOT={visible}",
+            f"[entrypoint] 警告：工作区在容器内挂载于 {root}（{mount.get('Type')}），"
+            f"但宿主 daemon 只认 {visible}。strix 创建沙箱时会报 "
+            "'bind source path does not exist'。\n"
+            "[entrypoint] 请恢复 compose 默认的工作区具名卷部署"
+            f"（WORKSPACE_ROOT={DEFAULT_ROOT}），或按 README 把容器内挂载点与 "
+            "daemon 路径手工对齐。",
             file=sys.stderr,
         )
 

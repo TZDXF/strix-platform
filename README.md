@@ -2,7 +2,7 @@
 
 团队内部使用的安全测试网站：创建**项目**（Git 仓库或 zip 压缩包），
 在项目内发起 [Strix](https://github.com/usestrix/strix) AI 渗透测试（白盒源码 + 黑盒 URL），
-生成漏洞报告（严重级别 / PoC / 修复建议，支持中文），可导出官方风格 PDF 报告，产物可下载归档。
+生成漏洞报告（严重级别 / PoC / 修复建议，支持中文），可导出 Markdown 格式报告，产物可下载归档。
 
 > 架构决策与可行性分析见 [docs/feasibility.md](docs/feasibility.md)。
 > Phase 0 引擎验证数据见 [phase0/EVALUATION.md](phase0/EVALUATION.md)
@@ -32,7 +32,7 @@ docker-compose.yml  postgres + redis + rustfs + api + worker + frontend
 3. **项目化任务发布**：先创建项目（Git 地址可配置 Personal Access Token 凭据；或 zip 上传型项目），
    在项目内发起扫描：Git 项目拉取远端**分支列表**供选择（默认分支排首位）；
    zip 项目可选**历史上传**复用或**新上传**（新上传自动存入历史）。
-4. **PDF 导出**：报告页一键导出官方风格 PDF（复用 strix 内置 reportlab 渲染，结果本地缓存）。
+4. **报告导出**：报告页一键导出 Markdown 格式完整报告（与报告页同源数据，结果本地缓存）。
 5. **中文报告**：发起任务即通过 `--instruction` 提示词要求 strix 用简体中文撰写；
    流程内不做自动翻译——如报告仍为英文，可在任务详情页点「翻译成中文」，
    经 LLM 网关把标题/描述/修复建议翻译入库（`*_zh` 字段，前端可切换）。
@@ -113,15 +113,24 @@ cd frontend && npm install && npm run dev   # http://localhost:5173
 
 ```bash
 git pull
-./deploy.sh up -d --build        # 仅重建有变化的镜像，数据卷（pg/工作区/对象存储）保留
+docker compose up -d --build    # 仅重建有变化的镜像，数据卷（pg/工作区/对象存储）保留
 ```
 
-> 部署统一走 `./deploy.sh`（参数与 `docker compose` 完全一致）。它会自动探测宿主
-> Docker 类型，把工作区目录对齐为 daemon 可见路径注入容器——strix 沙箱的 bind
-> mount 由宿主 daemon 解析路径且内部会做 realpath，直接 `docker compose` 在
-> Docker Desktop / 原生 Linux 上都会导致沙箱创建报
-> `bind source path does not exist`。手工部署时需自行在 `.env` 设置
-> `WORKSPACE_HOST_DIR` 与 `WORKSPACE_CONTAINER_ROOT`（同一绝对路径语义，见脚本）。
+> 直接 `docker compose` 即可，任何宿主平台均无需路径探测脚本。工作区由固定名具名卷
+> `strix-platform_workspaces` 承载，容器内挂载点就是该卷在 daemon 侧的真实存储路径
+> （`/var/lib/docker/volumes/strix-platform_workspaces/_data`）——strix 沙箱经宿主
+> daemon bind mount 源码目录时按 daemon 所在文件系统解析路径且内部会做 realpath，
+> 该常量路径在 Docker Desktop 与原生 Linux 上都真实存在，worker/api/沙箱三方天然对齐。
+> 仓库根的 `./deploy.sh` 现仅是 `docker compose` 的透传别名，为老习惯保留。
+
+> 历史数据迁移（v0.9 之前用宿主目录 bind 挂载的部署）：旧工作区在
+> `./docker/data/workspaces`，一次性拷入新卷后即可继续查看历史任务：
+>
+> ```bash
+> docker run --rm -v strix-platform_workspaces:/dst \
+>   -v "$(pwd -W 2>/dev/null || pwd)/docker/data/workspaces:/src:ro" \
+>   python:3.12-slim-bookworm cp -a /src/. /dst/
+> ```
 
 ### 常见问题
 
@@ -130,7 +139,7 @@ git pull
 | 任务日志含 `DOCKER NOT INSTALLED`，秒退退出码 1 | worker 容器内无 `docker` CLI 或未挂载 docker.sock。镜像已内置 `docker-cli`（见 `backend/Dockerfile`），若仍出现请确认 compose 中 worker 挂载了 `/var/run/docker.sock`，并重新 `docker compose build worker && docker compose up -d worker` |
 | 归档阶段 `NoSuchBucket` | 正常部署不会出现（api 启动与上传时均自动建桶）；若出现多为 RustFS 密钥与 `.env` 不一致，或 api 启动日志中有 `[startup] S3 归档桶不可用`，检查 `RUSTFS_*` 配置后重启 api |
 | 首个任务卡在 scanning 很久 | 首次扫描需拉取沙箱镜像，可在宿主机预拉取：`docker pull ghcr.io/usestrix/strix-sandbox:<tag>` |
-| 任务日志含 `invalid mount config ... bind source path does not exist`，秒退退出码 1 | 沙箱容器的 bind mount 由宿主 daemon 解析路径且 strix 内部会做 realpath，工作区须在容器内真实挂载于 daemon 可见的同一路径。改用 `./deploy.sh up -d --build` 重建即可自动对齐（Docker Desktop 映射到 `/run/desktop/mnt/host/<盘符>/...`，原生 Linux 用宿主绝对路径）；或按 `.env.deploy.example` 手工设置 `WORKSPACE_CONTAINER_ROOT`（相对路径无效：daemon 只认其自身命名空间的绝对路径） |
+| 任务日志含 `invalid mount config ... bind source path does not exist`，秒退退出码 1 | 沙箱容器的 bind mount 由宿主 daemon 解析路径且 strix 内部会做 realpath，工作区在容器内挂载点与 daemon 可见路径不一致。默认具名卷部署不会出现；若自行覆盖过 `WORKSPACE_ROOT` 或改回宿主目录 bind 挂载，请恢复 compose 默认（容器 api/worker 启动日志中 entrypoint 诊断会打印对齐指引） |
 | `SECRET_KEY` / `LLM_API_BASE` 启动报错 | `.env` 未填写必填项，对照 `.env.deploy.example` |
 
 > Worker 挂载了 `/var/run/docker.sock`（strix 沙箱通过宿主机 Docker 启动分析容器，镜像内已安装 docker-cli）。
@@ -146,7 +155,7 @@ git pull
 | `TOKEN_EXPIRY_HOURS` | 登录有效期（小时） | 24 |
 | `DATABASE_URL` / `REDIS_URL` | 依赖连接 | 本机默认 |
 | `LLM_API_BASE` / `STRIX_LLM` | 公司 LLM 网关（OpenAI 兼容）与默认模型；API 密钥由用户在「设置」页个人配置，平台无统一密钥 | `free` |
-| `WORKSPACE_ROOT` | 任务源码/工作区/上传目录 | `./workspaces` |
+| `WORKSPACE_ROOT` | 任务源码/工作区/上传目录；compose 默认指向工作区具名卷的 daemon 侧存储路径，本机直跑后端时才是相对路径 | `/var/lib/docker/volumes/strix-platform_workspaces/_data`（容器）· `./docker/data/workspaces`（本地直跑） |
 | `S3_ENABLED` / `S3_ENDPOINT` / `S3_*` | RustFS 对象存储；false 时产物留本地磁盘 | false |
 | `TARGET_ALLOWLIST` | 黑盒目标允许清单（域名后缀/CIDR，逗号分隔） | 空=仅内网/回环 |
 | `MAX_UPLOAD_MB` | zip 上限 | 500 |
@@ -164,7 +173,7 @@ git pull
    （聚焦的漏洞类型 / 测试要求 / 测试账号，透传 `--instruction`，留空则全量扫描）。
    多仓库 / 大型项目可勾选「不限时运行」，按任务关闭档位默认的超时终止。
 4. 任务列表实时刷新状态：`pending → fetching → scanning → parsing → (translating) → done/failed`。
-5. 报告页查看：严重级别概览 + 漏洞明细（可展开 PoC）+ 官方执行摘要；可导出 PDF、下载产物 zip
+5. 报告页查看：严重级别概览 + 漏洞明细（可展开 PoC）+ 官方执行摘要；可导出 Markdown 报告、下载产物 zip
    （漏洞 JSON/CSV/MD、SARIF、执行日志）。「智能体」页可回放具体执行过程
    （倍速播放 / 拖动定位 / 智能体并发泳道 / 事件流筛选）。
 6. （可选）超管在「系统设置」配置邮件提醒（SMTP），用户在「个人设置 → 通知邮箱」填写收件地址；
@@ -182,5 +191,5 @@ git pull
 
 - 扫描耗时以实测为准：quick 双目标约 1 小时+（任务超时已按此校准）
 - free 模型池有间歇故障，worker 自动重试（最多 3 次）
-- PDF 由 run 工作区实时生成并缓存；工作区被清理后可改用产物 zip 归档
+- Markdown 报告由 run 工作区实时生成并缓存；工作区被清理后可改用产物 zip 归档
 - 漏洞结果为 AI 辅助测试产出，报告页已标注建议人工复核

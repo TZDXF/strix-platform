@@ -44,11 +44,12 @@ services:
       REDIS_URL: redis://redis:6379/0
       SECRET_KEY: ${SECRET_KEY:?must set SECRET_KEY}
       ADMIN_INITIAL_PASSWORD: ${ADMIN_INITIAL_PASSWORD:-admin}
-      # strix 沙箱由宿主 daemon 创建、bind mount 源码目录，工作区须在容器内真实
-      # 挂载于 daemon 可见的同一路径（strix 会对路径做 realpath，符号链接无效）。
-      # 路径含平台差异，由 ./deploy.sh 自动探测注入 WORKSPACE_HOST_DIR /
-      # WORKSPACE_CONTAINER_ROOT；手工部署时按 README 设置这两个变量
-      WORKSPACE_ROOT: ${WORKSPACE_CONTAINER_ROOT:-/data/workspaces}
+      # strix 沙箱由宿主 daemon 创建、bind mount 源码目录：bind 源按 daemon 所在
+      # 文件系统解析且须真实存在。这里用固定名具名卷承载工作区，并把容器内挂载点
+      # 设为该卷在 daemon 侧的存储路径（Windows/macOS Desktop 与原生 Linux 同为
+      # 该常量），worker/api 与沙箱三方路径天然同串对齐，直接 docker compose up 即可，
+      # 无需按平台探测注入（历史行为见 git 的 deploy.sh）。
+      WORKSPACE_ROOT: /var/lib/docker/volumes/strix-platform_workspaces/_data
       STRIX_LLM: ${STRIX_LLM:-free}
       LLM_API_BASE: ${LLM_API_BASE:?must set LLM_API_BASE}
       S3_ENABLED: "true"
@@ -62,9 +63,7 @@ services:
       # 联网搜索（可选）：内网 MCP 搜索端点；配置后任务提交时可勾选启用
       WEB_SEARCH_MCP_URL: ${WEB_SEARCH_MCP_URL:-}
     volumes:
-      - type: bind
-        source: ${WORKSPACE_HOST_DIR:-./docker/data/workspaces}
-        target: ${WORKSPACE_CONTAINER_ROOT:-/data/workspaces}
+      - workspaces:/var/lib/docker/volumes/strix-platform_workspaces/_data
     depends_on:
       postgres:
         condition: service_healthy
@@ -87,9 +86,7 @@ services:
       - default
       - strix-sandbox
     volumes:
-      - type: bind
-        source: ${WORKSPACE_HOST_DIR:-./docker/data/workspaces}
-        target: ${WORKSPACE_CONTAINER_ROOT:-/data/workspaces}
+      - workspaces:/var/lib/docker/volumes/strix-platform_workspaces/_data
       - /var/run/docker.sock:/var/run/docker.sock   # strix 沙箱需要 Docker
     depends_on:
       postgres:
@@ -104,7 +101,14 @@ services:
     ports:
       - "80:80"
 
-# 所有数据已改为 bind mount 映射到 ./docker/data/ 下
+# 工作区用固定名具名卷承载（见上方 WORKSPACE_ROOT 注释）；postgres/rustfs 数据
+# 仍 bind mount 到 ./docker/data/ 下
+volumes:
+  # 显式固定卷名：与其在 daemon 侧的真实存储路径
+  # /var/lib/docker/volumes/strix-platform_workspaces/_data 保持一致，
+  # 不随 COMPOSE_PROJECT_NAME / docker compose -p 变化
+  workspaces:
+    name: strix-platform_workspaces
 
 networks:
   strix-sandbox:

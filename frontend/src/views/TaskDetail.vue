@@ -213,8 +213,8 @@ async function refresh() {
 async function downloadArtifacts() {
   try { await api.downloadArtifacts(props.taskId) } catch (e) { toast.error((e as Error).message) }
 }
-async function downloadPdf() {
-  try { await api.downloadPdf(props.taskId) } catch (e) { toast.error((e as Error).message) }
+async function downloadReport() {
+  try { await api.downloadReport(props.taskId) } catch (e) { toast.error((e as Error).message) }
 }
 
 function fmtDur(s: number | null) {
@@ -286,7 +286,7 @@ onUnmounted(() => { clearInterval(timer); themeObserver?.disconnect() })
             v-if="task.status === 'done' && task.findings_count > 0 && task.zh_status !== 'pending'"
             :class="btnGhost" :disabled="translatingZh" @click="translateNow"
           >{{ translatingZh ? '请求中…' : '翻译成中文' }}</button>
-          <button v-if="task.status === 'done' && task.run_dir_name" :class="btn" @click="downloadPdf">导出 PDF 报告</button>
+          <button v-if="task.status === 'done' && task.run_dir_name" :class="btn" @click="downloadReport">导出报告</button>
         </div>
       </div>
 

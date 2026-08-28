@@ -601,7 +601,7 @@ onUnmounted(() => clearInterval(timer))
                 </SelectRoot>
               </div>
               <div>
-                <label :class="label">模型（网关 free 池，默认 {{ defaultModel || 'free' }}）</label>
+                <label :class="label">模型</label>
                 <SelectRoot v-model="form.model">
                   <SelectTrigger :class="selectTrigger"><SelectValue placeholder="free" /></SelectTrigger>
                   <SelectPortal>
@@ -621,9 +621,7 @@ onUnmounted(() => clearInterval(timer))
                     class="flex h-4 w-4 cursor-pointer items-center justify-center rounded border border-border bg-panel2 data-state-checked:border-accent data-state-checked:bg-accent/20">
                     <CheckboxIndicator class="text-xs leading-none text-accent">✓</CheckboxIndicator>
                   </CheckboxRoot>
-                  不限时运行（关闭超时终止）
-                  <span class="text-xs text-muted">（{{ form.scanMode }} 档位默认超时 {{ MODE_LIMITS[form.scanMode] || '-' }}；多仓库 / 大型项目常跑不满一个档位时长，
-                    勾选后引擎不会被超时回收，跑完为止，可随时在任务页手动取消）</span>
+                  不限时运行（关闭超时终止，{{ form.scanMode }} 档默认 {{ MODE_LIMITS[form.scanMode] || '-' }}，跑完为止，可手动取消）
                 </label>
               </div>
               <div v-if="isGit" class="col-span-2">

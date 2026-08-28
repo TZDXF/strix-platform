@@ -537,7 +537,7 @@ export const api = {
   getReplay: (id: string) =>
     request<{ available: boolean; reason?: string; data?: ReplayData }>('GET', `/api/tasks/${id}/replay`),
   downloadArtifacts: (id: string) => download(`/api/tasks/${id}/artifacts`, `${id}-artifacts.zip`),
-  downloadPdf: (id: string) => download(`/api/tasks/${id}/report.pdf`, `strix-report-${id.slice(0, 10)}.pdf`),
+  downloadReport: (id: string) => download(`/api/tasks/${id}/report.md`, `strix-report-${id.slice(0, 10)}.md`),
   cancelTask: (id: string) => request<{ ok: boolean; status: string }>('POST', `/api/tasks/${id}/cancel`),
   translateTask: (id: string) => request<{ ok: boolean }>('POST', `/api/tasks/${id}/translate`),
 
