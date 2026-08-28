@@ -13,13 +13,15 @@
 ```
 frontend/   Vue 3 + Vite（登录 / 项目 / 任务 / 用户管理 / 报告页）
 backend/    FastAPI + Celery + SQLAlchemy
-              ├─ app/main.py      API（用户认证 + 项目 + 任务 + 报告/产物）
+              ├─ app/main.py      API（用户认证 + 项目 + 任务 + 报告/产物 + 技能库）
               ├─ app/auth.py      账号体系（PBKDF2 口令 + HMAC 签名令牌）
               ├─ app/tasks.py     流水线：fetch → scan → parse → archive
+              ├─ app/runner.py    strix 子进程执行器（失败重试、断点续扫、运行中转向）
+              ├─ app/skills.py    技能库（自定义 strix 技能注入引擎 + 联网搜索技能）
+              ├─ app/apispec.py   API 规范目标（OpenAPI/Postman/Apifox 导出校验与拉取）
               ├─ app/translate.py 中文翻译（LLM 网关，任务页按钮手动触发）
               ├─ app/mailer.py    邮件提醒（SMTP 配置存库 + 任务完成/失败通知）
-              ├─ app/replay.py    执行过程回放（解析 strix.log 生成事件时间线）
-              └─ app/runner.py    strix 子进程执行器（失败自动重试）
+              └─ app/replay.py    执行过程回放（解析 strix.log 生成事件时间线）
 docker-compose.yml  postgres + redis + rustfs + api + worker + frontend
 ```
 
@@ -36,17 +38,34 @@ docker-compose.yml  postgres + redis + rustfs + api + worker + frontend
 5. **中文报告**：发起任务即通过 `--instruction` 提示词要求 strix 用简体中文撰写；
    流程内不做自动翻译——如报告仍为英文，可在任务详情页点「翻译成中文」，
    经 LLM 网关把标题/描述/修复建议翻译入库（`*_zh` 字段，前端可切换）。
-6. **报告页**：对齐 `strix view` 官方报告结构——严重级别概览网格（严重/高危/中危/低危/提示）、
-   官方执行摘要报告（`penetration_test_report.md`，Markdown 渲染）、逐条漏洞明细
-   （彩色级别条 / CVSS / CWE / PoC 说明与脚本）。
-7. **执行过程回放**：任务详情「智能体」页可回放具体执行过程——解析引擎日志 `strix.log`
-   生成事件时间线（引擎启停 / 智能体派生与收工 / 工具调用 / 漏洞落盘 / 告警错误），
-   播放器支持倍速播放、时间轴拖动定位、执行密度图、各智能体并发泳道与事件流筛选；
-   工作区日志被清理后自动回退解析产物 zip 中的存档（解析结果缓存入库）。
-8. **系统设置页（仅超管）**：集中管理平台级配置——平台模型管理（网关密钥查询可用模型后加入平台、
-   指定默认模型）与邮件提醒（SMTP 服务器/端口/加密方式/发件人，可真实发送测试邮件验证连通）。
-9. **邮件提醒**：超管在「系统设置」配置 SMTP 后，扫描任务完成/失败时平台自动向创建者
-   在「个人设置」填写的通知邮箱发送结果摘要邮件（严重度分布、耗时、失败原因、任务链接）。
+6. **断点续扫（--resume）**：失败/取消/已完成的任务（产出了 run 目录）可在任务详情页点「续扫」，
+   从上次断点恢复根/子智能体完整对话历史继续扫描（引擎 `--resume`），已完成的工作不重跑；
+   LLM 连接失败的自动重试同样优先断点续扫，不重复计费已完成轮次。
+7. **运行中转向（steering）**：扫描运行中可在任务详情页向智能体下发新指令（聚焦方向/补充凭据/纠正路线）：
+   平台安全打断引擎进程，把转向指令追加进测试指令并 `--resume` 续扫（引擎把新指令注入根智能体会话），
+   转向重启不占用 LLM 失败重试次数。
+8. **diff 增量扫描**：Git 项目发起任务/定时计划可选「代码扫描范围」——`diff` 只扫相对基线
+   （分支或 commit，如 `origin/main`）的变更文件（`--scope-mode diff --diff-base`），
+   定时巡检场景大幅省 token；diff 模式自动改用完整克隆以解析基线历史。
+9. **API 规范目标**：发起任务可上传 OpenAPI/Swagger、Postman collection、Apifox 导出的规范文件
+   （或填 Apifox 项目 ID + 访问令牌在线导出 OpenAPI，令牌仅导出一次、不落库），
+   规范作为独立目标传入引擎（`-t <spec>`），智能体按接口契约逐端点测试。
+10. **技能库（超管管理）**：系统设置维护自定义 strix 技能（Markdown + frontmatter，可上传 .md 导入），
+    扫描时注入引擎（`register_skill_dir`，优先级高于内置技能，同路径可遮蔽内置），
+    引擎按任务相关性自动加载（每个智能体最多 5 个）。「联网搜索」即内置种子技能
+    （custom/web_search_internal）：超管配置 `WEB_SEARCH_MCP_URL` 后自动生成/刷新，
+    任务勾选联网搜索时指令仅注入一行加载指引，调用方法沉淀在技能正文里。
+11. **报告页**：对齐 `strix view` 官方报告结构——严重级别概览网格（严重/高危/中危/低危/提示）、
+    官方执行摘要报告（`penetration_test_report.md`，Markdown 渲染）、逐条漏洞明细
+    （彩色级别条 / CVSS / CWE / PoC 说明与脚本）。
+12. **执行过程回放**：任务详情「智能体」页可回放具体执行过程——解析引擎日志 `strix.log`
+    生成事件时间线（引擎启停 / 智能体派生与收工 / 工具调用 / 漏洞落盘 / 告警错误），
+    播放器支持倍速播放、时间轴拖动定位、执行密度图、各智能体并发泳道与事件流筛选；
+    工作区日志被清理后自动回退解析产物 zip 中的存档（解析结果缓存入库）。
+13. **系统设置页（仅超管）**：集中管理平台级配置——平台模型管理（网关密钥查询可用模型后加入平台、
+    指定默认模型）、技能库管理与邮件提醒（SMTP 服务器/端口/加密方式/发件人，可真实发送测试邮件验证连通）。
+14. **邮件提醒**：超管在「系统设置」配置 SMTP 后，扫描任务完成/失败时平台自动向创建者
+    在「个人设置」填写的通知邮箱发送结果摘要邮件（严重度分布、耗时、失败原因、任务链接）。
 
 ## 本地开发
 
@@ -155,6 +174,7 @@ docker compose up -d --build    # 仅重建有变化的镜像，数据卷（pg/�
 | `TOKEN_EXPIRY_HOURS` | 登录有效期（小时） | 24 |
 | `DATABASE_URL` / `REDIS_URL` | 依赖连接 | 本机默认 |
 | `LLM_API_BASE` / `STRIX_LLM` | 公司 LLM 网关（OpenAI 兼容）与默认模型；API 密钥由用户在「设置」页个人配置，平台无统一密钥 | `free` |
+| `WEB_SEARCH_MCP_URL` | 内网 MCP 搜索端点（Streamable HTTP，JSON-RPC 直调）。配置后自动生成/刷新「联网搜索」内置技能，任务勾选联网搜索即可用；留空 = 功能关闭 | 空 |
 | `WORKSPACE_ROOT` | 任务源码/工作区/上传目录；compose 默认指向工作区具名卷的 daemon 侧存储路径，本机直跑后端时才是相对路径 | `/var/lib/docker/volumes/strix-platform_workspaces/_data`（容器）· `./docker/data/workspaces`（本地直跑） |
 | `S3_ENABLED` / `S3_ENDPOINT` / `S3_*` | RustFS 对象存储；false 时产物留本地磁盘 | false |
 | `TARGET_ALLOWLIST` | 黑盒目标允许清单（域名后缀/CIDR，逗号分隔） | 空=仅内网/回环 |
@@ -171,12 +191,15 @@ docker compose up -d --build    # 仅重建有变化的镜像，数据卷（pg/�
 3. 项目内「发起扫描任务」：Git 项目选分支，zip 项目选历史上传/新上传；可选档位
    （quick/standard/deep 全开放）、模型、黑盒地址、中文报告、测试指令
    （聚焦的漏洞类型 / 测试要求 / 测试账号，透传 `--instruction`，留空则全量扫描）。
+   Git 项目还可选「代码扫描范围」（diff 增量，基线默认仓库主分支）、上传 API 规范文件
+   （OpenAPI/Swagger/Postman/Apifox 导出）或填 Apifox 项目 ID + 令牌在线导出；
    多仓库 / 大型项目可勾选「不限时运行」，按任务关闭档位默认的超时终止。
 4. 任务列表实时刷新状态：`pending → fetching → scanning → parsing → (translating) → done/failed`。
+   运行中可在任务详情页「下发转向」中途纠正方向；失败/取消/完成后可一键「续扫」从断点恢复。
 5. 报告页查看：严重级别概览 + 漏洞明细（可展开 PoC）+ 官方执行摘要；可导出 Markdown 报告、下载产物 zip
    （漏洞 JSON/CSV/MD、SARIF、执行日志）。「智能体」页可回放具体执行过程
    （倍速播放 / 拖动定位 / 智能体并发泳道 / 事件流筛选）。
-6. （可选）超管在「系统设置」配置邮件提醒（SMTP），用户在「个人设置 → 通知邮箱」填写收件地址；
+6. （可选）超管在「系统设置」配置邮件提醒（SMTP）与技能库，用户在「个人设置 → 通知邮箱」填写收件地址；
    任务完成或失败时会自动收到提醒邮件。
 
 ## 安全护栏

@@ -126,9 +126,18 @@ class Task(Base):
     # 黑盒测试地址列表：JSON [{"url": "...", "note": "作用说明"}]；非空字符串时优先生效
     test_targets = Column(Text, default="")
     instruction = Column(Text, default="")  # 用户自定义测试指令（--instruction，可选）
-    web_search = Column(Boolean, default=False)  # 联网搜索：指令中注入内网 MCP 搜索调用指南
+    web_search = Column(Boolean, default=False)  # 联网搜索：启用技能库中的「内网联网搜索」技能
     # 关闭超时终止：True 时忽略档位默认时长（quick 2h / standard 4h / deep 8h），引擎跑完为止
     timeout_disabled = Column(Boolean, default=False)
+    # 代码扫描范围："" / auto / diff / full（"" = 不传参数，按引擎默认 auto）
+    scope_mode = Column(String(8), default="")
+    # diff 范围基线（分支或 commit，如 origin/main）；仅 scope_mode=diff 时生效
+    diff_base = Column(String(255), default="")
+    # API 规范目标：JSON [{"name", "stored_path"}]（OpenAPI/Swagger/Postman/Apifox 导出文件，
+    # 已保存在 workspace 下）；作为本地文件目标逐个传给 strix -t
+    api_specs = Column(Text, default="")
+    # 手动续扫次数（「续扫」按钮以 --resume 从上次 run 断点继续，每续扫一次 +1）
+    resume_count = Column(Integer, default=0)
     report_lang = Column(String(8), default="zh")  # 固定中文报告；保留字段兼容历史 en 任务
     zh_status = Column(String(16), default="")  # 翻译状态："" | pending | done | failed
 
@@ -175,7 +184,9 @@ class Schedule(Base):
     scan_mode = Column(String(16), default="quick")
     model = Column(String(64), default="")  # 留空 = 触发时用平台默认模型
     instruction = Column(Text, default="")
-    web_search = Column(Boolean, default=False)  # 触发任务时是否注入联网搜索指南
+    web_search = Column(Boolean, default=False)  # 触发任务时是否启用联网搜索技能
+    scope_mode = Column(String(8), default="")  # 任务快照：代码扫描范围（"" / auto / diff / full）
+    diff_base = Column(String(255), default="")  # 任务快照：diff 范围基线
     repo_branches = Column(Text, default="")  # JSON [{"url","branch"}]；分支留空 = 各仓库默认分支
     upload_id = Column(String(32), ForeignKey("project_uploads.id"), nullable=True)  # zip 项目复用的历史上传
     test_targets = Column(Text, default="")  # JSON [{"url","note"}]
@@ -222,6 +233,24 @@ class Finding(Base):
 
 
 Index("ix_findings_task_severity", Finding.task_id, Finding.severity)
+
+
+class Skill(Base):
+    """平台技能库：自定义 strix 技能（<category>/<name>.md），扫描时材料化到技能目录
+    经 register_skill_dir 注入引擎（优先级高于内置技能，同路径可遮蔽内置技能）。"""
+
+    __tablename__ = "skills"
+
+    id = Column(String(32), primary_key=True)  # uuid4 hex
+    name = Column(String(128), nullable=False, index=True)  # 技能名（=文件名去 .md）
+    category = Column(String(32), default="custom", index=True)  # 类目目录名
+    description = Column(String(512), default="")  # frontmatter description（列表展示用）
+    content = Column(Text, default="")  # 技能全文（含 frontmatter）
+    enabled = Column(Boolean, default=True)
+    builtin = Column(Boolean, default=False)  # 平台种子技能（联网搜索），允许编辑/停用但不建议删除
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_now)
+    updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now)
 
 
 class SystemSetting(Base):

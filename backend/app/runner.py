@@ -6,6 +6,9 @@
 - LLM 连接失败时 TUI 输出含 "LLM CONNECTION FAILED"（free 池间歇故障，决策 #7 需重试）
 - 引擎在 strix_runs/<auto>/strix.log 持续写生命周期事件（沙箱/智能体/轮次/告警），
   等待子进程期间由 tail 线程把关键事件翻译后转投任务日志，避免长扫描期间日志空白
+- --resume <run_name> 从 run 目录恢复根/子智能体完整 LLM 历史；恢复时传新 --instruction
+  会被引擎注入根智能体会话（runner.resume_instruction），平台用它实现运行中转向
+- 无头子进程默认无自定义技能通道：经 python -c 引导段先 register_skill_dir 再进引擎主入口
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -27,11 +31,26 @@ RETRY_MARKER = "LLM CONNECTION FAILED"
 # strix 对这些前缀有专门路由，不加 openai/ 前缀
 _PASSTHROUGH_PREFIXES = ("openai/", "litellm/", "any-llm/", "ollama/")
 
+# strix 子进程引导段：先把平台技能目录注册进引擎（优先级高于内置技能），再进 CLI 主入口。
+# 经 `python -c <引导段> <strix 参数...>` 启动时 sys.argv = ['-c', <参数...>]，
+# argparse 解析 sys.argv[1:]，与 strix 控制台脚本行为一致
+_BOOTSTRAP = (
+    "import os\n"
+    "d = os.environ.get('PLATFORM_SKILLS_DIR', '')\n"
+    "if d and os.path.isdir(d):\n"
+    "    from strix.skills import register_skill_dir\n"
+    "    register_skill_dir(d)\n"
+    "from strix.interface.main import main\n"
+    "main()\n"
+)
 
-def _strix_env(model: str = "", llm_api_key: str = "") -> dict[str, str]:
+
+def _strix_env(model: str = "", llm_api_key: str = "", skills_dir: Path | None = None) -> dict[str, str]:
     s = get_settings()
     env = {**os.environ}
     env["STRIX_TELEMETRY"] = "off"
+    if skills_dir is not None:
+        env["PLATFORM_SKILLS_DIR"] = str(skills_dir)
     if s.llm_api_base:
         env["LLM_API_BASE"] = s.llm_api_base
     # 仅使用任务创建者的个人密钥（平台不持有统一密钥）
@@ -237,6 +256,9 @@ def _tail_strix_log(work_dir: Path, log: Callable[[str], None], stop: threading.
 def _display_cmd(cmd: list[str], work_dir: Path) -> str:
     """供日志展示的命令行：折叠长指令、缩短工作区路径（密钥在环境变量里，不在命令行）。"""
     parts: list[str] = []
+    if cmd and cmd[0] == sys.executable and len(cmd) > 3 and cmd[1] == "-c":
+        parts.append("strix")  # 引导段启动（技能注入）按 strix CLI 展示
+        cmd = cmd[3:]  # 跳过 python / -c / 引导段代码三段，其后才是 strix 参数
     skip_value = False
     for a in cmd:
         if skip_value:
@@ -247,6 +269,11 @@ def _display_cmd(cmd: list[str], work_dir: Path) -> str:
         else:
             parts.append(a)
     return " ".join(parts).replace(str(work_dir), ".")
+
+
+def _run_resumable(work_dir: Path, run_name: str) -> bool:
+    """run 目录是否可续扫：--resume 需要引擎已写出智能体拓扑（agents.json）。"""
+    return bool(run_name) and (work_dir / "strix_runs" / run_name / "agents.json").is_file()
 
 
 def _kill_tree(proc: subprocess.Popen) -> None:
@@ -292,74 +319,124 @@ def execute_scan(
     llm_api_key: str = "",
     cancel_check: Callable[[], bool] | None = None,
     timeout_disabled: bool = False,
+    scope_mode: str = "",
+    diff_base: str = "",
+    resume_run: str = "",
+    spec_files: list[Path] | None = None,
+    skills_dir: Path | None = None,
+    steer_check: Callable[[], str] | None = None,
 ) -> dict:
-    """运行 strix，返回 {exit_code, timed_out, cancelled, run_dir_name, attempts}。
+    """运行 strix，返回 {exit_code, timed_out, cancelled, run_dir_name, attempts, resume_used}。
 
     src_dirs 为白盒源码目录列表（多仓库任务每仓库一个目录）：strix 的 -t 可重复
     传多个目标，每个目录各占一个 -t，引擎为每个目标分配独立的 /workspace/<目录名>
     子目录并在根智能体任务里逐目标列出，漏洞的 target 字段可据此归属到仓库。
     test_targets 为黑盒目标列表 [{"url", "note"}]：每个地址各占一个 -t；
     note（地址作用说明）由调用方并入 instruction 注入。
+    spec_files 为 API 规范文件列表（OpenAPI/Swagger/Postman/Apifox 导出）：逐个 -t。
+    scope_mode/diff_base 透传 --scope-mode/--diff-base（diff 增量扫描）。
+    resume_run 非空且 run 目录可恢复（agents.json 存在）时加 --resume 断点续扫；
+    LLM 连接失败自动重试同样优先 --resume 从断点继续。
+    steer_check 在引擎运行期间轮询，返回非空转向指令时：安全打断引擎 → 追加转向块到
+    instruction → --resume 立即续扫（引擎把新指令注入根智能体会话），不占用重试次数；
+    run 目录尚不可恢复时退化为带新指令的全量重启。skills_dir 非空时注入平台技能目录。
     cancel_check 返回 True 时终止进程树并放弃后续重试（结果 cancelled=True）。
     timeout_disabled=True 时不限时运行：跳过档位默认时长的超时回收（多仓库/大型
-    项目扫描常超出档位上限），仅保留用户取消通道。
+    项目扫描常超出档位上限），仅保留用户取消/转向通道。
     """
     s = get_settings()
     work_dir.mkdir(parents=True, exist_ok=True)
-    before = _list_runs(work_dir)
 
-    cmd = ["strix", "-n"]
-    for d in src_dirs:
-        cmd += ["-t", str(d)]
-    for t in test_targets:
-        cmd += ["-t", t["url"]]
-    cmd += ["-m", scan_mode]
-    if instruction:
-        cmd += ["--instruction", instruction]
-    if s.strix_max_budget > 0:
-        cmd += ["--max-budget", str(s.strix_max_budget)]
-    if s.strix_extra_args.strip():
-        cmd += shlex.split(s.strix_extra_args.strip())
+    base_instruction = instruction
+    steered_msgs: list[str] = []
+    steered_restart = False
+    resume_used = bool(resume_run)
+    # 转向消息 → 追加指令块（引擎 resume 时注入根智能体；子智能体由根在任务派发时转达）
+    def _instruction_now() -> str:
+        if not steered_msgs:
+            return base_instruction
+        blocks = "\n\n".join(
+            f"MID-SCAN USER STEERING (higher priority, apply from now on):\n{m}"
+            for m in steered_msgs
+        )
+        return f"{base_instruction}\n\n{blocks}".strip()
+
+    def _build_cmd() -> list[str]:
+        cmd = [sys.executable, "-c", _BOOTSTRAP] if skills_dir is not None else ["strix"]
+        cmd += ["-n"]
+        if resume_run and _run_resumable(work_dir, resume_run):
+            cmd += ["--resume", resume_run]
+        for d in src_dirs:
+            cmd += ["-t", str(d)]
+        for f in spec_files or []:
+            cmd += ["-t", str(f)]
+        for t in test_targets:
+            cmd += ["-t", t["url"]]
+        cmd += ["-m", scan_mode]
+        if scope_mode in ("auto", "diff", "full"):
+            cmd += ["--scope-mode", scope_mode]
+        if scope_mode == "diff" and diff_base.strip():
+            cmd += ["--diff-base", diff_base.strip()]
+        if instruction:
+            cmd += ["--instruction", instruction]
+        if s.strix_max_budget > 0:
+            cmd += ["--max-budget", str(s.strix_max_budget)]
+        if s.strix_extra_args.strip():
+            cmd += shlex.split(s.strix_extra_args.strip())
+        return cmd
 
     timeout_sec = {"quick": s.timeout_quick, "standard": s.timeout_standard, "deep": s.timeout_deep}.get(
         scan_mode, s.timeout_standard
     )
-    env = _strix_env(model, llm_api_key)
+    env = _strix_env(model, llm_api_key, skills_dir)
     scan_log = work_dir / "scan.log"
-
-    log(f"[scan] 命令: {_display_cmd(cmd, work_dir)}")
 
     exit_code: int | None = None
     timed_out = False
     cancelled = False
     attempts = 0
 
-    for attempt in range(1, s.max_scan_attempts + 1):
+    while True:
         if cancel_check and cancel_check():
             cancelled = True
             log("[scan] 检测到取消请求，停止执行")
             break
-        attempts = attempt
-        log(
-            f"[scan] 第 {attempt}/{s.max_scan_attempts} 次执行（"
-            + ("不限时运行" if timeout_disabled else f"超时 {timeout_sec // 60} 分钟")
-            + "）"
-        )
-        # tail 线程只在 proc 存活期间运行，wait 返回（含超时/取消）即 join，
+        if steered_restart:
+            steered_restart = False  # 用户转向重启：不占用 LLM 失败重试次数
+            if _run_resumable(work_dir, resume_run):
+                log("[scan] 转向重启：从断点 --resume 继续（新指令将注入根智能体）")
+            else:
+                log("[scan] 转向重启：run 目录尚不可恢复，带新指令重新开始")
+        else:
+            if attempts >= s.max_scan_attempts:
+                break
+            attempts += 1
+            log(
+                f"[scan] 第 {attempts}/{s.max_scan_attempts} 次执行（"
+                + ("不限时运行" if timeout_disabled else f"超时 {timeout_sec // 60} 分钟")
+                + "）"
+            )
+        instruction = _instruction_now()
+        cmd = _build_cmd()
+        known = set(_list_runs(work_dir))
+        log(f"[scan] 命令: {_display_cmd(cmd, work_dir)}")
+        steered = False
+
+        # tail 线程只在 proc 存活期间运行，wait 返回（含超时/取消/转向）即 join，
         # 保证 log 回调（写 DB）不与主线程并发
         stop_evt = threading.Event()
         mon = threading.Thread(target=_tail_strix_log, args=(work_dir, log, stop_evt), daemon=True)
         mon.start()
         try:
             with scan_log.open("ab") as out:
-                out.write(f"\n===== attempt {attempt} {now_bj().strftime('%Y-%m-%dT%H:%M:%S')} =====\n".encode())
+                out.write(f"\n===== attempt {attempts} {now_bj().strftime('%Y-%m-%dT%H:%M:%S')} =====\n".encode())
                 # POSIX 下独立进程组：取消/超时可 killpg 整树而不伤 worker 自身
                 proc = subprocess.Popen(
                     cmd, cwd=str(work_dir), stdout=out, stderr=subprocess.STDOUT, env=env,
                     start_new_session=(os.name != "nt"),
                 )
-                # 等待期间每 2 秒轮询一次取消标记（跨进程经 Redis）；总时长仍受
-                # timeout_sec 约束（timeout_disabled 时不限时，仅响应取消），
+                # 等待期间每 2 秒轮询一次取消/转向标记（跨进程经 Redis）；总时长仍受
+                # timeout_sec 约束（timeout_disabled 时不限时，仅响应取消/转向），
                 # 语义与原 proc.wait(timeout=...) 一致
                 started = time.monotonic()
                 while True:
@@ -374,6 +451,15 @@ def execute_scan(
                             proc.wait(timeout=60)
                             exit_code = proc.returncode
                             break
+                        steer_msg = (steer_check() or "").strip() if steer_check else ""
+                        if steer_msg:
+                            steered = True
+                            steered_msgs.append(steer_msg[:2000])
+                            log(f"[scan] 收到转向指令（{len(steer_msg)} 字），正在安全打断并应用…")
+                            _kill_tree(proc)
+                            proc.wait(timeout=60)
+                            exit_code = proc.returncode
+                            break
                         if not timeout_disabled and time.monotonic() - started >= timeout_sec:
                             _kill_tree(proc)
                             proc.wait(timeout=60)
@@ -383,21 +469,38 @@ def execute_scan(
         finally:
             stop_evt.set()
             mon.join(timeout=10)
-        log(
-            f"[scan] 退出码 {exit_code}"
-            + ("（超时被回收）" if timed_out else "（用户取消）" if cancelled else "")
-        )
 
-        if timed_out or cancelled:
-            break  # 运维回收/用户主动取消，不重试
+        # 定位本次 run 目录：优先新增目录，回退已知最新 run.json
+        new = _list_runs(work_dir) - known
+        if len(new) == 1:
+            resume_run = new.pop()
+        elif new:
+            base = work_dir / "strix_runs"
+            resume_run = max(new, key=lambda n: (base / n / "run.json").stat().st_mtime)
+        resume_used = _run_resumable(work_dir, resume_run)
 
+        if cancelled:
+            log("[scan] 退出码 " + str(exit_code) + "（用户取消）")
+            break
+        if timed_out:
+            log(f"[scan] 退出码 {exit_code}（超时被回收）")
+            break
+        if steered:
+            steered_restart = True
+            continue
+
+        log(f"[scan] 退出码 {exit_code}")
         tail = ""
         try:
             tail = scan_log.read_text(encoding="utf-8", errors="replace")[-4000:]
         except OSError:
             pass
         if exit_code == 1 and RETRY_MARKER in tail:
-            log("[scan] LLM 连接失败（网关 free 池间歇故障），30 秒后自动重试")
+            if attempts >= s.max_scan_attempts:
+                log("[scan] 已达最大重试次数，停止执行")
+                break
+            log("[scan] LLM 连接失败（网关 free 池间歇故障），30 秒后自动重试"
+                + ("（--resume 从断点继续）" if resume_used else ""))
             for _ in range(30):  # 分段睡眠，重试等待期间仍响应取消
                 if cancel_check and cancel_check():
                     cancelled = True
@@ -409,21 +512,19 @@ def execute_scan(
             continue
         break
 
-    # 定位本次 run 目录：优先新增目录，回退最新 run.json
-    after = _list_runs(work_dir)
-    new = after - before
-    run_dir_name = ""
-    base = work_dir / "strix_runs"
-    if len(new) == 1:
-        run_dir_name = new.pop()
-    elif new:
-        run_dir_name = max(new, key=lambda n: (base / n / "run.json").stat().st_mtime)
-    elif after:
-        run_dir_name = max(after, key=lambda n: (base / n / "run.json").stat().st_mtime)
+    run_dir_name = resume_run if resume_run and resume_run in _list_runs(work_dir) else ""
     if run_dir_name:
         log(f"[scan] run 目录: {run_dir_name}")
 
-    return {"exit_code": exit_code, "timed_out": timed_out, "cancelled": cancelled, "run_dir_name": run_dir_name, "attempts": attempts}
+    return {
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "cancelled": cancelled,
+        "run_dir_name": run_dir_name,
+        "attempts": attempts,
+        "resume_used": resume_used,
+        "steered": len(steered_msgs),
+    }
 
 
 def read_run_artifacts(work_dir: Path, run_dir_name: str) -> tuple[dict, list[dict]]:

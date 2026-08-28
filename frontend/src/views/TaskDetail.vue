@@ -37,6 +37,38 @@ async function cancelTask() {
   } catch (e) { toast.error((e as Error).message) } finally { cancelling.value = false }
 }
 
+// ---- 运行中转向：向智能体下发新指令（安全打断 + --resume 断点续扫注入） ----
+const steerMsg = ref('')
+const steering = ref(false)
+
+async function steerTask() {
+  const msg = steerMsg.value.trim()
+  if (!msg) { toast.error('请输入转向指令'); return }
+  if (!confirm('转向会安全打断当前引擎进程，把指令注入根智能体后从断点续扫（通常几十秒内恢复运行）。确定下发？')) return
+  steering.value = true
+  try {
+    await api.steerTask(props.taskId, msg)
+    toast.success('转向指令已下达，引擎将从断点携带新指令继续')
+    steerMsg.value = ''
+    refresh()
+  } catch (e) { toast.error((e as Error).message) } finally { steering.value = false }
+}
+
+// ---- 断点续扫：失败/取消/完成后从上次 run 断点继续（--resume，保留已完成轮次） ----
+const resuming = ref(false)
+const canResume = computed(() =>
+  ['done', 'failed', 'cancelled'].includes(task.value?.status || '') && !!task.value?.run_dir_name)
+
+async function resumeTask() {
+  if (!confirm(`确定从 run「${task.value?.run_dir_name}」断点续扫？已完成的工作保留，续扫期间 tokens 继续累计。`)) return
+  resuming.value = true
+  try {
+    await api.resumeTask(props.taskId)
+    toast.success('续扫已发起，任务重新进入队列')
+    refresh()
+  } catch (e) { toast.error((e as Error).message) } finally { resuming.value = false }
+}
+
 // ---- 手动触发中文翻译（流程内不自动翻译，报告为英文或明细缺中文时按需补翻） ----
 const translatingZh = ref(false)
 
@@ -267,6 +299,10 @@ onUnmounted(() => { clearInterval(timer); themeObserver?.disconnect() })
             <span v-if="task.web_search" class="inline-block rounded-full bg-[#9b7bff]/15 px-2.5 py-0.5 text-xs font-semibold text-[#a78bfa]" title="智能体可经内网搜索端点查询公开漏洞/利用资料">联网搜索</span>
             <span v-if="task.timed_out" :class="statusBadgeClass('failed')">超时终止</span>
             <span v-if="task.timeout_disabled" class="inline-block rounded-full bg-border/30 px-2.5 py-0.5 text-xs font-semibold text-muted" title="发起任务时关闭了超时终止，引擎不受档位默认时长限制">不限时</span>
+            <span v-if="task.scope_mode === 'diff'" class="inline-block rounded-full bg-ok/15 px-2.5 py-0.5 text-xs font-semibold text-ok" :title="`增量扫描：仅扫相对 ${task.diff_base || '仓库默认分支'} 的变更`">
+              diff 增量{{ task.diff_base ? ` · ${task.diff_base}` : '' }}
+            </span>
+            <span v-if="task.resume_count" class="inline-block rounded-full bg-accent/15 px-2.5 py-0.5 text-xs font-semibold text-accent" title="该任务经「续扫」从断点恢复的次数">续扫 ×{{ task.resume_count }}</span>
             <span v-if="task.zh_status === 'pending'" class="inline-block rounded-full bg-[#9b7bff]/15 px-2.5 py-0.5 text-xs font-semibold text-[#a78bfa]">翻译中</span>
           </h1>
           <p class="mt-1.5 text-[13px] text-muted">
@@ -280,6 +316,9 @@ onUnmounted(() => { clearInterval(timer); themeObserver?.disconnect() })
         <div class="flex shrink-0 items-center gap-2.5">
           <button v-if="running" :class="btnDanger" :disabled="cancelling" @click="cancelTask">
             {{ cancelling ? '取消中…' : '取消任务' }}
+          </button>
+          <button v-if="canResume" :class="btnGhost" :disabled="resuming" @click="resumeTask">
+            {{ resuming ? '发起中…' : `续扫${task.resume_count ? `（已续 ${task.resume_count} 次）` : ''}` }}
           </button>
           <button v-if="task.has_artifacts" :class="btnGhost" @click="downloadArtifacts">下载产物 zip</button>
           <button
@@ -310,6 +349,31 @@ onUnmounted(() => { clearInterval(timer); themeObserver?.disconnect() })
       <div v-else-if="task.findings.some(f => /^https?:\/\//i.test((f.target || '').trim()) && isLoopbackUrl(f.target.trim()))" class="mb-[18px] rounded-xl border border-med/40 bg-med/[.06] px-4 py-3 text-[13px] leading-relaxed text-body shadow-soft">
         <div class="font-semibold text-muted">未配置黑盒测试地址</div>
         本次任务未提供任何黑盒目标。部分漏洞的 PoC 由引擎在<span class="font-semibold">扫描沙箱内自建的本地实例</span>上实测（构建并运行应用、自备数据库与测试数据），相关结论仅代表本地靶场行为，不代表真实环境响应；实测流量全部局限于沙箱内部。
+      </div>
+
+      <!-- API 规范目标（OpenAPI/Swagger/Postman/Apifox 导出文件） -->
+      <div v-if="task.api_specs?.length" class="mb-[18px] rounded-xl border border-border bg-panel px-4 py-3 text-[13px] leading-relaxed text-body shadow-soft">
+        <div class="mb-1 font-semibold text-muted">API 规范目标（{{ task.api_specs.length }} 个）：</div>
+        <div v-for="s in task.api_specs" :key="s" class="break-all font-mono">{{ s }}</div>
+      </div>
+
+      <!-- 运行中转向：向智能体下发新指令 -->
+      <div v-if="task.status === 'scanning'" class="mb-[18px] rounded-xl border border-accent/35 bg-accent/[.06] px-4 py-3 shadow-soft">
+        <div class="mb-1.5 text-[13px] font-semibold text-text">运行中转向</div>
+        <div class="flex items-start gap-2.5">
+          <textarea
+            v-model="steerMsg"
+            rows="2"
+            placeholder="给智能体的新指令，例如：&#10;Prioritize the admin panel at /admin and test default credentials.&#10;补充测试账号：user:test1234，重点看订单接口的水平越权。"
+            class="flex-1 resize-y rounded-md border border-border bg-panel2 px-2.5 py-2 text-[13.5px] text-text outline-none focus:border-accent"
+          ></textarea>
+          <button :class="btn" :disabled="steering || !steerMsg.trim()" @click="steerTask">
+            {{ steering ? '下发中…' : '下发转向' }}
+          </button>
+        </div>
+        <p :class="hint" class="!mt-1.5">
+          指令会注入根智能体并从断点继续（引擎进程会被安全打断后 --resume 续扫，已完成的工作不丢失）；多个智能体的具体执行由根智能体转达。
+        </p>
       </div>
 
       <!-- 测试指令 -->

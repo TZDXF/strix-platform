@@ -12,7 +12,7 @@ from pathlib import Path
 from sqlalchemy import delete
 
 from .artifacts import archive_run
-from .cancel import cancel_requested, clear_cancel
+from .cancel import cancel_requested, clear_cancel, clear_steer, pop_steer
 from .celery_app import celery_app
 from .config import get_settings
 from .db import SessionLocal
@@ -20,6 +20,7 @@ from .llm_models import default_model
 from .mailer import notify_task_finished
 from .models import Finding, GitConfig, Project, ProjectUpload, Task, User
 from .runner import execute_scan, read_run_artifacts
+from .skills import materialize_skills, web_search_pointer
 from .sources import (
     SourceError,
     clone_git,
@@ -56,34 +57,33 @@ LOCAL_RANGE_GUIDE = (
 
 
 def web_search_guide(mcp_url: str) -> str:
-    """联网搜索指令块：教智能体用沙箱 shell curl 内网 MCP 搜索端点。
+    """（兼容保留）联网搜索调用指南文本——已迁移为技能库种子技能的正文载体。
 
-    端点为 Streamable HTTP MCP，实测支持无状态 JSON-RPC 直调（免 initialize/会话），
-    返回 SSE data: 行，content[0].text 内是再包一层的 JSON 结果串（title/link/content）。
-    指令进入根智能体任务文本；根智能体派生专项智能体时按需把命令带进子任务。
+    见 skills.build_web_search_content：任务勾选联网搜索时，指令里只注入
+    web_search_pointer() 的一行加载指引，具体调用方法在技能正文里，可由
+    超管在「技能库」查看和编辑。
     """
-    payload = (
-        '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"web_search_prime",'
-        '"arguments":{"search_query":"<english keywords>","location":"us"}}}'
-    )
-    return (
-        "Web research capability is ENABLED for this scan: an internal web-search gateway "
-        "is reachable from the sandbox shell. To search, run:\n"
-        f"curl -s -m 30 -X POST '{mcp_url}' "
-        "-H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' "
-        f"-d '{payload}' "
-        '| sed -n "s/^data://p" '
-        "| jq -r '.result.content[0].text | fromjson | .[] | \"\\(.title) - \\(.link)\\n\\(.content)\"'\n"
-        "Guidance: use it to research current CVE details, exploit/PoC approaches, payload "
-        "syntax and bypass techniques for the exact technologies in scope. Keep queries in "
-        "English and under 70 characters. Optional arguments: search_recency_filter "
-        "(oneDay/oneWeek/oneMonth/oneYear), content_size=high for deeper summaries, "
-        "search_domain_filter to restrict to specific sites (e.g. nvd.nist.gov). "
-        "Cross-check findings across multiple results before acting on them. If the gateway "
-        "is unreachable, continue the assessment without web research. When spawning "
-        "specialist agents whose task benefits from web research, include this command in "
-        "their task text."
-    )
+    from .skills import build_web_search_content
+
+    return build_web_search_content(mcp_url)
+
+
+def _parse_api_specs(raw) -> list[dict]:
+    """解析任务的 API 规范目标 JSON（[{"name","stored_path"}]，路径相对 workspace）；坏数据返回 []。"""
+    if isinstance(raw, str):
+        if not raw.strip():
+            return []
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return []
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for it in raw:
+        if isinstance(it, dict) and it.get("name") and it.get("stored_path"):
+            out.append({"name": str(it["name"]), "stored_path": str(it["stored_path"])})
+    return out
 
 
 def _set_status(db, task, status: str) -> None:
@@ -95,6 +95,7 @@ def _set_status(db, task, status: str) -> None:
 def _finish_as_cancelled(db, task, task_id: str, detail: str = "") -> dict:
     """任务以「已取消」收尾：终态时间/时长/日志，不解析产物、不翻译、不发提醒邮件。"""
     clear_cancel(task_id)
+    clear_steer(task_id)
     task.error = ""
     task.finished_at = datetime.now(timezone.utc)
     if task.started_at:
@@ -238,6 +239,7 @@ def run_scan(self, task_id: str) -> dict:
         result = _finish_as_cancelled(db, task, task_id, "任务在排队等待期间被取消")
         db.close()
         return result
+    clear_steer(task_id)  # 防御：清理上次运行未消费的转向标记，避免新任务被旧指令误转向
 
     project = db.get(Project, task.project_id) if task.project_id else None
     creator = db.get(User, task.created_by) if task.created_by else None
@@ -258,12 +260,22 @@ def run_scan(self, task_id: str) -> dict:
     artifacts_dir = ws / "artifacts"
     task.model = task.model or default_model(db)  # 平台默认模型（platform_models 表，超管维护）
     task.strix_version = s.strix_version
+    resume_run = ""
+    if task.resume_count and task.resume_count > 0 and task.run_dir_name:
+        # 手动续扫：以任务记录的 run 目录为断点（run 目录被清理时 execute_scan 会自动退化为重跑）
+        resume_run = task.run_dir_name
+        _log(task, f"[task] 第 {task.resume_count} 次续扫：从 run「{resume_run}」断点恢复（--resume）")
     task.attempts = 0
 
     try:
         task.started_at = datetime.now(timezone.utc)
         _set_status(db, task, "fetching")
         repo_refs = effective_repo_branches(task.repo_branches, task.source_ref, task.branch or "")
+        scope_mode = (task.scope_mode or "").strip()
+        diff_base = (task.diff_base or "").strip()
+        full_history = scope_mode == "diff"  # diff 增量需要基线分支历史，浅克隆解析不了
+        if scope_mode == "diff":
+            _log(task, f"[scan] diff 增量扫描：范围 {scope_mode}，基线 {diff_base or '仓库默认分支'}")
         src_desc = (
             f"git（{len(repo_refs)} 个仓库，分支 {'/'.join(r['branch'] or '默认' for r in repo_refs)}）"
             if task.source_type == "git" and len(repo_refs) != 1
@@ -280,6 +292,7 @@ def run_scan(self, task_id: str) -> dict:
         # 子目录，漏洞的 target 字段才能归属到具体仓库
         taken = {"scan", "src"}
         repo_dirs = {r["url"]: task_ws / repo_dir_name(r["url"], taken) for r in repo_refs}
+        api_dir = task_ws / "api"
         for d in [*repo_dirs.values(), src_dir]:  # 重派发/重试时清掉上次残留，保证可幂等重跑
             shutil.rmtree(d, ignore_errors=True)
         t_fetch = time.monotonic()
@@ -296,7 +309,7 @@ def run_scan(self, task_id: str) -> dict:
 
             def _clone(url: str, dest, branch: str) -> None:
                 auth, tok = repo_credential(repo_tokens, url, proj_auth, proj_token, bound_config=bound)
-                clone_git(url, dest, git_log, branch=branch, auth_type=auth, token=tok)
+                clone_git(url, dest, git_log, branch=branch, auth_type=auth, token=tok, full_history=full_history)
 
             if len(repo_refs) > 1:
                 _log(task, f"[fetch] 项目绑定 {len(repo_refs)} 个仓库，逐个克隆为独立扫描目标")
@@ -314,6 +327,22 @@ def run_scan(self, task_id: str) -> dict:
                 lambda m: (_log(task, m), db.commit()),
             )
             source_dirs = [src_dir]
+
+        # API 规范目标（OpenAPI/Swagger/Postman/Apifox 导出）：拷入任务工作区 api/ 目录
+        spec_files: list[Path] = []
+        api_specs = _parse_api_specs(task.api_specs)
+        if api_specs:
+            api_dir.mkdir(parents=True, exist_ok=True)
+            for spec in api_specs:
+                src_path = Path(spec["stored_path"])
+                if not src_path.is_file():
+                    _log(task, f"[fetch][警告] API 规范文件丢失，跳过: {spec['name']}")
+                    continue
+                dest = api_dir / spec["name"]
+                shutil.copyfile(src_path, dest)
+                spec_files.append(dest)
+            if spec_files:
+                _log(task, f"[fetch] API 规范目标 {'、'.join(p.name for p in spec_files)}")
         _log(
             task,
             f"[fetch] 源码就绪（{sum(du_mb(d) for d in source_dirs)}MB"
@@ -367,10 +396,28 @@ def run_scan(self, task_id: str) -> dict:
         else:
             # 无黑盒目标时明确授权边界：允许沙箱内自建靶场做实测，禁止出沙箱流量
             instruction_parts.append(LOCAL_RANGE_GUIDE)
+        if spec_files:
+            lines = [
+                "API specification targets are provided alongside the source code "
+                "(OpenAPI/Swagger, Postman collection or Apifox export). Treat them as "
+                "the authoritative API contract: enumerate and test the documented "
+                "endpoints, parameters and auth flows against the black-box targets "
+                "above (or against a locally provisioned instance when no black-box "
+                "target is in scope):",
+            ]
+            for i, p in enumerate(spec_files, 1):
+                lines.append(f"{i}. {p.name} (staged at /workspace/{p.name})")
+            instruction_parts.append("\n".join(lines))
         if task.web_search and s.web_search_mcp_url:
-            instruction_parts.append(web_search_guide(s.web_search_mcp_url))
+            instruction_parts.append(web_search_pointer())
         instruction_parts.append(ZH_INSTRUCTION)
         instruction = "\n".join(instruction_parts).strip()
+
+        # 平台技能库：启用的技能材料化到共享目录，经 python -c 引导段注册进引擎
+        skills_dir = materialize_skills(db, ws / ".skills")
+        if skills_dir:
+            _log(task, "[scan] 已注入平台技能库（含联网搜索等自定义技能）")
+
         result = execute_scan(
             work_dir=scan_dir,
             src_dirs=source_dirs,
@@ -382,6 +429,12 @@ def run_scan(self, task_id: str) -> dict:
             log=lambda m: (_log(task, m), db.commit()),
             cancel_check=lambda: cancel_requested(task_id),
             timeout_disabled=bool(task.timeout_disabled),
+            scope_mode=scope_mode,
+            diff_base=diff_base,
+            resume_run=resume_run,
+            spec_files=spec_files,
+            skills_dir=skills_dir,
+            steer_check=lambda: pop_steer(task_id),
         )
         task.exit_code = result["exit_code"]
         task.attempts = result["attempts"]
@@ -413,6 +466,7 @@ def run_scan(self, task_id: str) -> dict:
             _log(task, "[parse] 未生成执行摘要报告（penetration_test_report.md）")
 
         db.execute(delete(Finding).where(Finding.task_id == task_id))
+        task.zh_status = ""  # 续扫/重跑生成全新 findings，旧的中文翻译状态随之失效
         counts: dict[str, int] = {}
         for v in vulns:
             sev = str(v.get("severity", "info")).lower()

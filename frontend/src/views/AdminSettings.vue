@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { api, type PlatformModel, type MailSettings } from '../api'
+import { api, type PlatformModel, type MailSettings, type SkillInfo } from '../api'
 import { toast } from '../toast'
 import { badge, btn, btnDanger, btnGhost, card, hint, h3, input, label, tableTd, tableTh } from '../ui'
 
@@ -132,9 +132,86 @@ async function sendTest() {
   } catch (e) { toast.error((e as Error).message) } finally { testing.value = false }
 }
 
+// ---- 技能库管理 ----
+const skills = ref<SkillInfo[]>([])
+const skillBusy = ref(false)
+// 编辑区：null=收起；{id:'', ...}=新建；非空 id=编辑既有技能
+const skillEdit = ref<{ id: string; name: string; category: string; description: string; content: string } | null>(null)
+const savingSkill = ref(false)
+
+async function loadSkills() {
+  try { skills.value = (await api.listAdminSkills()).items } catch (e) { toast.error((e as Error).message) }
+}
+
+function newSkill() {
+  skillEdit.value = { id: '', name: '', category: 'custom', description: '', content: '' }
+}
+
+function editSkill(s: SkillInfo) {
+  skillEdit.value = { id: s.id, name: s.name, category: s.category, description: s.description, content: s.content || '' }
+}
+
+async function importSkillFile(e: Event) {
+  const f = (e.target as HTMLInputElement).files?.[0]
+  ;(e.target as HTMLInputElement).value = ''
+  if (!f) return
+  if (!f.name.toLowerCase().endsWith('.md')) { toast.error('请选择 .md 技能文件'); return }
+  const content = await f.text()
+  skillBusy.value = true
+  try {
+    const s = await api.importSkill(content, 'custom')
+    toast.success(`已导入技能 ${s.full_name}`)
+    await loadSkills()
+  } catch (err) { toast.error((err as Error).message) } finally { skillBusy.value = false }
+}
+
+async function saveSkill() {
+  const ed = skillEdit.value
+  if (!ed) return
+  if (!ed.id) {
+    if (!ed.name.trim()) { toast.error('请填写技能名（小写字母/数字/中划线）'); return }
+    if (!ed.content.trim()) { toast.error('技能内容不能为空'); return }
+    savingSkill.value = true
+    try {
+      await api.createSkill({ name: ed.name.trim(), category: ed.category.trim() || 'custom', description: ed.description.trim(), content: ed.content })
+      toast.success('技能已创建')
+      skillEdit.value = null
+      await loadSkills()
+    } catch (e) { toast.error((e as Error).message) } finally { savingSkill.value = false }
+  } else {
+    savingSkill.value = true
+    try {
+      await api.patchSkill(ed.id, { description: ed.description.trim(), content: ed.content })
+      toast.success('技能已保存')
+      skillEdit.value = null
+      await loadSkills()
+    } catch (e) { toast.error((e as Error).message) } finally { savingSkill.value = false }
+  }
+}
+
+async function toggleSkill(s: SkillInfo) {
+  skillBusy.value = true
+  try {
+    await api.patchSkill(s.id, { enabled: !s.enabled })
+    await loadSkills()
+    toast.success(`已${s.enabled ? '停用' : '启用'} ${s.full_name}${!s.enabled ? '' : '，新发起的扫描即可使用'}`)
+  } catch (e) { toast.error((e as Error).message) } finally { skillBusy.value = false }
+}
+
+async function removeSkill(s: SkillInfo) {
+  if (!confirm(`确定删除技能「${s.full_name}」？删除后新发起的扫描不再注入该技能。`)) return
+  skillBusy.value = true
+  try {
+    await api.deleteSkill(s.id)
+    await loadSkills()
+    toast.success(`已删除「${s.full_name}」`)
+  } catch (e) { toast.error((e as Error).message) } finally { skillBusy.value = false }
+}
+
 onMounted(() => {
   loadModels()
   loadMail()
+  loadSkills()
 })
 </script>
 
@@ -279,6 +356,91 @@ onMounted(() => {
           </tbody>
         </table>
       </div>
+    </div>
+
+    <!-- 技能库管理 -->
+    <div :class="card">
+      <div class="flex flex-wrap items-center gap-2.5">
+        <h3 :class="[h3, 'mb-0']">技能库</h3>
+        <span :class="badge + (skills.some(s => s.enabled) ? ' bg-ok/15 text-ok' : ' bg-border/30 text-muted')">
+          {{ skills.filter(s => s.enabled).length }} / {{ skills.length }} 启用
+        </span>
+        <div class="flex-1"></div>
+        <label :class="btnGhost + ' !px-3 !py-1.5 !text-xs cursor-pointer'">
+          导入 .md 文件
+          <input type="file" accept=".md" class="hidden" :disabled="skillBusy" @change="importSkillFile" />
+        </label>
+        <button :class="btnGhost + ' !px-3 !py-1.5 !text-xs'" @click="newSkill">新建技能</button>
+      </div>
+      <p :class="hint">
+        技能是注入扫描引擎的知识包（Markdown + frontmatter）：引擎按任务相关性自动加载（每个智能体最多 5 个），
+        也可由智能体经 load_skill 显式加载。同路径技能可遮蔽内置技能；启停/编辑对新发起的扫描即时生效。
+        「联网搜索」即平台种子技能（custom/web_search_internal），任务勾选联网搜索时依赖它处于启用状态。
+      </p>
+
+      <!-- 新建/编辑表单 -->
+      <div v-if="skillEdit" class="mt-3.5 rounded-lg border border-accent/40 bg-accent/[.04] p-3.5">
+        <div class="grid gap-3" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr))">
+          <div v-if="!skillEdit.id">
+            <label :class="label">技能名（小写字母/数字/中划线）</label>
+            <input v-model="skillEdit.name" type="text" placeholder="internal-api-testing" :class="input" />
+          </div>
+          <div v-if="!skillEdit.id">
+            <label :class="label">类目</label>
+            <input v-model="skillEdit.category" type="text" placeholder="custom" :class="input" />
+          </div>
+          <div class="!col-span-1" style="grid-column: 1 / -1">
+            <label :class="label">描述（frontmatter description，引擎按它判断相关性）</label>
+            <input v-model="skillEdit.description" type="text" placeholder="Testing techniques for the company internal API gateway" :class="input" />
+          </div>
+        </div>
+        <div class="mt-3">
+          <label :class="label">技能正文（Markdown；缺 frontmatter 时保存会按技能名/描述自动补齐）</label>
+          <textarea
+            v-model="skillEdit.content" rows="10"
+            placeholder="---&#10;name: internal-api-testing&#10;description: ...&#10;---&#10;&#10;# 技能标题&#10;&#10;测试方法、命令、校验要点……"
+            class="w-full resize-y rounded-md border border-border bg-panel2 px-2.5 py-2 font-mono text-[12.5px] leading-relaxed text-text outline-none focus:border-accent"
+          ></textarea>
+        </div>
+        <div class="mt-3 flex items-center gap-2.5">
+          <button :class="btn" :disabled="savingSkill" @click="saveSkill">{{ savingSkill ? '保存中…' : '保存技能' }}</button>
+          <button :class="btnGhost" @click="skillEdit = null">取消</button>
+        </div>
+      </div>
+
+      <!-- 技能列表 -->
+      <table v-if="skills.length" class="mt-3.5 w-full border-collapse">
+        <thead>
+          <tr>
+            <th :class="tableTh">技能</th>
+            <th :class="tableTh">描述</th>
+            <th :class="tableTh">状态</th>
+            <th :class="tableTh">更新时间</th>
+            <th :class="tableTh"></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="s in skills" :key="s.id">
+            <td :class="tableTd">
+              <span class="font-mono text-[13px]">{{ s.full_name }}</span>
+              <span v-if="s.builtin" :class="badge + ' ml-1.5 bg-accent/15 text-accent'" title="平台种子技能（随系统配置自动生成）">内置</span>
+            </td>
+            <td :class="tableTd + ' max-w-[360px] truncate text-muted'" :title="s.description">{{ s.description || '-' }}</td>
+            <td :class="tableTd">
+              <span :class="badge + (s.enabled ? ' bg-ok/15 text-ok' : ' bg-border/30 text-muted')">{{ s.enabled ? '启用' : '停用' }}</span>
+            </td>
+            <td :class="tableTd + ' text-muted'">{{ fmtTime(s.updated_at) }}</td>
+            <td :class="tableTd + ' text-right'">
+              <div class="flex justify-end gap-1.5">
+                <button :class="btnGhost + ' !px-2.5 !py-1 !text-xs'" @click="editSkill(s)">编辑</button>
+                <button :class="btnGhost + ' !px-2.5 !py-1 !text-xs'" :disabled="skillBusy" @click="toggleSkill(s)">{{ s.enabled ? '停用' : '启用' }}</button>
+                <button v-if="!s.builtin" :class="btnDanger + ' !px-2.5 !py-1 !text-xs'" :disabled="skillBusy" @click="removeSkill(s)">删除</button>
+              </div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <div v-else :class="hint" class="mt-2">技能库为空。可「新建技能」沉淀公司内部测试方法，或「导入 .md 文件」复用社区技能。</div>
     </div>
   </div>
 </template>

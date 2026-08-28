@@ -229,25 +229,33 @@ def clone_git(
     branch: str = "",
     auth_type: str = "",
     token: str = "",
+    full_history: bool = False,
 ) -> None:
-    """克隆指定分支（depth 1）；branch 为空时克隆默认分支。"""
+    """克隆指定分支（默认 depth 1）；full_history=True 时完整克隆。
+
+    diff 增量扫描（--scope-mode diff --diff-base <基线>）需要基线分支的对象历史，
+    浅克隆解析不了 diff-base，故该模式必须完整克隆（基线可能是另一条分支，
+    --single-branch 也一并去掉）。
+    """
     effective_url = _token_url(url, token) if auth_type == "token" and token else url
     env = _git_env()
 
-    cmd = ["git", "clone", "--depth", "1"]
-    if branch:
-        cmd += ["--branch", branch, "--single-branch"]
+    cmd = ["git", "clone"]
+    if full_history:
+        log("[fetch] diff 增量扫描需要基线历史，使用完整克隆（大仓库会较慢）")
     else:
-        cmd += ["--single-branch"]
+        cmd += ["--depth", "1", "--single-branch"]
+    if branch:
+        cmd += ["--branch", branch]
     # 凭据不出现在日志里
     display = re.sub(r"://[^@/]+@", "://***@", effective_url)
-    log(f"[fetch] git clone (depth 1, branch={branch or '默认'}): {display}")
+    log(f"[fetch] git clone ({'完整' if full_history else 'depth 1'}, branch={branch or '默认'}): {display}")
     try:
-        proc = subprocess.run(cmd + [effective_url, str(dest)], capture_output=True, text=True, timeout=900, env=env)
+        proc = subprocess.run(cmd + [effective_url, str(dest)], capture_output=True, text=True, timeout=1800, env=env)
     except FileNotFoundError as exc:
         raise SourceError("服务器未安装 git") from exc
     except subprocess.TimeoutExpired as exc:
-        raise SourceError("git clone 超时（15 分钟）") from exc
+        raise SourceError(f"git clone 超时（{'30' if full_history else '15'} 分钟）") from exc
     if proc.returncode != 0:
         err = re.sub(r"://[^@/]+@", "://***@", proc.stderr.strip()[-800:])
         raise SourceError(f"git clone 失败: {err}")

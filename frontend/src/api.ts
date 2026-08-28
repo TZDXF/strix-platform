@@ -80,8 +80,12 @@ export interface TaskSummary {
   test_url: string // 兼容旧字段：首个地址
   test_targets: TestTarget[]
   instruction: string
-  web_search: boolean // 联网搜索（指令注入内网 MCP 搜索指南）
+  web_search: boolean // 联网搜索（启用技能库中的「内网联网搜索」技能）
   timeout_disabled: boolean // 发起时关闭了超时终止（不限时运行）
+  scope_mode: string // 代码扫描范围：'' | auto | diff | full
+  diff_base: string // diff 范围基线（分支或 commit）
+  api_specs: string[] // API 规范目标文件名（OpenAPI/Swagger/Postman/Apifox 导出）
+  resume_count: number // 手动续扫次数（--resume 断点续扫）
   report_lang: 'en' | 'zh'
   zh_status: string
   model: string
@@ -119,6 +123,33 @@ export interface Finding {
   status_updated_at: string | null
 }
 
+export interface SkillInfo {
+  id: string
+  name: string
+  category: string
+  full_name: string
+  description: string
+  enabled: boolean
+  builtin: boolean
+  content_chars: number
+  content?: string
+  created_at: string | null
+  updated_at: string | null
+}
+
+export interface SkillCreatePayload {
+  name: string
+  category: string
+  description?: string
+  content: string
+}
+
+export interface SkillPatchPayload {
+  description?: string
+  content?: string
+  enabled?: boolean
+}
+
 export interface Schedule {
   id: string
   project_id: string
@@ -130,6 +161,8 @@ export interface Schedule {
   model: string
   instruction: string
   web_search: boolean
+  scope_mode: string
+  diff_base: string
   repo_branches: RepoBranch[]
   test_targets: TestTarget[]
   upload_id: string
@@ -149,6 +182,8 @@ export interface SchedulePayload {
   model: string
   instruction: string
   web_search?: boolean
+  scope_mode?: string
+  diff_base?: string
   repo_branches?: RepoBranch[]
   test_targets?: TestTarget[]
   upload_id?: string
@@ -354,6 +389,11 @@ export interface SubmitTaskParams {
   webSearch?: boolean
   timeoutDisabled?: boolean
   model?: string
+  scopeMode?: string // '' | auto | diff | full
+  diffBase?: string // diff 范围基线（scopeMode=diff 时生效）
+  apifoxProjectId?: string // Apifox 项目 ID（在线导出 OpenAPI 作为规范目标）
+  apifoxToken?: string // Apifox 访问令牌（仅提交时使用，后端不落库）
+  apiSpecFile?: File | null // API 规范文件（OpenAPI/Swagger/Postman/Apifox 导出）
   branch?: string
   uploadId?: string
   file?: File | null
@@ -518,7 +558,11 @@ export const api = {
     if (p.webSearch) form.append('web_search', '1')
     if (p.timeoutDisabled) form.append('timeout_disabled', '1')
     if (p.model) form.append('model', p.model)
-    if (p.branch) form.append('branch', p.branch)
+    if (p.scopeMode) form.append('scope_mode', p.scopeMode)
+    if (p.diffBase) form.append('diff_base', p.diffBase)
+    if (p.apifoxProjectId) form.append('apifox_project_id', p.apifoxProjectId)
+    if (p.apifoxToken) form.append('apifox_token', p.apifoxToken)
+    if (p.apiSpecFile) form.append('api_spec_file', p.apiSpecFile)
     if (p.uploadId) form.append('upload_id', p.uploadId)
     if (p.file) form.append('file', p.file)
     return request<{ id: string; status: string }>('POST', `/api/projects/${projectId}/tasks`, { form })
@@ -539,7 +583,21 @@ export const api = {
   downloadArtifacts: (id: string) => download(`/api/tasks/${id}/artifacts`, `${id}-artifacts.zip`),
   downloadReport: (id: string) => download(`/api/tasks/${id}/report.md`, `strix-report-${id.slice(0, 10)}.md`),
   cancelTask: (id: string) => request<{ ok: boolean; status: string }>('POST', `/api/tasks/${id}/cancel`),
+  steerTask: (id: string, message: string) =>
+    request<{ ok: boolean }>('POST', `/api/tasks/${id}/steer`, { json: { message } }),
+  resumeTask: (id: string) =>
+    request<{ ok: boolean; resume_count: number; status: string }>('POST', `/api/tasks/${id}/resume`),
   translateTask: (id: string) => request<{ ok: boolean }>('POST', `/api/tasks/${id}/translate`),
+
+  // 技能库（/api/skills 登录可用，只含启用技能；管理接口仅超管）
+  listSkills: () => request<{ items: SkillInfo[] }>('GET', '/api/skills'),
+  listAdminSkills: () => request<{ items: SkillInfo[] }>('GET', '/api/admin/skills'),
+  createSkill: (p: SkillCreatePayload) => request<SkillInfo>('POST', '/api/admin/skills', { json: p }),
+  patchSkill: (id: string, patch: SkillPatchPayload) =>
+    request<SkillInfo>('PATCH', `/api/admin/skills/${id}`, { json: patch }),
+  deleteSkill: (id: string) => request<{ ok: boolean }>('DELETE', `/api/admin/skills/${id}`),
+  importSkill: (content: string, category: string) =>
+    request<SkillInfo>('POST', '/api/admin/skills/import', { json: { content, category } }),
 
   // 漏洞处置状态
   patchFinding: (id: number, patch: { status: FindingStatus; note?: string }) =>

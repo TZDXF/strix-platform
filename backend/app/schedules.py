@@ -175,6 +175,8 @@ def schedule_out(sch: Schedule, db: Session) -> dict:
         "model": sch.model or "",
         "instruction": sch.instruction or "",
         "web_search": bool(sch.web_search),
+        "scope_mode": sch.scope_mode or "",
+        "diff_base": sch.diff_base or "",
         "repo_branches": effective_repo_branches(sch.repo_branches, "", ""),
         "test_targets": effective_targets(sch.test_targets, ""),
         "upload_id": sch.upload_id or "",
@@ -248,6 +250,8 @@ def fire_schedule(db: Session, sch: Schedule, manual: bool = False) -> tuple[str
         test_targets=sch.test_targets or "",
         instruction=sch.instruction or "",
         web_search=bool(sch.web_search),
+        scope_mode=sch.scope_mode or "",
+        diff_base=sch.diff_base or "",
         model=model, report_lang="zh", status="pending",
     )
     db.add(task)

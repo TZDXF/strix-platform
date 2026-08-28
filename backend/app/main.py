@@ -31,18 +31,29 @@ from .auth import (
     require_user,
     verify_password,
 )
-from .cancel import request_cancel
+from .cancel import clear_cancel, clear_steer, request_cancel, request_steer
 from .config import get_settings
 from .db import get_db, init_db
 from .gitlab import GitLabError, list_projects as gitlab_list_projects, normalize_base_url, same_host, verify_token
 from .llm_models import default_model, discover_models, platform_models, seed_platform_models, valid_model_name
+from .apispec import ApiSpecError, fetch_apifox_openapi, safe_spec_name, validate_spec_content
+from .skills import (
+    ensure_frontmatter,
+    new_skill_id,
+    parse_skill_markdown,
+    sync_web_search_skill,
+    valid_category,
+    valid_skill_name,
+    web_search_ready,
+)
 from .mailer import (
     K_FROM, K_HOST, K_NOTIFY_DONE, K_NOTIFY_FAILED, K_PASSWORD, K_PORT,
     K_SENDER_NAME, K_SITE_URL, K_SSL, K_USE_TLS, K_USER,
     get_mail_settings, mail_configured, mail_settings_public, send_mail, set_mail_settings,
 )
 from .models import (
-    FINDING_STATUSES, AuditEntry, Finding, GitConfig, PlatformModel, Project, ProjectUpload, Schedule, Task, User,
+    FINDING_STATUSES, AuditEntry, Finding, GitConfig, PlatformModel, Project, ProjectUpload,
+    Schedule, Skill, Task, User,
 )
 from .runner import read_run_artifacts  # noqa: F401（契约复用说明）
 from .replay import parse_strix_timeline, zip_member_strix_log
@@ -107,9 +118,10 @@ def _startup() -> None:
     try:
         bootstrap_admin(db)
         seed_platform_models(db)
+        sync_web_search_skill(db)
     finally:
         db.close()
-    _step("bootstrap_admin + seed_platform_models")
+    _step("bootstrap_admin + seed_platform_models + sync_web_search_skill")
     if ensure_bucket():
         _step("ensure_bucket（S3 建桶探测）")
     else:
@@ -461,6 +473,164 @@ def admin_delete_model(
             db.commit()
     _audit(db, request, "model.delete", f"name={name} was_default={was_default}", user=admin)
     return {"ok": True}
+
+
+# ===================== 技能库（超管管理；扫描时注入引擎） =====================
+
+
+def _skill_out(s: Skill, with_content: bool = False) -> dict:
+    out = {
+        "id": s.id,
+        "name": s.name,
+        "category": s.category,
+        "full_name": f"{s.category}/{s.name}",
+        "description": s.description or "",
+        "enabled": bool(s.enabled),
+        "builtin": bool(s.builtin),
+        "content_chars": len(s.content or ""),
+        "created_at": s.created_at.isoformat() if s.created_at else None,
+        "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+    }
+    if with_content:
+        out["content"] = s.content or ""
+    return out
+
+
+def _skill_unique_check(db: Session, category: str, name: str, exclude_id: str = "") -> None:
+    q = db.query(Skill).filter(Skill.category == category, Skill.name == name)
+    if exclude_id:
+        q = q.filter(Skill.id != exclude_id)
+    if db.query(q.exists()).scalar():
+        raise HTTPException(400, f"技能 {category}/{name} 已存在")
+
+
+class SkillCreateBody(BaseModel):
+    name: str
+    category: str = "custom"
+    description: str = ""
+    content: str
+
+
+class SkillPatchBody(BaseModel):
+    description: str | None = None
+    content: str | None = None
+    enabled: bool | None = None
+
+
+@app.get("/api/skills", dependencies=[Depends(require_user)])
+def list_skills_public(db: Session = Depends(get_db)):
+    """已启用的平台技能（发起任务页展示，不含正文）。"""
+    items = db.query(Skill).filter(Skill.enabled == True).order_by(Skill.category, Skill.name).all()  # noqa: E712
+    return {"items": [_skill_out(s) for s in items]}
+
+
+@app.get("/api/admin/skills", dependencies=[Depends(require_admin)])
+def admin_list_skills(db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    items = db.query(Skill).order_by(Skill.category, Skill.name).all()
+    return {"items": [_skill_out(s, with_content=True) for s in items]}
+
+
+@app.post("/api/admin/skills", dependencies=[Depends(require_admin)])
+def admin_create_skill(
+    body: SkillCreateBody, request: Request,
+    db: Session = Depends(get_db), admin: User = Depends(require_admin),
+):
+    name = (body.name or "").strip().lower()
+    category = (body.category or "custom").strip().lower() or "custom"
+    if not valid_skill_name(name):
+        raise HTTPException(400, "技能名只能包含小写字母/数字/中划线/下划线，且以字母或数字开头（≤64 字符）")
+    if not valid_category(category):
+        raise HTTPException(400, "类目只能包含小写字母/数字/中划线/下划线（≤32 字符）")
+    content = (body.content or "").strip()
+    if not content:
+        raise HTTPException(400, "技能内容不能为空")
+    if len(content) > 200_000:
+        raise HTTPException(400, "技能内容过长（≤200k 字符）")
+    meta, _body = parse_skill_markdown(content)
+    description = (body.description or "").strip() or str(meta.get("description", ""))[:512]
+    content = ensure_frontmatter(content, name, description)
+    _skill_unique_check(db, category, name)
+    sk = Skill(
+        id=new_skill_id(), name=name, category=category, description=description[:512],
+        content=content, enabled=True, builtin=False, created_by=admin.id,
+    )
+    db.add(sk)
+    db.commit()
+    _audit(db, request, "skill.create", f"id={sk.id} name={category}/{name}", user=admin)
+    return _skill_out(sk, with_content=True)
+
+
+@app.patch("/api/admin/skills/{skill_id}", dependencies=[Depends(require_admin)])
+def admin_patch_skill(
+    skill_id: str, body: SkillPatchBody, request: Request,
+    db: Session = Depends(get_db), admin: User = Depends(require_admin),
+):
+    sk = db.get(Skill, skill_id)
+    if sk is None:
+        raise HTTPException(404, "技能不存在")
+    if body.enabled is not None:
+        sk.enabled = bool(body.enabled)
+    if body.content is not None:
+        content = body.content.strip()
+        if not content:
+            raise HTTPException(400, "技能内容不能为空")
+        if len(content) > 200_000:
+            raise HTTPException(400, "技能内容过长（≤200k 字符）")
+        sk.content = ensure_frontmatter(content, sk.name, body.description if body.description is not None else sk.description)
+    if body.description is not None:
+        sk.description = body.description.strip()[:512]
+    db.commit()
+    _audit(db, request, "skill.patch", f"id={sk.id} enabled={sk.enabled}", user=admin)
+    return _skill_out(sk, with_content=True)
+
+
+@app.delete("/api/admin/skills/{skill_id}", dependencies=[Depends(require_admin)])
+def admin_delete_skill(
+    skill_id: str, request: Request,
+    db: Session = Depends(get_db), admin: User = Depends(require_admin),
+):
+    sk = db.get(Skill, skill_id)
+    if sk is None:
+        raise HTTPException(404, "技能不存在")
+    if sk.builtin:
+        raise HTTPException(400, "内置技能（联网搜索等平台种子）不可删除，可停用或编辑")
+    name = f"{sk.category}/{sk.name}"
+    db.delete(sk)
+    db.commit()
+    _audit(db, request, "skill.delete", f"name={name}", user=admin)
+    return {"ok": True}
+
+
+class SkillImportBody(BaseModel):
+    content: str  # 完整 .md 文本（含 frontmatter）
+    category: str = "custom"
+
+
+@app.post("/api/admin/skills/import", dependencies=[Depends(require_admin)])
+def admin_import_skill(
+    body: SkillImportBody, request: Request,
+    db: Session = Depends(get_db), admin: User = Depends(require_admin),
+):
+    """导入技能 md 文件：从 frontmatter 取 name/description，正文原样保留。"""
+    meta, _body = parse_skill_markdown(body.content or "")
+    name = str(meta.get("name", "")).strip().lower()
+    if not name:
+        raise HTTPException(400, "导入文件缺少 frontmatter 的 name 字段（--- name: xxx ---）")
+    if not valid_skill_name(name):
+        raise HTTPException(400, f"技能名 {name!r} 不合法（小写字母/数字/中划线/下划线）")
+    category = (body.category or "custom").strip().lower() or "custom"
+    if not valid_category(category):
+        raise HTTPException(400, "类目不合法")
+    _skill_unique_check(db, category, name)
+    sk = Skill(
+        id=new_skill_id(), name=name, category=category,
+        description=str(meta.get("description", ""))[:512],
+        content=(body.content or "").strip(), enabled=True, builtin=False, created_by=admin.id,
+    )
+    db.add(sk)
+    db.commit()
+    _audit(db, request, "skill.import", f"id={sk.id} name={category}/{name}", user=admin)
+    return _skill_out(sk, with_content=True)
 
 
 # ===================== 系统设置：邮件提醒（仅超管） =====================
@@ -1054,6 +1224,19 @@ def delete_upload(project_id: str, upload_id: str, request: Request, user: User 
 # ===================== 任务 =====================
 
 
+def _parse_api_specs_safe(raw: str) -> list[dict]:
+    """任务 api_specs 列的安全读取（仅取文件名展示）；坏数据返回 []。"""
+    if not raw or not raw.strip():
+        return []
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return []
+    if not isinstance(data, list):
+        return []
+    return [{"name": str(it.get("name", ""))} for it in data if isinstance(it, dict) and it.get("name")]
+
+
 def _task_summary(t: Task, db: Session) -> dict:
     project = db.get(Project, t.project_id) if t.project_id else None
     creator = db.get(User, t.created_by) if t.created_by else None
@@ -1078,6 +1261,10 @@ def _task_summary(t: Task, db: Session) -> dict:
         "instruction": t.instruction or "",
         "web_search": bool(t.web_search),
         "timeout_disabled": bool(t.timeout_disabled),
+        "scope_mode": t.scope_mode or "",
+        "diff_base": t.diff_base or "",
+        "api_specs": [s["name"] for s in _parse_api_specs_safe(t.api_specs)],
+        "resume_count": t.resume_count or 0,
         "report_lang": t.report_lang,
         "zh_status": t.zh_status or "",
         "model": t.model or "",
@@ -1170,12 +1357,17 @@ async def create_task(
     test_url: str = Form(""),  # 旧版单地址（兼容旧客户端）
     test_targets: str = Form(""),  # 多目标列表：JSON [{"url","note"}]
     instruction: str = Form(""),
-    web_search: bool = Form(False),  # 联网搜索：指令注入内网 MCP 搜索指南（默认关闭）
+    web_search: bool = Form(False),  # 联网搜索：启用技能库中的「内网联网搜索」技能
     timeout_disabled: bool = Form(False),  # 关闭超时终止：忽略档位默认时长，引擎跑完为止
     model: str = Form(""),
+    scope_mode: str = Form(""),  # 代码扫描范围："" / auto / diff / full
+    diff_base: str = Form(""),  # diff 范围基线（分支或 commit，如 origin/main）
+    apifox_project_id: str = Form(""),  # Apifox 项目 ID（与 apifox_token 二选一或同时给）
+    apifox_token: str = Form(""),  # Apifox 访问令牌：仅本次导出使用，不落库不回显
     branch: str = Form(""),  # 旧版单仓库分支（兼容旧客户端）
     repo_branches: str = Form(""),  # 多仓库各自分支：JSON [{"url","branch"}]
     upload_id: str = Form(""),
+    api_spec_file: UploadFile | None = File(default=None),  # API 规范文件（OpenAPI/Swagger/Postman/Apifox 导出）
     file: UploadFile | None = File(default=None),
     user: User = Depends(require_user),
 ):
@@ -1197,6 +1389,16 @@ async def create_task(
     elif not platform_models(db):
         raise HTTPException(400, "平台尚未配置可用模型，请联系超管在「设置」中添加")
 
+    # 代码扫描范围（diff 增量）：scope_mode 白名单；diff_base 仅 diff 模式生效
+    scope_mode = (scope_mode or "").strip().lower()
+    if scope_mode not in ("", "auto", "diff", "full"):
+        raise HTTPException(400, "scope_mode 必须是 auto/diff/full 或留空")
+    diff_base = (diff_base or "").strip()
+    if diff_base and not re.fullmatch(r"[A-Za-z0-9._/-]{1,255}", diff_base):
+        raise HTTPException(400, "diff_base 只能包含字母数字 . _ / -（分支或 commit）")
+    if scope_mode != "diff":
+        diff_base = ""
+
     # 黑盒目标允许清单校验（多目标逐个校验；test_targets 优先，旧 test_url 兼容）
     if test_targets.strip():
         targets = _checked_targets(test_targets)
@@ -1210,9 +1412,41 @@ async def create_task(
     if len(instruction) > 4000:
         raise HTTPException(400, "instruction 最长 4000 个字符")
 
-    # 联网搜索：需超管在环境变量配置 WEB_SEARCH_MCP_URL 后才可勾选
-    if web_search and not settings.web_search_mcp_url:
-        raise HTTPException(400, "平台未配置联网搜索端点（WEB_SEARCH_MCP_URL），请联系超管")
+    # 联网搜索：端点已配置且「内网联网搜索」技能在技能库中启用
+    if web_search and not web_search_ready(db):
+        raise HTTPException(400, "平台未配置联网搜索端点（WEB_SEARCH_MCP_URL）或技能未启用，请联系超管")
+
+    # API 规范目标：本地上传 spec 文件，或经 Apifox 开放 API 在线导出（令牌仅本次使用）
+    ws = Path(settings.workspace_root)
+    specs_dir = ws / "uploads" / "apispecs"
+    specs_dir.mkdir(parents=True, exist_ok=True)
+    api_specs: list[dict] = []
+    if api_spec_file is not None and api_spec_file.filename:
+        try:
+            name = safe_spec_name(api_spec_file.filename)
+        except ApiSpecError as exc:
+            raise HTTPException(400, str(exc))
+        content = await api_spec_file.read()
+        if len(content) > 20 * 1024 * 1024:
+            raise HTTPException(400, "API 规范文件不能超过 20MB")
+        if not content:
+            raise HTTPException(400, "API 规范文件为空")
+        try:
+            validate_spec_content(content, name)
+        except ApiSpecError as exc:
+            raise HTTPException(400, str(exc))
+        task_id_pre = new_task_id()
+        stored = specs_dir / f"{task_id_pre}_{name}"
+        stored.write_bytes(content)
+        api_specs.append({"name": name, "stored_path": str(stored)})
+    if (apifox_project_id or "").strip() or (apifox_token or "").strip():
+        try:
+            content, name = fetch_apifox_openapi(apifox_project_id, apifox_token)
+        except ApiSpecError as exc:
+            raise HTTPException(400, f"Apifox 导出失败：{exc}")
+        stored = specs_dir / f"{new_task_id()}_{name}"
+        stored.write_bytes(content)
+        api_specs.append({"name": name, "stored_path": str(stored)})
 
     task_id = new_task_id()
     upload_ref: ProjectUpload | None = None
@@ -1266,6 +1500,8 @@ async def create_task(
         test_url=targets[0]["url"] if targets else "",
         test_targets=dump_targets(targets),
         instruction=instruction, web_search=web_search, timeout_disabled=timeout_disabled,
+        scope_mode=scope_mode, diff_base=diff_base,
+        api_specs=json.dumps(api_specs, ensure_ascii=False) if api_specs else "",
         model=model, report_lang="zh", status="pending",
     )
     db.add(task)
@@ -1275,7 +1511,8 @@ async def create_task(
         f"id={task_id} project={project_id} mode={scan_mode} model={model or 'default'} "
         f"source={source_type} repos={len(repo_refs)} branch={branch} upload={upload_ref.id if upload_ref else '-'} "
         f"targets={dump_targets(targets) if targets else '-'} instruction={'yes' if instruction else 'no'} "
-        f"web_search={'yes' if web_search else 'no'} timeout={'off' if timeout_disabled else 'default'}",
+        f"web_search={'yes' if web_search else 'no'} timeout={'off' if timeout_disabled else 'default'} "
+        f"scope={scope_mode or 'auto'} diff_base={diff_base or '-'} api_specs={len(api_specs)}",
         user=user,
     )
     run_scan.delay(task_id)
@@ -1679,6 +1916,69 @@ def cancel_task(task_id: str, request: Request, db: Session = Depends(get_db), u
     return {"ok": True, "status": task.status}
 
 
+class SteerBody(BaseModel):
+    message: str
+
+
+@app.post("/api/tasks/{task_id}/steer", dependencies=[Depends(require_user)])
+def steer_task(
+    task_id: str, body: SteerBody, request: Request,
+    db: Session = Depends(get_db), user: User = Depends(require_user),
+):
+    """扫描运行中转向：向智能体下发新指令。
+
+    实现方式：指令写入 Redis 标记，worker 轮询到后安全打断引擎进程，把转向指令
+    追加进 instruction 并以 --resume 从断点续扫（引擎把新指令注入根智能体会话，
+    参见 strix runner 的 resume_instruction）。转向重启不占用 LLM 失败重试次数。
+    """
+    task = _get_task_checked(db, task_id, user)
+    if task.status != "scanning":
+        raise HTTPException(400, "任务不在扫描运行中，无法转向")
+    message = (body.message or "").strip()
+    if not message:
+        raise HTTPException(400, "转向指令不能为空")
+    if len(message) > 2000:
+        raise HTTPException(400, "转向指令最长 2000 个字符")
+    if not request_steer(task_id, message):
+        raise HTTPException(503, "Redis 暂不可用，转向指令下达失败；请稍后重试")
+    _append_task_log(task, f"[steer] 收到转向指令：{message[:200]}{'…' if len(message) > 200 else ''}")
+    db.commit()
+    _audit(db, request, "task.steer", f"id={task_id} len={len(message)}", user=user)
+    return {"ok": True}
+
+
+@app.post("/api/tasks/{task_id}/resume", dependencies=[Depends(require_user)])
+def resume_task(task_id: str, request: Request, db: Session = Depends(get_db), user: User = Depends(require_user)):
+    """断点续扫：对已结束（失败/取消/完成）的任务以 --resume 从上次 run 断点继续。
+
+    复用任务自身的全部配置与工作区（源码/克隆在 run_scan 里幂等重建），把状态
+    复位为 pending 重新派发；run_scan 检测到 resume_count>0 时自动加 --resume。
+    """
+    task = _get_task_checked(db, task_id, user)
+    if task.status not in ("done", "failed", "cancelled"):
+        raise HTTPException(400, "任务仍在运行中，无需续扫")
+    if not (task.run_dir_name or "").strip():
+        raise HTTPException(400, "任务没有可恢复的 run 目录（扫描未产出运行数据），只能重新发起任务")
+    if not (user.llm_api_key or "").strip():
+        raise HTTPException(400, "尚未配置个人 AI 密钥；请先在「设置」中配置后再续扫")
+    task.resume_count = (task.resume_count or 0) + 1
+    task.status = "pending"
+    task.error = ""
+    task.finished_at = None
+    task.updated_at = datetime.now(timezone.utc)
+    clear_cancel(task_id)
+    clear_steer(task_id)
+    _append_task_log(
+        task,
+        f"[resume] 发起第 {task.resume_count} 次续扫：从 run「{task.run_dir_name}」断点恢复"
+        "（重试不重新计费已完成的轮次，tokens 累计）",
+    )
+    db.commit()
+    _audit(db, request, "task.resume", f"id={task_id} resume_count={task.resume_count}", user=user)
+    run_scan.delay(task_id)
+    return {"ok": True, "resume_count": task.resume_count, "status": "pending"}
+
+
 @app.post("/api/tasks/{task_id}/translate", dependencies=[Depends(require_user)])
 def translate_task(task_id: str, request: Request, db: Session = Depends(get_db), user: User = Depends(require_user)):
     """手动触发漏洞明细中文翻译（任务页按钮调用，流程内不再自动翻译）。
@@ -1785,6 +2085,8 @@ class ScheduleCreateBody(BaseModel):
     model: str = ""
     instruction: str = ""
     web_search: bool = False
+    scope_mode: str = ""  # "" / auto / diff / full
+    diff_base: str = ""
     repo_branches: str | list | None = None
     test_targets: str | list | None = None
     upload_id: str = ""
@@ -1816,8 +2118,16 @@ def create_schedule(
     instruction = body.instruction.strip()
     if len(instruction) > 4000:
         raise HTTPException(400, "instruction 最长 4000 个字符")
-    if body.web_search and not settings.web_search_mcp_url:
-        raise HTTPException(400, "平台未配置联网搜索端点（WEB_SEARCH_MCP_URL），请联系超管")
+    if body.web_search and not web_search_ready(db):
+        raise HTTPException(400, "平台未配置联网搜索端点（WEB_SEARCH_MCP_URL）或技能未启用，请联系超管")
+    scope_mode = (body.scope_mode or "").strip().lower()
+    if scope_mode not in ("", "auto", "diff", "full"):
+        raise HTTPException(400, "scope_mode 必须是 auto/diff/full 或留空")
+    diff_base = (body.diff_base or "").strip()
+    if diff_base and not re.fullmatch(r"[A-Za-z0-9._/-]{1,255}", diff_base):
+        raise HTTPException(400, "diff_base 只能包含字母数字 . _ / -（分支或 commit）")
+    if scope_mode != "diff":
+        diff_base = ""
     targets = _checked_targets(body.test_targets) if body.test_targets is not None else []
     repo_refs: list[dict] = []
     upload_id = ""
@@ -1836,6 +2146,7 @@ def create_schedule(
         id=new_schedule_id(), project_id=project_id, created_by=user.id,
         name=(body.name.strip() or "未命名计划")[:128], cron=cron, enabled=True,
         scan_mode=body.scan_mode, model=model, instruction=instruction, web_search=body.web_search,
+        scope_mode=scope_mode, diff_base=diff_base,
         repo_branches=json.dumps(repo_refs, ensure_ascii=False) if repo_refs else "",
         upload_id=upload_id or None,
         test_targets=dump_targets(targets) if targets else "",
@@ -1859,6 +2170,8 @@ class SchedulePatchBody(BaseModel):
     model: str | None = None  # None=不修改；""=改为触发时用平台默认
     instruction: str | None = None
     web_search: bool | None = None
+    scope_mode: str | None = None  # None=不修改；""/auto/diff/full
+    diff_base: str | None = None
     repo_branches: str | list | None = None
     test_targets: str | list | None = None
     upload_id: str | None = None
@@ -1898,9 +2211,21 @@ def patch_schedule(
             raise HTTPException(400, "instruction 最长 4000 个字符")
         sch.instruction = body.instruction.strip()
     if body.web_search is not None:
-        if body.web_search and not settings.web_search_mcp_url:
-            raise HTTPException(400, "平台未配置联网搜索端点（WEB_SEARCH_MCP_URL），请联系超管")
+        if body.web_search and not web_search_ready(db):
+            raise HTTPException(400, "平台未配置联网搜索端点（WEB_SEARCH_MCP_URL）或技能未启用，请联系超管")
         sch.web_search = body.web_search
+    if body.scope_mode is not None:
+        scope_mode = body.scope_mode.strip().lower()
+        if scope_mode not in ("", "auto", "diff", "full"):
+            raise HTTPException(400, "scope_mode 必须是 auto/diff/full 或留空")
+        sch.scope_mode = scope_mode
+        if scope_mode != "diff":
+            sch.diff_base = ""  # 范围退出 diff 时基线一并清掉，避免陈旧快照
+    if body.diff_base is not None:
+        diff_base = body.diff_base.strip()
+        if diff_base and not re.fullmatch(r"[A-Za-z0-9._/-]{1,255}", diff_base):
+            raise HTTPException(400, "diff_base 只能包含字母数字 . _ / -（分支或 commit）")
+        sch.diff_base = diff_base if (sch.scope_mode or "") == "diff" else ""
     if body.repo_branches is not None and project is not None and project.source_type == "git":
         repo_refs = _schedule_repo_refs(project, body.repo_branches)
         sch.repo_branches = json.dumps(repo_refs, ensure_ascii=False)

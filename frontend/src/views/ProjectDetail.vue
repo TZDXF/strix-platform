@@ -6,7 +6,7 @@ import {
   RadioGroupRoot, RadioGroupItem, RadioGroupIndicator,
   CheckboxRoot, CheckboxIndicator,
 } from 'reka-ui'
-import { api, type GitConfig, type GitRepoRef, type ProjectDetailData, type Schedule, type TestTarget, type User } from '../api'
+import { api, type GitConfig, type GitRepoRef, type ProjectDetailData, type Schedule, type SkillInfo, type TestTarget, type User } from '../api'
 import RepoListField from '../components/RepoListField.vue'
 import TargetListField from '../components/TargetListField.vue'
 import { toast } from '../toast'
@@ -34,9 +34,21 @@ interface RepoBranchSel {
 const form = ref({
   scanMode: 'quick', model: '', blackbox: false, testTargets: [] as TestTarget[], instruction: '',
   webSearch: false, timeoutDisabled: false,
+  scopeMode: '' as '' | 'auto' | 'diff' | 'full', diffBase: '',
+  apiSpecChoice: 'none' as 'none' | 'file' | 'apifox',
+  apiSpecFile: null as File | null, apiSpecName: '',
+  apifoxProjectId: '', apifoxToken: '',
   repos: [] as RepoBranchSel[],
   uploadChoice: 'new' as 'history' | 'new', uploadId: '', file: null as File | null, fileName: '',
 })
+
+// 平台技能库（已启用技能，只读展示在发起表单）
+const skills = ref<SkillInfo[]>([])
+
+function onApiSpecFile(e: Event) {
+  const f = (e.target as HTMLInputElement).files?.[0]
+  if (f) { form.value.apiSpecFile = f; form.value.apiSpecName = f.name }
+}
 
 // 各档位默认超时上限（与后端 config.py 的 timeout_* 默认值对应，仅作提示文案）
 const MODE_LIMITS: Record<string, string> = { quick: '2 小时', standard: '4 小时', deep: '8 小时' }
@@ -176,10 +188,16 @@ function openLaunch() {
   form.value.blackbox = defaults.length > 0
   form.value.webSearch = false  // 联网搜索默认不勾选
   form.value.timeoutDisabled = false  // 超时终止默认开启（按档位默认时长回收）
+  form.value.scopeMode = ''  // 代码扫描范围默认走引擎 auto
+  form.value.diffBase = ''
+  form.value.apiSpecChoice = 'none'  // API 规范目标默认不使用
+  form.value.apiSpecFile = null; form.value.apiSpecName = ''
+  form.value.apifoxProjectId = ''; form.value.apifoxToken = ''
   form.value.repos = (project.value?.git_repos || []).map(r => ({
     url: r.url, note: r.note, branch: '', branches: [], loaded: false, loading: false,
   }))
   loadModels()
+  api.listSkills().then(r => { skills.value = r.items }).catch(() => { skills.value = [] })
   if (isGit.value) loadRepoBranches()
   else if (project.value?.uploads.length) {
     form.value.uploadChoice = 'history'
@@ -195,6 +213,9 @@ async function launch() {
   if (f.blackbox && !targets.length) { toast.error('已勾选黑盒测试，请至少填写一个黑盒测试地址，或取消勾选仅做白盒扫描'); return }
   if (!isGit.value && f.uploadChoice === 'history' && !f.uploadId) { toast.error('请选择历史上传'); return }
   if (!isGit.value && f.uploadChoice === 'new' && !f.file) { toast.error('请选择 zip 压缩包'); return }
+  if (f.apiSpecChoice === 'file' && !f.apiSpecFile) { toast.error('请选择 API 规范文件（.json/.yaml/.yml）'); return }
+  if (f.apiSpecChoice === 'apifox' && !f.apifoxProjectId.trim()) { toast.error('请填写 Apifox 项目 ID'); return }
+  if (f.apiSpecChoice === 'apifox' && !f.apifoxToken.trim()) { toast.error('请填写 Apifox 访问令牌'); return }
   launching.value = true
   try {
     // 黑盒任务提交前逐个探测目标：不在允许清单的直接拦截；无法访问的汇总后确认一次，避免任务空跑
@@ -224,6 +245,11 @@ async function launch() {
       webSearch: f.webSearch,
       timeoutDisabled: f.timeoutDisabled,
       model: f.model,
+      scopeMode: f.scopeMode,
+      diffBase: f.scopeMode === 'diff' ? f.diffBase.trim() : '',
+      apifoxProjectId: f.apiSpecChoice === 'apifox' ? f.apifoxProjectId.trim() : '',
+      apifoxToken: f.apiSpecChoice === 'apifox' ? f.apifoxToken.trim() : '',
+      apiSpecFile: f.apiSpecChoice === 'file' ? f.apiSpecFile : null,
       uploadId: !isGit.value && f.uploadChoice === 'history' ? f.uploadId : '',
       file: !isGit.value && f.uploadChoice === 'new' ? f.file : null,
     })
@@ -272,6 +298,7 @@ const CRON_PRESETS = [
 const schedForm = ref({
   name: '', cron: '0 8 * * *', scanMode: 'quick', model: '',
   blackbox: false, testTargets: [] as TestTarget[], instruction: '', webSearch: false,
+  scopeMode: '' as '' | 'auto' | 'diff' | 'full', diffBase: '',
   repos: [] as RepoBranchSel[], uploadId: '',
 })
 
@@ -290,6 +317,8 @@ function openScheduleDialog(s?: Schedule) {
     testTargets: (s?.test_targets || (project.value?.default_test_targets || [])).map(t => ({ ...t })),
     instruction: s?.instruction || '',
     webSearch: s?.web_search || false,
+    scopeMode: (s?.scope_mode as '' | 'auto' | 'diff' | 'full') || '',
+    diffBase: s?.diff_base || '',
     repos: (s?.repo_branches?.length
       ? s.repo_branches
       : (project.value?.git_repos || []).map(r => ({ url: r.url, branch: '' }))
@@ -341,9 +370,11 @@ async function saveSchedule() {
       model: f.model,
       instruction: f.instruction.trim(),
       web_search: f.webSearch,
-      repoBranches: isGit.value ? f.repos.map(r => ({ url: r.url, branch: r.branch })) : [],
-      testTargets: f.blackbox ? targets : [],
-      uploadId: !isGit.value ? f.uploadId : '',
+      scope_mode: f.scopeMode,
+      diff_base: f.scopeMode === 'diff' ? f.diffBase.trim() : '',
+      repo_branches: isGit.value ? f.repos.map(r => ({ url: r.url, branch: r.branch })) : [],
+      test_targets: f.blackbox ? targets : [],
+      upload_id: !isGit.value ? f.uploadId : '',
     }
     if (editingSched.value) {
       await api.patchSchedule(editingSched.value.id, payload)
@@ -624,6 +655,64 @@ onUnmounted(() => clearInterval(timer))
                   不限时运行（关闭超时终止，{{ form.scanMode }} 档默认 {{ MODE_LIMITS[form.scanMode] || '-' }}，跑完为止，可手动取消）
                 </label>
               </div>
+              <template v-if="isGit">
+                <div>
+                  <label :class="label">代码扫描范围</label>
+                  <SelectRoot v-model="form.scopeMode">
+                    <SelectTrigger :class="selectTrigger"><SelectValue placeholder="auto（默认）" /></SelectTrigger>
+                    <SelectPortal>
+                      <SelectContent :class="selectContent" position="popper">
+                        <SelectViewport>
+                          <SelectItem value="auto" :class="selectItem"><SelectItemText>auto（引擎默认策略）</SelectItemText></SelectItem>
+                          <SelectItem value="diff" :class="selectItem"><SelectItemText>diff（仅扫相对基线的变更）</SelectItemText></SelectItem>
+                          <SelectItem value="full" :class="selectItem"><SelectItemText>full（全量代码）</SelectItemText></SelectItem>
+                        </SelectViewport>
+                      </SelectContent>
+                    </SelectPortal>
+                  </SelectRoot>
+                </div>
+                <div v-if="form.scopeMode === 'diff'">
+                  <label :class="label">diff 基线（分支或 commit）</label>
+                  <input v-model="form.diffBase" type="text" placeholder="origin/main（留空用仓库默认分支）" class="w-full rounded-md border border-border bg-panel2 px-2.5 py-2 font-mono text-[13.5px] text-text outline-none focus:border-accent" />
+                  <p :class="hint" class="!mt-1">增量扫描会用完整克隆解析基线历史，大仓库首次克隆较慢。</p>
+                </div>
+              </template>
+              <div class="col-span-2">
+                <label :class="label">API 规范目标（可选，与黑盒地址配合测试接口）</label>
+                <RadioGroupRoot v-model="form.apiSpecChoice" class="flex gap-4.5">
+                  <div class="flex items-center gap-1.5">
+                    <RadioGroupItem id="as-none" value="none" :class="radioItem">
+                      <RadioGroupIndicator class="h-2 w-2 rounded-full bg-accent" />
+                    </RadioGroupItem>
+                    <label for="as-none" class="cursor-pointer text-[13px] text-text">不使用</label>
+                  </div>
+                  <div class="flex items-center gap-1.5">
+                    <RadioGroupItem id="as-file" value="file" :class="radioItem">
+                      <RadioGroupIndicator class="h-2 w-2 rounded-full bg-accent" />
+                    </RadioGroupItem>
+                    <label for="as-file" class="cursor-pointer text-[13px] text-text">上传规范文件</label>
+                  </div>
+                  <div class="flex items-center gap-1.5">
+                    <RadioGroupItem id="as-apifox" value="apifox" :class="radioItem">
+                      <RadioGroupIndicator class="h-2 w-2 rounded-full bg-accent" />
+                    </RadioGroupItem>
+                    <label for="as-apifox" class="cursor-pointer text-[13px] text-text">Apifox 在线导出</label>
+                  </div>
+                </RadioGroupRoot>
+                <div v-if="form.apiSpecChoice === 'file'" class="mt-2">
+                  <input type="file" accept=".json,.yaml,.yml" class="w-full rounded-md border border-border bg-panel2 p-1.5 text-[13.5px] text-text file:mr-3 file:cursor-pointer file:rounded file:border-0 file:bg-accent/20 file:px-3 file:py-1 file:text-accent" @change="onApiSpecFile" />
+                  <p :class="hint" class="!mt-1">支持 OpenAPI/Swagger、Postman collection、Apifox 导出（≤20MB）。</p>
+                </div>
+                <div v-else-if="form.apiSpecChoice === 'apifox'" class="mt-2 grid grid-cols-2 gap-3">
+                  <div>
+                    <input v-model="form.apifoxProjectId" type="text" placeholder="Apifox 项目 ID（数字）" class="w-full rounded-md border border-border bg-panel2 px-2.5 py-2 text-[13.5px] text-text outline-none focus:border-accent" />
+                  </div>
+                  <div>
+                    <input v-model="form.apifoxToken" type="password" placeholder="API 访问令牌（仅本次导出使用）" autocomplete="new-password" class="w-full rounded-md border border-border bg-panel2 px-2.5 py-2 text-[13.5px] text-text outline-none focus:border-accent" />
+                  </div>
+                  <p :class="hint" class="col-span-2 !mt-0">项目设置 → 基本信息查看项目 ID；令牌在 Apifox「账号设置 → API 访问令牌」创建，平台只用于导出一次、不落库。</p>
+                </div>
+              </div>
               <div v-if="isGit" class="col-span-2">
                 <div class="mb-1.5 flex items-center gap-2.5">
                   <label :class="label" class="!mb-0">
@@ -736,6 +825,11 @@ onUnmounted(() => clearInterval(timer))
                   placeholder="聚焦的漏洞类型或测试要求，例如：&#10;Focus on IDOR and SQL injection.&#10;Use credentials admin:password123 for authenticated testing.&#10;重点检查 /api/v2 下的接口鉴权。"
                   class="w-full resize-y rounded-md border border-border bg-panel2 px-2.5 py-2 text-[13.5px] text-text outline-none focus:border-accent"
                 ></textarea>
+                <p v-if="skills.length" :class="hint" class="!mt-1.5">
+                  本次扫描已注入 {{ skills.length }} 个平台技能：
+                  <span class="font-mono">{{ skills.map(s => s.full_name).join('、') }}</span>
+                  （引擎按任务相关性自动加载，超管可在「系统设置 → 技能库」维护）
+                </p>
               </div>
             </div>
             <div class="mt-4 flex items-center gap-2.5">
@@ -803,6 +897,27 @@ onUnmounted(() => clearInterval(timer))
                   </SelectPortal>
                 </SelectRoot>
               </div>
+              <template v-if="isGit">
+                <div>
+                  <label :class="label">代码扫描范围</label>
+                  <SelectRoot v-model="schedForm.scopeMode">
+                    <SelectTrigger :class="selectTrigger"><SelectValue placeholder="auto（默认）" /></SelectTrigger>
+                    <SelectPortal>
+                      <SelectContent :class="selectContent" position="popper">
+                        <SelectViewport>
+                          <SelectItem value="auto" :class="selectItem"><SelectItemText>auto（引擎默认策略）</SelectItemText></SelectItem>
+                          <SelectItem value="diff" :class="selectItem"><SelectItemText>diff（仅扫相对基线的变更）</SelectItemText></SelectItem>
+                          <SelectItem value="full" :class="selectItem"><SelectItemText>full（全量代码）</SelectItemText></SelectItem>
+                        </SelectViewport>
+                      </SelectContent>
+                    </SelectPortal>
+                  </SelectRoot>
+                </div>
+                <div v-if="schedForm.scopeMode === 'diff'">
+                  <label :class="label">diff 基线（分支或 commit）</label>
+                  <input v-model="schedForm.diffBase" type="text" placeholder="origin/main（留空用仓库默认分支）" class="w-full rounded-md border border-border bg-panel2 px-2.5 py-2 font-mono text-[13.5px] text-text outline-none focus:border-accent" />
+                </div>
+              </template>
               <div v-if="isGit" class="col-span-2">
                 <div class="mb-1.5 flex items-center gap-2.5">
                   <label :class="[label, '!mb-0']">

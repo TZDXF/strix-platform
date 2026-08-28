@@ -35,6 +35,10 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         ("web_search", "BOOLEAN DEFAULT FALSE"),
         ("timeout_disabled", "BOOLEAN DEFAULT FALSE"),
         ("execution_events", "TEXT DEFAULT ''"),
+        ("scope_mode", "VARCHAR(8) DEFAULT ''"),
+        ("diff_base", "VARCHAR(255) DEFAULT ''"),
+        ("api_specs", "TEXT DEFAULT ''"),
+        ("resume_count", "INTEGER DEFAULT 0"),
     ],
     "findings": [
         ("poc_description", "TEXT DEFAULT ''"),
@@ -63,6 +67,8 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
     ],
     "schedules": [
         ("web_search", "BOOLEAN DEFAULT FALSE"),
+        ("scope_mode", "VARCHAR(8) DEFAULT ''"),
+        ("diff_base", "VARCHAR(255) DEFAULT ''"),
     ],
 }
 
