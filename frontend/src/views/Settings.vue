@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import {
   DialogRoot, DialogPortal, DialogOverlay, DialogContent, DialogTitle,
 } from 'reka-ui'
-import { api, updateStoredUser, type User, type GitConfig } from '../api'
+import { api, gitPlatformLabel, updateStoredUser, type User, type GitConfig } from '../api'
 import { toast } from '../toast'
 import { badge, btn, btnDanger, btnGhost, card, hint, h3, input, label, tableTd, tableTh } from '../ui'
 
@@ -86,22 +86,48 @@ async function clearEmail() {
 
 function fmtTime(iso: string | null) { return iso ? new Date(iso).toLocaleString('zh-CN', { hour12: false }) : '-' }
 
-// ---- 个人 Git 配置（GitLab）----
+// ---- 个人 Git 配置（GitLab / GitHub / Gitee）----
 const gitConfigs = ref<GitConfig[]>([])
-const gitForm = ref({ name: '', base_url: '', token: '' })
+const gitForm = ref({ name: '', platform: 'gitlab', base_url: '', token: '' })
 const savingGit = ref(false)
 const gitDialogOpen = ref(false)
 const editingGit = ref<GitConfig | null>(null) // null = 新增
 
+const PLATFORM_OPTIONS = [
+  { value: 'gitlab', label: 'GitLab' },
+  { value: 'github', label: 'GitHub' },
+  { value: 'gitee', label: 'Gitee' },
+] as const
+
+const baseUrlPlaceholder = computed(() =>
+  gitForm.value.platform === 'github' ? 'https://github.com（GitHub Enterprise 填实例地址）'
+    : gitForm.value.platform === 'gitee' ? 'https://gitee.com'
+      : 'http://192.168.1.3:12580')
+const tokenPlaceholder = computed(() =>
+  gitForm.value.platform === 'github' ? 'ghp_xxxx 或 github_pat_xxxx'
+    : gitForm.value.platform === 'gitee' ? 'Gitee 私人令牌'
+      : 'glpat-xxxx')
+const platformHint = computed(() =>
+  gitForm.value.platform === 'github' ? 'classic 令牌需勾选 repo 权限；fine-grained 令牌需授予目标仓库的 Contents 读取权限。'
+    : gitForm.value.platform === 'gitee' ? '在 Gitee「设置 → 私人令牌」生成，需勾选 projects 权限。'
+      : '需要 read_api 或 api scope（请在 GitLab 重新生成令牌时勾选）。')
+
+// 已知公有云站点自动切换平台（后端同样按域名强制校正）
+function onBaseUrlInput() {
+  const v = gitForm.value.base_url
+  if (/github\.com/i.test(v)) gitForm.value.platform = 'github'
+  else if (/gitee\.com/i.test(v)) gitForm.value.platform = 'gitee'
+}
+
 function openGitCreate() {
   editingGit.value = null
-  gitForm.value = { name: '', base_url: '', token: '' }
+  gitForm.value = { name: '', platform: 'gitlab', base_url: '', token: '' }
   gitDialogOpen.value = true
 }
 
 function openGitEdit(c: GitConfig) {
   editingGit.value = c
-  gitForm.value = { name: c.name, base_url: c.base_url, token: '' }
+  gitForm.value = { name: c.name, platform: c.platform || 'gitlab', base_url: c.base_url, token: '' }
   gitDialogOpen.value = true
 }
 
@@ -120,6 +146,7 @@ async function saveGitConfig() {
     if (editingGit.value) {
       await api.updateGitConfig(editingGit.value.id, {
         name: gitForm.value.name.trim(),
+        platform: gitForm.value.platform,
         base_url: gitForm.value.base_url.trim(),
         token: gitForm.value.token.trim(),
       })
@@ -127,6 +154,7 @@ async function saveGitConfig() {
     } else {
       await api.createGitConfig({
         name: gitForm.value.name.trim(),
+        platform: gitForm.value.platform,
         base_url: gitForm.value.base_url.trim(),
         token: gitForm.value.token.trim(),
       })
@@ -252,9 +280,9 @@ onMounted(() => {
       </div>
     </div>
 
-    <!-- 个人 Git 配置（GitLab） -->
+    <!-- 个人 Git 配置（GitLab / GitHub / Gitee） -->
     <div :class="card">
-      <h3 :class="h3">Git 配置（GitLab）</h3>
+      <h3 :class="h3">Git 配置（GitLab / GitHub / Gitee）</h3>
       <div class="mt-2 flex items-center gap-2.5">
         <span :class="badge + (gitConfigs.length ? ' bg-ok/15 text-ok' : ' bg-border/30 text-muted')">
           {{ gitConfigs.length ? `已配置 ${gitConfigs.length} 个` : '未配置' }}
@@ -267,6 +295,7 @@ onMounted(() => {
           <thead>
             <tr>
               <th :class="tableTh">名称</th>
+              <th :class="tableTh">平台</th>
               <th :class="tableTh">服务地址</th>
               <th :class="tableTh">添加时间</th>
               <th :class="tableTh"></th>
@@ -275,6 +304,9 @@ onMounted(() => {
           <tbody>
             <tr v-for="c in gitConfigs" :key="c.id">
               <td :class="tableTd + ' font-semibold'">{{ c.name }}</td>
+              <td :class="tableTd">
+                <span class="rounded-full bg-accent/15 px-2 py-0.5 text-[10.5px] font-semibold text-accent">{{ gitPlatformLabel(c.platform) }}</span>
+              </td>
               <td :class="tableTd"><span class="font-mono text-[12.5px]">{{ c.base_url }}</span></td>
               <td :class="tableTd + ' text-muted'">{{ fmtTime(c.created_at) }}</td>
               <td :class="tableTd + ' text-right'">
@@ -297,21 +329,33 @@ onMounted(() => {
           <DialogTitle class="mb-4 text-base font-semibold text-text">{{ editingGit ? '编辑 Git 配置' : '添加 Git 配置' }}</DialogTitle>
           <div class="grid gap-3.5">
             <div>
+              <label :class="label">Git 平台</label>
+              <div class="flex gap-2">
+                <button
+                  v-for="o in PLATFORM_OPTIONS" :key="o.value" type="button"
+                  class="cursor-pointer rounded-md px-3.5 py-1.5 text-xs font-semibold transition-colors"
+                  :class="gitForm.platform === o.value ? 'bg-accent text-white' : 'border border-border text-muted hover:border-accent hover:text-accent'"
+                  @click="gitForm.platform = o.value"
+                >{{ o.label }}</button>
+              </div>
+            </div>
+            <div>
               <label :class="label">配置名称（可选，默认取令牌用户名）</label>
-              <input v-model="gitForm.name" type="text" placeholder="内网 GitLab" :class="input" />
+              <input v-model="gitForm.name" type="text" placeholder="内网 GitLab / GitHub 账号" :class="input" />
             </div>
             <div>
               <label :class="label">Git 服务地址</label>
-              <input v-model="gitForm.base_url" type="text" placeholder="http://192.168.1.3:12580" :class="input" />
+              <input v-model="gitForm.base_url" type="text" :placeholder="baseUrlPlaceholder" :class="input" @input="onBaseUrlInput" />
             </div>
             <div>
               <label :class="label">访问令牌（Personal Access Token）</label>
               <input
                 v-model="gitForm.token" type="password"
-                :placeholder="editingGit ? '不修改请留空' : 'glpat-xxxx'"
+                :placeholder="editingGit ? '不修改请留空' : tokenPlaceholder"
                 :class="input" @keyup.enter="saveGitConfig"
               />
-              <div v-if="editingGit" class="mt-1 text-xs text-muted">留空表示继续使用已保存的令牌；修改地址或令牌时会重新验证。</div>
+              <div class="mt-1 text-xs text-muted">{{ platformHint }}</div>
+              <div v-if="editingGit" class="mt-1 text-xs text-muted">留空表示继续使用已保存的令牌；修改地址、平台或令牌时会重新验证。</div>
             </div>
             <div class="mt-1 flex items-center justify-end gap-2.5">
               <button :class="btnGhost" :disabled="savingGit" @click="gitDialogOpen = false">取消</button>

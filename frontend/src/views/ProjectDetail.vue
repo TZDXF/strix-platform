@@ -6,7 +6,7 @@ import {
   RadioGroupRoot, RadioGroupItem, RadioGroupIndicator,
   CheckboxRoot, CheckboxIndicator,
 } from 'reka-ui'
-import { api, type GitConfig, type GitRepoRef, type ProjectDetailData, type Schedule, type SkillInfo, type TestTarget, type User } from '../api'
+import { api, gitPlatformLabel, type GitConfig, type GitRepoRef, type ProjectDetailData, type Schedule, type SkillInfo, type TestTarget, type User } from '../api'
 import RepoListField from '../components/RepoListField.vue'
 import TargetListField from '../components/TargetListField.vue'
 import { toast } from '../toast'
@@ -1046,7 +1046,7 @@ onUnmounted(() => clearInterval(timer))
                             <SelectItemText>不绑定（按已存令牌快照 / 公开仓库）</SelectItemText>
                           </SelectItem>
                           <SelectItem v-for="c in gitConfigs" :key="c.id" :value="c.id" :class="selectItem">
-                            <SelectItemText>{{ c.name }}（{{ c.base_url }}）</SelectItemText>
+                            <SelectItemText>{{ c.name }}（{{ gitPlatformLabel(c.platform) }} · {{ c.base_url }}）</SelectItemText>
                           </SelectItem>
                         </SelectViewport>
                       </SelectContent>

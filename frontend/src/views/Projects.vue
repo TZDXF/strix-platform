@@ -4,7 +4,7 @@ import {
   DialogRoot, DialogPortal, DialogOverlay, DialogContent, DialogTitle,
   SelectRoot, SelectTrigger, SelectValue, SelectPortal, SelectContent, SelectViewport, SelectItem, SelectItemText,
 } from 'reka-ui'
-import { api, type GitConfig, type GitProject, type GitRepoRef, type Project, type TestTarget, type User } from '../api'
+import { api, gitPlatformLabel, type GitConfig, type GitProject, type GitRepoRef, type Project, type TestTarget, type User } from '../api'
 import RepoListField from '../components/RepoListField.vue'
 import TargetListField from '../components/TargetListField.vue'
 import { toast } from '../toast'
@@ -34,7 +34,7 @@ const selectTrigger = 'flex w-full items-center justify-between rounded-md borde
 const selectItem = 'cursor-pointer rounded-md px-2.5 py-1.5 text-[13.5px] text-text data-highlighted:bg-accent/15 data-highlighted:outline-none'
 const selectContent = 'z-50 max-h-72 min-w-[var(--reka-select-trigger-width)] overflow-hidden rounded-md border border-border bg-panel2 py-1 shadow-lg'
 
-// ---- 个人 Git 配置导入（GitLab） ----
+// ---- 个人 Git 配置导入（GitLab / GitHub / Gitee） ----
 const gitConfigs = ref<GitConfig[]>([])
 const gitMode = ref<'import' | 'manual'>('manual') // 有配置时默认导入，无配置只能手动
 const selectedConfig = ref('') // GitConfig.id
@@ -153,7 +153,7 @@ async function create() {
   }
   creating.value = true
   try {
-    // 仓库列表：导入模式取自所选 GitLab 仓库（可多选），手动模式取表单（丢弃空行，携带逐仓库令牌）
+    // 仓库列表：导入模式取自所选 Git 配置的仓库（可多选），手动模式取表单（丢弃空行，携带逐仓库令牌）
     const repos: GitRepoRef[] = form.value.source_type === 'git' && gitMode.value === 'import'
       ? selectedRepos.value.map(p => ({ url: (p.http_url_to_repo || p.web_url).trim(), note: '' }))
       : form.value.git_repos
@@ -344,7 +344,7 @@ onMounted(() => {
                           <SelectContent :class="selectContent" position="popper">
                             <SelectViewport>
                               <SelectItem v-for="c in gitConfigs" :key="c.id" :value="c.id" :class="selectItem">
-                                <SelectItemText>{{ c.name }}（{{ c.base_url }}）</SelectItemText>
+                                <SelectItemText>{{ c.name }}（{{ gitPlatformLabel(c.platform) }} · {{ c.base_url }}）</SelectItemText>
                               </SelectItem>
                             </SelectViewport>
                           </SelectContent>

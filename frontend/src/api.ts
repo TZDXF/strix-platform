@@ -409,9 +409,15 @@ export interface UserPatch {
 export interface GitConfig {
   id: string
   name: string
+  platform: string // gitlab | github | gitee
   base_url: string
   has_token: boolean
   created_at: string | null
+}
+
+// 平台标识 → 展示名（存量数据无 platform 时按 GitLab 处理）
+export function gitPlatformLabel(platform: string | undefined | null): string {
+  return platform === 'github' ? 'GitHub' : platform === 'gitee' ? 'Gitee' : 'GitLab'
 }
 
 export interface MailSettings {
@@ -498,11 +504,11 @@ export const api = {
   clearLlmKey: () => request<User>('DELETE', '/api/me/llm-key'),
   setEmail: (email: string) => request<User>('PUT', '/api/me/email', { json: { email } }),
 
-  // 个人 Git 配置（GitLab）
+  // 个人 Git 配置（GitLab / GitHub / Gitee）
   listGitConfigs: () => request<{ items: GitConfig[] }>('GET', '/api/git-configs'),
-  createGitConfig: (c: { name?: string; base_url: string; token: string }) =>
+  createGitConfig: (c: { name?: string; platform?: string; base_url: string; token: string }) =>
     request<GitConfig>('POST', '/api/git-configs', { json: c }),
-  updateGitConfig: (id: string, c: { name?: string; base_url?: string; token?: string }) =>
+  updateGitConfig: (id: string, c: { name?: string; platform?: string; base_url?: string; token?: string }) =>
     request<GitConfig>('PATCH', `/api/git-configs/${id}`, { json: c }),
   deleteGitConfig: (id: string) => request<{ ok: boolean }>('DELETE', `/api/git-configs/${id}`),
   listGitProjects: (configId: string) =>

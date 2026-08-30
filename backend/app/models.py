@@ -73,12 +73,13 @@ class Project(Base):
 
 
 class GitConfig(Base):
-    """用户个人 Git 服务配置（GitLab）：保存服务地址与访问令牌，创建项目时可拉取仓库列表。"""
+    """用户个人 Git 服务配置（GitLab / GitHub / Gitee）：保存服务地址与访问令牌，创建项目时可拉取仓库列表。"""
 
     __tablename__ = "git_configs"
 
     id = Column(String(32), primary_key=True)  # uuid4 hex
     user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    platform = Column(String(16), default="gitlab")  # gitlab | github | gitee（github.com/gitee.com 按域名强制校正）
     name = Column(String(128), default="")  # 显示名，如「内网 GitLab」
     base_url = Column(Text, default="")  # 如 http://192.168.1.3:12580
     token = Column(Text, default="")  # PAT 明文，仅后端使用，接口永不回显

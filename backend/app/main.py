@@ -34,7 +34,14 @@ from .auth import (
 from .cancel import clear_cancel, clear_steer, request_cancel, request_steer
 from .config import get_settings
 from .db import get_db, init_db
-from .gitlab import GitLabError, list_projects as gitlab_list_projects, normalize_base_url, same_host, verify_token
+from .gitproviders import (
+    GitProviderError,
+    list_projects as provider_list_projects,
+    normalize_base_url,
+    resolve_platform,
+    same_host,
+    verify_token,
+)
 from .llm_models import default_model, discover_models, platform_models, seed_platform_models, valid_model_name
 from .apispec import ApiSpecError, fetch_apifox_openapi, safe_spec_name, validate_spec_content
 from .skills import (
@@ -749,13 +756,14 @@ def admin_save_scan_settings(
     return {"scan_concurrency": body.scan_concurrency, "max_concurrency": WORKER_POOL_SIZE}
 
 
-# ===================== 个人 Git 配置（GitLab） =====================
+# ===================== 个人 Git 配置（GitLab / GitHub / Gitee） =====================
 
 
 def _git_config_out(c: GitConfig) -> dict:
     return {
         "id": c.id,
         "name": c.name or c.base_url,
+        "platform": c.platform or "gitlab",
         "base_url": c.base_url,
         "has_token": bool(c.token),
         "created_at": c.created_at.isoformat() if c.created_at else None,
@@ -777,13 +785,14 @@ def list_git_configs(user: User = Depends(require_user), db: Session = Depends(g
 
 class GitConfigCreateBody(BaseModel):
     name: str = ""
+    platform: str = "gitlab"  # gitlab | github | gitee（github.com/gitee.com 按域名强制校正）
     base_url: str
     token: str
 
 
 @app.post("/api/git-configs", dependencies=[Depends(require_user)])
 def create_git_config(body: GitConfigCreateBody, request: Request, user: User = Depends(require_user), db: Session = Depends(get_db)):
-    """保存个人 Git 服务配置；保存前真实验证令牌（调 /api/v4/user），无效直接报错。"""
+    """保存个人 Git 服务配置；保存前按平台真实验证令牌（如 GitLab 调 /api/v4/user），无效直接报错。"""
     token = body.token.strip()
     if not token:
         raise HTTPException(400, "访问令牌不能为空")
@@ -791,16 +800,14 @@ def create_git_config(body: GitConfigCreateBody, request: Request, user: User = 
         raise HTTPException(400, "令牌过长")
     try:
         base_url = normalize_base_url(body.base_url)
-    except GitLabError as exc:
-        raise HTTPException(400, str(exc))
-    try:
-        info = verify_token(base_url, token)
-    except GitLabError as exc:
+        platform = resolve_platform(body.platform.strip() or "gitlab", base_url)
+        info = verify_token(platform, base_url, token)
+    except GitProviderError as exc:
         raise HTTPException(400, str(exc))
     config = GitConfig(
         id=uuid.uuid4().hex, user_id=user.id,
         name=(body.name.strip() or info.get("username", ""))[:128],
-        base_url=base_url, token=token,
+        platform=platform, base_url=base_url, token=token,
     )
     db.add(config)
     db.commit()
@@ -810,6 +817,7 @@ def create_git_config(body: GitConfigCreateBody, request: Request, user: User = 
 
 class GitConfigPatchBody(BaseModel):
     name: str = ""
+    platform: str = ""  # 非空=切换平台（与地址/令牌一并重新验证）
     base_url: str = ""
     token: str = ""
 
@@ -821,23 +829,26 @@ def patch_git_config(config_id: str, body: GitConfigPatchBody, request: Request,
     if body.base_url.strip():
         try:
             base_url = normalize_base_url(body.base_url)
-        except GitLabError as exc:
+        except GitProviderError as exc:
             raise HTTPException(400, str(exc))
     token = body.token.strip()
     if len(token) > 512:
         raise HTTPException(400, "令牌过长")
     if body.name.strip():
         config.name = body.name.strip()[:128]
-    if base_url != config.base_url or token:
-        # 地址或令牌有变化时，用新令牌（未填则用旧令牌）对新地址做真实验证
+    platform = body.platform.strip() or (config.platform or "gitlab")
+    if base_url != config.base_url or token or platform != (config.platform or "gitlab"):
+        # 地址 / 令牌 / 平台有变化时，用新令牌（未填则用旧令牌）对新地址做真实验证
         try:
-            info = verify_token(base_url, token or config.token)
-        except GitLabError as exc:
+            platform = resolve_platform(platform, base_url)
+            info = verify_token(platform, base_url, token or config.token)
+        except GitProviderError as exc:
             raise HTTPException(400, str(exc))
         config.base_url = base_url
+        config.platform = platform
         if token:
             config.token = token
-        _audit(db, request, "git_config.token_update", f"id={config_id} base_url={base_url} user={info.get('username')}", user=user)
+        _audit(db, request, "git_config.token_update", f"id={config_id} platform={platform} base_url={base_url} user={info.get('username')}", user=user)
     db.commit()
     _audit(db, request, "git_config.patch", f"id={config_id}", user=user)
     return _git_config_out(config)
@@ -858,8 +869,8 @@ def git_config_projects(config_id: str, request: Request, user: User = Depends(r
     """列出该 Git 服务下当前用户可见的仓库（带组织/命名空间信息），供创建项目时选择。"""
     config = _get_git_config_checked(db, config_id, user)
     try:
-        items = gitlab_list_projects(config.base_url, config.token)
-    except GitLabError as exc:
+        items = provider_list_projects(config.platform or "gitlab", config.base_url, config.token)
+    except GitProviderError as exc:
         raise HTTPException(400, str(exc))
     _audit(db, request, "git_config.list_projects", f"id={config_id} count={len(items)}", user=user)
     return {"items": items}

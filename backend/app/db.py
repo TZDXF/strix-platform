@@ -70,6 +70,9 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         ("scope_mode", "VARCHAR(8) DEFAULT ''"),
         ("diff_base", "VARCHAR(255) DEFAULT ''"),
     ],
+    "git_configs": [
+        ("platform", "VARCHAR(16) DEFAULT 'gitlab'"),
+    ],
 }
 
 

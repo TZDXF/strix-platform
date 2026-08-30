@@ -162,7 +162,7 @@ def repo_credential(
     bound_config 为 (base_url, token)：绑定配置换令牌后所有同域项目自动跟随，无需改项目；
     配置被删或失效时由调用方传 None，回退到快照兜底。
     """
-    from .gitlab import same_host
+    from .gitproviders import same_host
 
     if bound_config and bound_config[1] and same_host(bound_config[0], url):
         return "token", bound_config[1]
