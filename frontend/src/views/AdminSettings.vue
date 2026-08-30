@@ -1,10 +1,38 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { api, type PlatformModel, type MailSettings, type SkillInfo } from '../api'
+import { api, type PlatformModel, type MailSettings, type ScanSettings, type SkillInfo } from '../api'
 import { toast } from '../toast'
 import { badge, btn, btnDanger, btnGhost, card, hint, h3, input, label, tableTd, tableTh } from '../ui'
 
 function fmtTime(iso: string | null) { return iso ? new Date(iso).toLocaleString('zh-CN', { hour12: false }) : '-' }
+
+// ---- 扫描并发 ----
+const scanSettings = ref<ScanSettings | null>(null)
+const scanConcurrency = ref(2)
+const savingScan = ref(false)
+
+async function loadScanSettings() {
+  try {
+    const s = await api.getScanSettings()
+    scanSettings.value = s
+    scanConcurrency.value = s.scan_concurrency
+  } catch (e) { toast.error((e as Error).message) }
+}
+
+async function saveScanSettings() {
+  const max = scanSettings.value?.max_concurrency ?? 8
+  const n = Number(scanConcurrency.value)
+  if (!Number.isInteger(n) || n < 1 || n > max) {
+    toast.error(`并行扫描数需为 1-${max} 之间的整数`); return
+  }
+  savingScan.value = true
+  try {
+    const s = await api.saveScanSettings({ scan_concurrency: n })
+    scanSettings.value = s
+    scanConcurrency.value = s.scan_concurrency
+    toast.success('扫描并发已保存，立即生效。')
+  } catch (e) { toast.error((e as Error).message) } finally { savingScan.value = false }
+}
 
 // ---- 平台模型管理 ----
 const models = ref<PlatformModel[]>([])
@@ -209,6 +237,7 @@ async function removeSkill(s: SkillInfo) {
 }
 
 onMounted(() => {
+  loadScanSettings()
   loadModels()
   loadMail()
   loadSkills()
@@ -217,6 +246,26 @@ onMounted(() => {
 
 <template>
   <div class="grid gap-4">
+    <!-- 扫描并发 -->
+    <div :class="card">
+      <h3 :class="h3">扫描并发</h3>
+      <p :class="hint">
+        允许同时执行的扫描任务数（默认 2）。排队超出的任务自动等待空位（列表中保持「排队中」，
+        任务日志会提示槽位占用），调整立即生效，无需重启 worker。上限为 worker 线程池硬顶
+        {{ scanSettings?.max_concurrency ?? 8 }}；并发越高，宿主机 CPU/内存与 LLM 网关压力越大。
+      </p>
+      <div class="mt-3 flex flex-wrap items-end gap-2.5">
+        <div class="w-[220px]">
+          <label :class="label">最大并行扫描数（1-{{ scanSettings?.max_concurrency ?? 8 }}）</label>
+          <input
+            v-model.number="scanConcurrency" type="number" min="1"
+            :max="scanSettings?.max_concurrency ?? 8" :class="input"
+          />
+        </div>
+        <button :class="btn" :disabled="savingScan" @click="saveScanSettings">{{ savingScan ? '保存中…' : '保存' }}</button>
+      </div>
+    </div>
+
     <!-- 邮件提醒设置 -->
     <div :class="card">
       <div class="flex items-center gap-2.5">

@@ -62,7 +62,8 @@ docker-compose.yml  postgres + redis + rustfs + api + worker + frontend
     生成事件时间线（引擎启停 / 智能体派生与收工 / 工具调用 / 漏洞落盘 / 告警错误），
     播放器支持倍速播放、时间轴拖动定位、执行密度图、各智能体并发泳道与事件流筛选；
     工作区日志被清理后自动回退解析产物 zip 中的存档（解析结果缓存入库）。
-13. **系统设置页（仅超管）**：集中管理平台级配置——平台模型管理（网关密钥查询可用模型后加入平台、
+13. **系统设置页（仅超管）**：集中管理平台级配置——扫描并发（最大并行扫描数，默认 2，
+    排队超出的任务自动等空位，调整即时生效无需重启）、平台模型管理（网关密钥查询可用模型后加入平台、
     指定默认模型）、技能库管理与邮件提醒（SMTP 服务器/端口/加密方式/发件人，可真实发送测试邮件验证连通）。
 14. **邮件提醒**：超管在「系统设置」配置 SMTP 后，扫描任务完成/失败时平台自动向创建者
     在「个人设置」填写的通知邮箱发送结果摘要邮件（严重度分布、耗时、失败原因、任务链接）。
@@ -81,7 +82,7 @@ cp phase0/.env .env      # 或按下表配置
 cd backend
 uv sync
 uv run uvicorn app.main:app --port 8000
-uv run celery -A app.celery_app.celery_app worker --pool=solo --beat --loglevel=info   # Windows 必须 --pool=solo；--beat 驱动定时扫描
+uv run celery -A app.celery_app.celery_app worker --beat --loglevel=info   # 线程池与并发硬顶见 app/celery_app.py；--beat 驱动定时扫描
 
 # 前端（API_PROXY 可覆盖代理目标，默认 http://localhost:8000）
 cd frontend && npm install && npm run dev   # http://localhost:5173

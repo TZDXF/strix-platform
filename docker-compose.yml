@@ -76,7 +76,9 @@ services:
     build: ./backend
     entrypoint: ["python", "-m", "app.entrypoint"]
     # --beat：内嵌 celery beat，每分钟轮询到期定时扫描计划（见 app/schedules.py）
-    command: celery -A app.celery_app.celery_app worker --pool=solo --beat --loglevel=info -n worker1
+    # 线程池与并发硬顶在 app/celery_app.py（WORKER_POOL_SIZE）；实际并行扫描数
+    # 由系统设置 scan_concurrency 实时控制（run_scan 闸门），调整无需重启
+    command: celery -A app.celery_app.celery_app worker --beat --loglevel=info -n worker1
     environment:
       <<: *backend_env
       # strix 在容器内运行时，沙箱须加入 worker 所在网络，Caido 代理走容器 IP 直连；

@@ -444,6 +444,11 @@ export interface MailSettingsPayload {
   notify_failed: boolean
 }
 
+export interface ScanSettings {
+  scan_concurrency: number
+  max_concurrency: number
+}
+
 export interface GitNamespace {
   kind: string // group（组织）| user（个人）
   name: string
@@ -522,6 +527,8 @@ export const api = {
   // 系统设置：邮件提醒（超管）
   getMailSettings: () => request<MailSettings>('GET', '/api/admin/mail-settings'),
   saveMailSettings: (s: MailSettingsPayload) => request<MailSettings>('PUT', '/api/admin/mail-settings', { json: s }),
+  getScanSettings: () => request<ScanSettings>('GET', '/api/admin/scan-settings'),
+  saveScanSettings: (s: { scan_concurrency: number }) => request<ScanSettings>('PUT', '/api/admin/scan-settings', { json: s }),
   testMailSettings: (to: string) =>
     request<{ ok: boolean; detail: string }>('POST', '/api/admin/mail-settings/test', { json: { to } }),
 

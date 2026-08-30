@@ -79,8 +79,9 @@ from .targets import (
     probe_target,
 )
 from .tasklog import append_log as _append_task_log
-from .tasks import new_task_id, run_scan
+from .tasks import get_scan_concurrency, new_task_id, run_scan, set_scan_concurrency
 from .translate import translate_findings_task
+from .celery_app import WORKER_POOL_SIZE
 
 settings = get_settings()
 
@@ -719,6 +720,33 @@ def admin_test_mail_settings(
         raise HTTPException(400, f"发送失败：{exc}")
     _audit(db, request, "mail.settings_test", f"to={to} from={sender}", user=admin)
     return {"ok": True, "detail": f"测试邮件已发送至 {to}"}
+
+
+# ===================== 系统设置：扫描并发（仅超管） =====================
+
+
+class ScanSettingsBody(BaseModel):
+    scan_concurrency: int
+
+
+@app.get("/api/admin/scan-settings", dependencies=[Depends(require_admin)])
+def admin_get_scan_settings(db: Session = Depends(get_db)):
+    return {
+        "scan_concurrency": get_scan_concurrency(db),
+        "max_concurrency": WORKER_POOL_SIZE,  # worker 线程池硬顶，设置不得超过
+    }
+
+
+@app.put("/api/admin/scan-settings", dependencies=[Depends(require_admin)])
+def admin_save_scan_settings(
+    body: ScanSettingsBody, request: Request,
+    db: Session = Depends(get_db), admin: User = Depends(require_admin),
+):
+    if not 1 <= body.scan_concurrency <= WORKER_POOL_SIZE:
+        raise HTTPException(400, f"并行扫描数需在 1-{WORKER_POOL_SIZE} 之间")
+    set_scan_concurrency(db, body.scan_concurrency, user_id=admin.id)
+    _audit(db, request, "scan.settings_save", f"scan_concurrency={body.scan_concurrency}", user=admin)
+    return {"scan_concurrency": body.scan_concurrency, "max_concurrency": WORKER_POOL_SIZE}
 
 
 # ===================== 个人 Git 配置（GitLab） =====================

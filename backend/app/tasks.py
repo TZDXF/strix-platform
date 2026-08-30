@@ -4,21 +4,22 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sqlalchemy import delete
+from sqlalchemy import delete, func, select
 
 from .artifacts import archive_run
 from .cancel import cancel_requested, clear_cancel, clear_steer, pop_steer
-from .celery_app import celery_app
+from .celery_app import WORKER_POOL_SIZE, celery_app
 from .config import get_settings
 from .db import SessionLocal
 from .llm_models import default_model
 from .mailer import notify_task_finished
-from .models import Finding, GitConfig, Project, ProjectUpload, Task, User
+from .models import Finding, GitConfig, Project, ProjectUpload, SystemSetting, Task, User
 from .runner import execute_scan, read_run_artifacts
 from .skills import materialize_skills, web_search_pointer
 from .sources import (
@@ -223,6 +224,65 @@ def _scan_error_detail(scan_dir: Path) -> str:
     return ""
 
 
+# ---- 并行扫描闸门 ----
+
+K_SCAN_CONCURRENCY = "scan_concurrency"  # system_settings 键：最大并行扫描数
+SCAN_CONCURRENCY_DEFAULT = 2             # 未配置时的默认并行扫描数
+SCAN_QUEUE_RETRY_SEC = 30                # 槽位满时的重排队间隔（秒）
+_ACTIVE_SCAN_STATUSES = ("fetching", "scanning", "parsing")
+# 单 worker 内并发线程取任务的准入串行化；多 worker 副本间仅由 DB 计数兜底，可能偶发超 1
+_SCAN_ADMISSION_LOCK = threading.Lock()
+
+
+def get_scan_concurrency(db) -> int:
+    """最大并行扫描数（超管在系统设置页维护；每次准入现查，改动即时生效无需重启）。"""
+    row = db.get(SystemSetting, K_SCAN_CONCURRENCY)
+    try:
+        value = int((row.value or "").strip()) if row is not None else 0
+    except ValueError:
+        value = 0
+    if value <= 0:
+        return SCAN_CONCURRENCY_DEFAULT
+    return min(WORKER_POOL_SIZE, max(1, value))
+
+
+def set_scan_concurrency(db, value: int, user_id: int | None) -> None:
+    row = db.get(SystemSetting, K_SCAN_CONCURRENCY)
+    if row is None:
+        row = SystemSetting(key=K_SCAN_CONCURRENCY, value=str(value), updated_by=user_id)
+        db.add(row)
+    else:
+        row.value = str(value)
+        row.updated_by = user_id
+    db.commit()
+
+
+def _admit_scan_slot(db, task) -> bool:
+    """并行扫描闸门：占用一个扫描槽位返回 True；槽位满返回 False（任务保持排队）。
+
+    排队任务状态保持 pending、不占用 worker 线程，由调用方定时重排队；
+    重投递的运行态消息（如 worker 重启后的 acks_late 重投递、续扫）视为已占槽直接放行。
+    """
+    if task.status in _ACTIVE_SCAN_STATUSES:
+        return True
+    limit = get_scan_concurrency(db)
+    with _SCAN_ADMISSION_LOCK:
+        active = db.execute(
+            select(func.count(Task.id)).where(
+                Task.status.in_(_ACTIVE_SCAN_STATUSES), Task.id != task.id,
+            )
+        ).scalar() or 0
+        if active >= limit:
+            wait_line = f"[queue] 并行扫描槽位已满（{active}/{limit}），任务继续排队，稍后自动重试"
+            if not (task.log or "").rstrip().endswith(wait_line):  # 末行相同不重复记，避免刷屏
+                _log(task, wait_line)
+                db.commit()
+            return False
+        task.started_at = datetime.now(timezone.utc)
+        _set_status(db, task, "fetching")  # 占位即置运行态，其他准入线程的计数立即可见
+        return True
+
+
 @celery_app.task(name="run_scan", bind=True, max_retries=1)
 def run_scan(self, task_id: str) -> dict:
     s = get_settings()
@@ -239,6 +299,11 @@ def run_scan(self, task_id: str) -> dict:
         result = _finish_as_cancelled(db, task, task_id, "任务在排队等待期间被取消")
         db.close()
         return result
+    if not _admit_scan_slot(db, task):
+        # 槽位满：状态保持 pending、不占 worker 线程，稍后自动重排队等空位
+        db.close()
+        run_scan.apply_async(args=[task_id], countdown=SCAN_QUEUE_RETRY_SEC)
+        return {"task_id": task_id, "queued": True}
     clear_steer(task_id)  # 防御：清理上次运行未消费的转向标记，避免新任务被旧指令误转向
 
     project = db.get(Project, task.project_id) if task.project_id else None
@@ -268,8 +333,7 @@ def run_scan(self, task_id: str) -> dict:
     task.attempts = 0
 
     try:
-        task.started_at = datetime.now(timezone.utc)
-        _set_status(db, task, "fetching")
+        # 状态与 started_at 已在准入闸门（_admit_scan_slot）置位
         repo_refs = effective_repo_branches(task.repo_branches, task.source_ref, task.branch or "")
         scope_mode = (task.scope_mode or "").strip()
         diff_base = (task.diff_base or "").strip()
