@@ -112,6 +112,12 @@ export interface Finding {
   endpoint: string
   target: string
   has_poc: boolean
+  /** 验证方式：dynamic=动态验证 / static=静态分析（原始 finding 的 finding_class） */
+  finding_class: string
+  /** 报告该漏洞的智能体名 */
+  agent_name: string
+  /** 请求方法（GET/POST/...，黑盒漏洞有值） */
+  method: string
   description: string
   description_zh: string
   remediation: string
@@ -121,6 +127,88 @@ export interface Finding {
   status: FindingStatus
   note: string
   status_updated_at: string | null
+}
+
+// 漏洞详情页全量数据（原始 finding 富字段 + 处置状态，单独页面展示）
+export interface VulnCodeLocation {
+  file: string
+  start_line?: number
+  end_line?: number
+  snippet?: string
+}
+
+export interface FindingDetailData {
+  id: number
+  task_id: string
+  vuln_id: string
+  title: string
+  title_zh: string
+  severity: string
+  cvss: number | null
+  cwe: string
+  cve: string
+  endpoint: string
+  target: string
+  has_poc: boolean
+  description: string
+  description_zh: string
+  remediation: string
+  remediation_zh: string
+  poc_description: string
+  poc_code: string
+  status: FindingStatus
+  note: string
+  status_updated_at: string | null
+  detail: {
+    impact?: string
+    technical_analysis?: string
+    evidence?: string
+    assumptions?: string
+    code_locations?: VulnCodeLocation[]
+    cvss_breakdown?: Record<string, string>
+    finding_class?: string
+    fix_effort?: string
+    fix_pr_body?: string
+    agent_name?: string
+    agent_id?: string
+    method?: string
+    timestamp?: string
+  }
+}
+
+// 执行步骤转录（transcript：解析引擎会话库 .state/agents.db 的 chat/tool 事件流）
+export interface TranscriptAgent {
+  id: string
+  name: string
+  parent_id: string | null
+  status: string
+}
+
+export interface TranscriptEvent {
+  ts: number // epoch 秒（绝对时间）
+  type: 'chat' | 'tool'
+  agent: string
+  d: {
+    role?: 'user' | 'assistant'
+    content?: string
+    tool_name?: string
+    args?: string // JSON 文本（超长被截断时非合法 JSON）
+    status?: string // running | completed | failed
+    result?: string
+  }
+}
+
+export interface TranscriptData {
+  available: boolean
+  live?: boolean
+  reason?: string
+  agents: TranscriptAgent[]
+  counts: Record<string, { chat: number; tool: number; total: number }>
+  started_at: number
+  truncated: boolean
+  selected: string
+  total_events: number
+  events: TranscriptEvent[]
 }
 
 export interface SkillInfo {
@@ -592,7 +680,11 @@ export const api = {
   getTask: (id: string) => request<TaskDetail>('GET', `/api/tasks/${id}`),
   getLog: (id: string) => request<{ log: string }>('GET', `/api/tasks/${id}/log`),
   getReplay: (id: string) =>
-    request<{ available: boolean; reason?: string; data?: ReplayData }>('GET', `/api/tasks/${id}/replay`),
+    request<{ available: boolean; live?: boolean; reason?: string; data?: ReplayData }>('GET', `/api/tasks/${id}/replay`),
+  getTranscript: (id: string, agent?: string) =>
+    request<TranscriptData>(
+      'GET', `/api/tasks/${id}/transcript` + (agent ? `?agent=${encodeURIComponent(agent)}` : ''),
+    ),
   downloadArtifacts: (id: string) => download(`/api/tasks/${id}/artifacts`, `${id}-artifacts.zip`),
   downloadReport: (id: string) => download(`/api/tasks/${id}/report.md`, `strix-report-${id.slice(0, 10)}.md`),
   cancelTask: (id: string) => request<{ ok: boolean; status: string }>('POST', `/api/tasks/${id}/cancel`),
@@ -617,6 +709,7 @@ export const api = {
     request<{ id: number; status: FindingStatus; note: string; status_updated_at: string | null }>(
       'PATCH', `/api/findings/${id}`, { json: patch },
     ),
+  getFindingDetail: (id: number) => request<FindingDetailData>('GET', `/api/findings/${id}`),
 
   // 定时扫描计划
   listSchedules: (projectId: string) =>

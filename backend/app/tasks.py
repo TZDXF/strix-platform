@@ -29,8 +29,7 @@ from .mailer import notify_task_finished
 from .models import Finding, GitConfig, Project, ProjectUpload, SystemSetting, Task, User
 from .runner import execute_scan, read_run_artifacts
 from .skills import materialize_skills, web_search_pointer
-from .sources import (
-    SourceError,
+from .sources import (    SourceError,
     clone_git,
     du_mb,
     effective_repo_branches,
@@ -42,6 +41,7 @@ from .sources import (
 )
 from .targets import effective_targets
 from .tasklog import append_log as _log
+from .transcript import build_transcript
 
 ZH_INSTRUCTION = (
     "Please write the entire report in Simplified Chinese (简体中文): "
@@ -357,6 +357,8 @@ def run_scan(self, task_id: str) -> dict:
     if task.resume_count and task.resume_count > 0 and task.run_dir_name:
         # 手动续扫：以任务记录的 run 目录为断点（run 目录被清理时 execute_scan 会自动退化为重跑）
         resume_run = task.run_dir_name
+        task.execution_events = ""  # 上一轮回放缓存作废，收尾后按新日志重解析
+        task.transcript = ""  # 执行步骤转录同样作废
         _log(task, f"[task] 第 {task.resume_count} 次续扫：从 run「{resume_run}」断点恢复（--resume）")
     task.attempts = 0
 
@@ -556,6 +558,20 @@ def run_scan(self, task_id: str) -> dict:
             task.report_md = ""
         if not task.report_md:
             _log(task, "[parse] 未生成执行摘要报告（penetration_test_report.md）")
+
+        # 执行步骤转录（strix view「智能体执行过程」同源数据：.state/agents.db 会话历史）
+        try:
+            transcript_data = build_transcript(scan_dir / "strix_runs" / result["run_dir_name"])
+            task.transcript = json.dumps(transcript_data, ensure_ascii=False) if transcript_data else ""
+            if transcript_data:
+                _log(
+                    task,
+                    f"[parse] 执行步骤转录：{transcript_data['counts']['all']['total']} 条事件"
+                    f"（{len(transcript_data['agents'])} 个智能体）",
+                )
+        except Exception as exc:  # noqa: BLE001 —— 转录失败不影响结果
+            task.transcript = ""
+            _log(task, f"[parse] 执行步骤转录解析失败（不影响结果）: {exc}")
 
         db.execute(delete(Finding).where(Finding.task_id == task_id))
         task.zh_status = ""  # 续扫/重跑生成全新 findings，旧的中文翻译状态随之失效

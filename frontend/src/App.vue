@@ -6,6 +6,7 @@ import Projects from './views/Projects.vue'
 import ProjectDetail from './views/ProjectDetail.vue'
 import TaskList from './views/TaskList.vue'
 import TaskDetail from './views/TaskDetail.vue'
+import FindingDetail from './views/FindingDetail.vue'
 import Users from './views/Users.vue'
 import Settings from './views/Settings.vue'
 import AdminSettings from './views/AdminSettings.vue'
@@ -46,12 +47,13 @@ function onLogin(logged: User) {
   location.hash = '#/welcome'
 }
 
-interface View { name: string; id?: string }
+interface View { name: string; id?: string; id2?: string }
 
 const view = computed<View>(() => {
   const r = route.value
   let m: RegExpMatchArray | null
-  if ((m = r.match(/^#\/task\/([a-f0-9]+)/))) return { name: 'task-detail', id: m[1] }
+  if ((m = r.match(/^#\/task\/([a-f0-9]+)\/finding\/(\d+)$/))) return { name: 'finding-detail', id: m[1], id2: m[2] }
+  if ((m = r.match(/^#\/task\/([a-f0-9]+)$/))) return { name: 'task-detail', id: m[1] }
   if (r.startsWith('#/tasks')) return { name: 'task-list' }
   if (r.startsWith('#/stats')) return { name: 'stats' }
   if ((m = r.match(/^#\/project\/([a-f0-9]+)/))) return { name: 'project-detail', id: m[1] }
@@ -146,6 +148,7 @@ onUnmounted(() => {
     <TaskList v-else-if="view.name === 'task-list'" :user="user" />
     <Stats v-else-if="view.name === 'stats'" />
     <TaskDetail v-else-if="view.name === 'task-detail'" :task-id="view.id!" />
+    <FindingDetail v-else-if="view.name === 'finding-detail'" :task-id="view.id!" :finding-id="view.id2!" />
     <Users v-else-if="view.name === 'users'" />
     <AdminSettings v-else-if="view.name === 'admin-settings'" />
     <Settings v-else-if="view.name === 'settings'" :user="user" />

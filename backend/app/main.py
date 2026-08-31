@@ -65,6 +65,7 @@ from .models import (
 from .runner import read_run_artifacts  # noqa: F401（契约复用说明）
 from .replay import parse_strix_timeline, zip_member_strix_log
 from .schedules import cron_valid, fire_schedule, new_schedule_id, next_cron_run, schedule_out
+from .transcript import AGENTS_JSON, STATE_DIR, build_transcript, extract_run_dir_from_zip
 from .sources import (
     SourceError,
     dump_repos,
@@ -1762,6 +1763,15 @@ def stats(db: Session = Depends(get_db), user: User = Depends(require_user)):
     }
 
 
+def _finding_raw(f: Finding) -> dict:
+    """解析 findings.raw 原始 JSON（损坏/为空时返回空 dict）。"""
+    try:
+        data = json.loads(f.raw or "{}")
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 @app.get("/api/tasks/{task_id}", dependencies=[Depends(require_user)])
 def task_detail(task_id: str, db: Session = Depends(get_db), user: User = Depends(require_user)):
     task = _get_task_checked(db, task_id, user)
@@ -1797,6 +1807,10 @@ def task_detail(task_id: str, db: Session = Depends(get_db), user: User = Depend
                 "endpoint": f.endpoint,
                 "target": f.target,
                 "has_poc": f.has_poc,
+                # 验证方式 / 报告智能体（来自原始 finding，列表概览用）
+                "finding_class": str(_finding_raw(f).get("finding_class") or ""),
+                "agent_name": str(_finding_raw(f).get("agent_name") or ""),
+                "method": str(_finding_raw(f).get("method") or ""),
                 "description": f.description,
                 "description_zh": f.description_zh,
                 "remediation": f.remediation,
@@ -1866,28 +1880,143 @@ def _strix_log_source(task: Task) -> tuple[str | None, float | None, str]:
         return None, None, "归档产物不可用（zip 损坏或读取失败）"
 
 
+_REPLAY_TERMINAL = {"done", "failed", "cancelled"}
+
+
 @app.get("/api/tasks/{task_id}/replay", dependencies=[Depends(require_user)])
 def task_replay(task_id: str, db: Session = Depends(get_db), user: User = Depends(require_user)):
-    """执行过程回放时间线：优先返回缓存解析结果，缺缓存时从日志源现场解析并回填。"""
+    """执行过程回放时间线：完成后优先返回缓存解析结果；运行中现场解析最新日志（前端定时重拉跟拍）。
+
+    运行中不读缓存也不写缓存——写了会把中间快照永久锁进缓存，任务收尾后无法重算全量。
+    """
     task = _get_task_checked(db, task_id, user)
-    cached = (task.execution_events or "").strip()
-    if cached:
-        try:
-            return {"available": True, "data": json.loads(cached)}
-        except ValueError:
-            pass  # 缓存损坏按无缓存处理，现场重算并覆盖
+    live = task.status not in _REPLAY_TERMINAL
+    if not live:
+        cached = (task.execution_events or "").strip()
+        if cached:
+            try:
+                return {"available": True, "live": False, "data": json.loads(cached)}
+            except ValueError:
+                pass  # 缓存损坏按无缓存处理，现场重算并覆盖
     log_text, mtime_hint, reason = _strix_log_source(task)
     if log_text is None:
-        return {"available": False, "reason": reason}
+        if live:
+            reason = "引擎日志尚未产生（排队取码或引擎启动中），产生后将自动展示"
+        return {"available": False, "live": live, "reason": reason}
     data = parse_strix_timeline(log_text, mtime_hint)
     if data is None:
-        return {"available": False, "reason": "日志中没有可识别的执行过程事件"}
+        return {"available": False, "live": live, "reason": "日志中没有可识别的执行过程事件"}
+    if not live:
+        try:
+            task.execution_events = json.dumps(data, ensure_ascii=False)
+            db.commit()
+        except Exception:  # noqa: BLE001 —— 缓存失败不影响本次返回
+            db.rollback()
+    return {"available": True, "live": live, "data": data}
+
+
+def _transcript_source(task: Task) -> tuple[dict | None, str]:
+    """定位本次运行的转录数据：工作区 run 目录 → 产物 zip（本地 / S3）抽取。
+
+    返回 (转录结构, 失败原因)；找不到时结构为 None。
+    工作区优先精确匹配任务记录的 run 目录，其次取含 .state/agents.json 的最新目录。
+    """
+    ws = Path(get_settings().workspace_root)
+    run_base = ws / task.id / "scan" / "strix_runs"
+    run_dir: Path | None = None
+    if run_base.is_dir():
+        exact = run_base / (task.run_dir_name or "")
+        if task.run_dir_name and (exact / STATE_DIR / AGENTS_JSON).is_file():
+            run_dir = exact
+        else:
+            candidates = [
+                d for d in run_base.iterdir()
+                if (d / STATE_DIR / AGENTS_JSON).is_file()
+            ]
+            run_dir = max(candidates, key=lambda d: d.stat().st_mtime, default=None)
+    if run_dir is not None:
+        data = build_transcript(run_dir)
+        if data is not None:
+            return data, ""
+
+    ref = task.artifacts_ref
+    if not ref:
+        return None, "run 工作区已清理且该任务没有归档产物"
     try:
-        task.execution_events = json.dumps(data, ensure_ascii=False)
-        db.commit()
-    except Exception:  # noqa: BLE001 —— 缓存失败不影响本次返回
-        db.rollback()
-    return {"available": True, "data": data}
+        if ref.startswith("s3://"):
+            opened = open_s3_artifact(ref)
+            if opened is None:
+                return None, "对象存储不可用或归档已缺失"
+            body, _length = opened
+            with zipfile.ZipFile(io.BytesIO(body.read())) as zfp:
+                tmp = extract_run_dir_from_zip(zfp, task.run_dir_name or "")
+        else:
+            path = artifact_response_path(ref)
+            if path is None:
+                return None, "本地归档文件缺失"
+            with zipfile.ZipFile(path) as zfp:
+                tmp = extract_run_dir_from_zip(zfp, task.run_dir_name or "")
+    except (OSError, zipfile.BadZipFile):
+        return None, "归档产物不可用（zip 损坏或读取失败）"
+    if tmp is None:
+        return None, "归档产物中没有智能体会话数据（.state/agents.db）"
+    data = build_transcript(tmp)
+    return (data, "") if data is not None else (None, "智能体会话数据为空或无法解析")
+
+
+@app.get("/api/tasks/{task_id}/transcript", dependencies=[Depends(require_user)])
+def task_transcript(
+    task_id: str,
+    agent: str = "",
+    db: Session = Depends(get_db),
+    user: User = Depends(require_user),
+):
+    """执行步骤转录（strix view 同源）：按智能体过滤的事件流。
+
+    终态任务优先读缓存（解析阶段落盘）；运行中现场解析引擎会话库（WAL 只读，
+    前端定时重拉跟拍）；工作区被清理时从产物 zip 兜底抽取并回填缓存。
+    agent 传 "all" 返回全部，缺省取根智能体。
+    """
+    task = _get_task_checked(db, task_id, user)
+    live = task.status not in _REPLAY_TERMINAL
+    data: dict | None = None
+    if not live:
+        cached = (task.transcript or "").strip()
+        if cached:
+            try:
+                loaded = json.loads(cached)
+                if isinstance(loaded, dict) and loaded.get("agents"):
+                    data = loaded
+            except ValueError:
+                data = None
+    if data is None:
+        data, reason = _transcript_source(task)
+        if data is None:
+            if live:
+                reason = "智能体会话尚未产生（引擎启动中），产生后将自动展示"
+            return {"available": False, "live": live, "reason": reason}
+        if not live:
+            try:
+                task.transcript = json.dumps(data, ensure_ascii=False)
+                db.commit()
+            except Exception:  # noqa: BLE001 —— 缓存失败不影响本次返回
+                db.rollback()
+
+    agents = data.get("agents") or []
+    agent_ids = {a["id"] for a in agents}
+    sel = agent if (agent == "all" or agent in agent_ids) else (agents[0]["id"] if agents else "")
+    events = data.get("events") or []
+    return {
+        "available": True,
+        "live": live,
+        "agents": agents,
+        "counts": data.get("counts") or {},
+        "started_at": data.get("started_at"),
+        "truncated": bool(data.get("truncated")),
+        "selected": sel,
+        "total_events": len(events),
+        "events": events if sel == "all" else [e for e in events if e.get("agent") == sel],
+    }
 
 
 @app.get("/api/tasks/{task_id}/artifacts", dependencies=[Depends(require_user)])
@@ -2058,6 +2187,57 @@ def translate_task(task_id: str, request: Request, db: Session = Depends(get_db)
 class FindingPatchBody(BaseModel):
     status: str
     note: str | None = None  # None=不修改备注；空串=清空
+
+
+# 漏洞明细富字段（strikes 原始 finding JSON 中的深字段，详情展开时按需拉取）
+_FINDING_DETAIL_FIELDS = (
+    "impact", "technical_analysis", "evidence", "assumptions",
+    "code_locations", "cvss_breakdown", "finding_class", "fix_effort",
+    "fix_pr_body", "agent_name", "agent_id", "method", "timestamp",
+)
+_FINDING_FIELD_MAX = 80_000  # 单字段上限（code_locations 含代码片段可能较长）
+
+
+@app.get("/api/findings/{finding_id}", dependencies=[Depends(require_user)])
+def finding_detail(
+    finding_id: int, db: Session = Depends(get_db), user: User = Depends(require_user),
+):
+    """漏洞详情页全量数据：基础字段 + 原始 finding 富字段（影响/技术分析/证据/代码位置等）。"""
+    finding = db.get(Finding, finding_id)
+    if finding is None:
+        raise HTTPException(404, "漏洞不存在")
+    _get_task_checked(db, finding.task_id, user)
+    raw = _finding_raw(finding)
+    detail: dict = {}
+    for key in _FINDING_DETAIL_FIELDS:
+        val = raw.get(key)
+        if isinstance(val, str) and len(val) > _FINDING_FIELD_MAX:
+            val = val[:_FINDING_FIELD_MAX] + " …（截断）"
+        detail[key] = val
+    return {
+        "id": finding.id,
+        "task_id": finding.task_id,
+        "vuln_id": finding.vuln_id,
+        "title": finding.title,
+        "title_zh": finding.title_zh,
+        "severity": finding.severity,
+        "cvss": finding.cvss,
+        "cwe": finding.cwe,
+        "cve": finding.cve,
+        "endpoint": finding.endpoint,
+        "target": finding.target,
+        "has_poc": finding.has_poc,
+        "description": finding.description,
+        "description_zh": finding.description_zh,
+        "remediation": finding.remediation,
+        "remediation_zh": finding.remediation_zh,
+        "poc_description": finding.poc_description,
+        "poc_code": finding.poc_code,
+        "status": finding.status or "open",
+        "note": finding.note or "",
+        "status_updated_at": finding.status_updated_at.isoformat() if finding.status_updated_at else None,
+        "detail": detail,
+    }
 
 
 @app.patch("/api/findings/{finding_id}", dependencies=[Depends(require_user)])

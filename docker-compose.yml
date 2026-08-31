@@ -63,7 +63,7 @@ services:
       # 联网搜索（可选）：内网 MCP 搜索端点；配置后任务提交时可勾选启用
       WEB_SEARCH_MCP_URL: ${WEB_SEARCH_MCP_URL:-}
     volumes:
-      - workspaces:/var/lib/docker/volumes/strix-platform_workspaces/_data
+      - ./docker/workspaces:/var/lib/docker/volumes/strix-platform_workspaces/_data
     depends_on:
       postgres:
         condition: service_healthy
@@ -88,7 +88,7 @@ services:
       - default
       - strix-sandbox
     volumes:
-      - workspaces:/var/lib/docker/volumes/strix-platform_workspaces/_data
+      - ./docker/workspaces:/var/lib/docker/volumes/strix-platform_workspaces/_data
       - /var/run/docker.sock:/var/run/docker.sock   # strix 沙箱需要 Docker
     depends_on:
       postgres:
@@ -102,15 +102,6 @@ services:
       - api
     ports:
       - "80:80"
-
-# 工作区用固定名具名卷承载（见上方 WORKSPACE_ROOT 注释）；postgres/rustfs 数据
-# 仍 bind mount 到 ./docker/data/ 下
-volumes:
-  # 显式固定卷名：与其在 daemon 侧的真实存储路径
-  # /var/lib/docker/volumes/strix-platform_workspaces/_data 保持一致，
-  # 不随 COMPOSE_PROJECT_NAME / docker compose -p 变化
-  workspaces:
-    name: strix-platform_workspaces
 
 networks:
   strix-sandbox:

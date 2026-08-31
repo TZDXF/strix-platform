@@ -1,10 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
-import {
-  TabsRoot, TabsList, TabsTrigger, TabsContent, CheckboxRoot, CheckboxIndicator,
-  SelectRoot, SelectTrigger, SelectValue, SelectPortal, SelectContent, SelectViewport, SelectItem, SelectItemText,
-} from 'reka-ui'
-import { api, type AgentUsage, type Finding, type FindingStatus, type TaskDetail as TaskDetailData } from '../api'
+import { TabsRoot, TabsList, TabsTrigger, TabsContent, CheckboxRoot, CheckboxIndicator } from 'reka-ui'
+import { api, type AgentUsage, type Finding, type TaskDetail as TaskDetailData } from '../api'
 import ReplayPlayer from '../components/ReplayPlayer.vue'
 import MarkdownRender from 'markstream-vue'
 import { toast } from '../toast'
@@ -17,7 +14,6 @@ const props = defineProps<{ taskId: string }>()
 const task = ref<TaskDetailData | null>(null)
 const logText = ref('')
 const logBox = ref<HTMLElement | null>(null)
-const expanded = ref<Record<number, boolean>>({})
 const showZh = ref(true)
 const tab = ref('findings')
 let timer: number | undefined
@@ -82,31 +78,9 @@ async function translateNow() {
   } catch (e) { toast.error((e as Error).message) } finally { translatingZh.value = false }
 }
 
-// ---- 漏洞处置状态：待处理 / 已修复 / 已忽略 / 误报 ----
-const FINDING_STATUS_OPTIONS: FindingStatus[] = ['open', 'fixed', 'ignored', 'false_positive']
-const editState = ref<Record<number, { status: FindingStatus; note: string }>>({})
-const savingFinding = ref(0)
-
-function ensureEdit(f: Finding) {
-  if (!editState.value[f.id]) editState.value[f.id] = { status: f.status, note: f.note }
-}
-
-function toggleExpand(f: Finding) {
-  expanded.value[f.id] = !expanded.value[f.id]
-  if (expanded.value[f.id]) ensureEdit(f)
-}
-
-async function saveFindingStatus(f: Finding) {
-  const st = editState.value[f.id]
-  if (!st) return
-  savingFinding.value = f.id
-  try {
-    const res = await api.patchFinding(f.id, { status: st.status, note: st.note })
-    f.status = res.status
-    f.note = res.note
-    f.status_updated_at = res.status_updated_at
-    toast.success('处置状态已保存')
-  } catch (e) { toast.error((e as Error).message) } finally { savingFinding.value = 0 }
+// ---- 漏洞详情：独立页面展示（行点击跳转），处置状态在该页维护 ----
+function openFinding(f: Finding) {
+  location.hash = `#/task/${props.taskId}/finding/${f.id}`
 }
 
 const statusCounts = computed(() => {
@@ -152,85 +126,14 @@ const filteredFindings = computed(() =>
     (sevFilter.value === 'all' || f.severity === sevFilter.value)
     && (!onlyPoc.value || f.has_poc)
     && (!onlyOpen.value || f.status === 'open')))
-const allExpanded = computed(() =>
-  filteredFindings.value.length > 0 && filteredFindings.value.every(f => expanded.value[f.id]))
-function expandAll(open: boolean) {
-  for (const f of task.value?.findings || []) {
-    expanded.value[f.id] = open
-    if (open) ensureEdit(f)
-  }
-}
 
-// ---- 漏洞按目标分组：白盒各仓库 / 黑盒各地址 / 智能体自建靶场 / 未标注 ----
-// target 由引擎逐条填写（受影响仓库或源码路径 / 黑盒地址），与任务绑定的仓库和
-// 黑盒地址匹配归类；匹配不上的 URL 视为黑盒、本地路径视为白盒（兼容历史任务）。
-// 未配置黑盒目标时引擎可能自建本地靶场实测，回环地址即归入「智能体自建靶场」
-interface FindingGroup { key: string; kind: 'whitebox' | 'blackbox' | 'agentlocal' | 'unknown'; name: string; findings: Finding[] }
-
+// 智能体自建靶场提示：检测是否存在回环地址目标的漏洞
 const LOOPBACK_HOST = /^(localhost|127\.\d+\.\d+\.\d+|\[?::1\]?)$/i
 function isLoopbackUrl(u: string): boolean {
   try { return LOOPBACK_HOST.test(new URL(u).hostname) } catch { return false }
 }
 
-function repoNameOf(url: string): string {
-  const seg = url.replace(/\/+$/, '').split(/[/:]/).pop() || url
-  return seg.endsWith('.git') ? seg.slice(0, -4) : seg
-}
-const repoDefs = computed(() => {
-  const t = task.value
-  if (!t || t.source_type !== 'git') return [] as { url: string; name: string }[]
-  const refs = t.repo_branches?.length ? t.repo_branches : [{ url: t.source_ref, branch: '' }]
-  return refs.map(r => ({ url: r.url, name: repoNameOf(r.url) })).filter(r => r.url)
-})
-const targetDefs = computed(() => task.value?.test_targets || [])
-
-function groupOf(f: Finding): { key: string; kind: FindingGroup['kind']; name: string } {
-  const t = (f.target || '').trim()
-  if (!t) return { key: 'unknown', kind: 'unknown', name: '未标注目标' }
-  for (const r of repoDefs.value) {
-    if (t.includes(r.url) || t.includes(r.name)) return { key: `wb:${r.name}`, kind: 'whitebox', name: r.name }
-  }
-  const norm = (u: string) => u.replace(/\/+$/, '')
-  for (const tt of targetDefs.value) {
-    if (t === tt.url || norm(t).startsWith(norm(tt.url)) || norm(tt.url).startsWith(norm(t))) {
-      return { key: `bb:${tt.url}`, kind: 'blackbox', name: tt.url }
-    }
-  }
-  if (/^https?:\/\//i.test(t)) {
-    const kind = isLoopbackUrl(t) ? 'agentlocal' : 'blackbox'
-    return { key: `${kind}:${t}`, kind, name: t }
-  }
-  const base = t.split(/[\\/]/).filter(Boolean).pop() || t
-  return { key: `wb:${base}`, kind: 'whitebox', name: base }
-}
-
-const findingGroups = computed<FindingGroup[]>(() => {
-  const map = new Map<string, FindingGroup>()
-  for (const f of filteredFindings.value) {
-    const { key, kind, name } = groupOf(f)
-    let g = map.get(key)
-    if (!g) { g = { key, kind, name, findings: [] }; map.set(key, g) }
-    g.findings.push(f)
-  }
-  // 分组排序：白盒仓库（按任务绑定顺序）→ 黑盒地址（按配置顺序）→ 自建靶场 → 未标注
-  const kindRank: Record<FindingGroup['kind'], number> = { whitebox: 0, blackbox: 1, agentlocal: 2, unknown: 3 }
-  const rank = (g: FindingGroup) => kindRank[g.kind]
-  const pos = (g: FindingGroup) =>
-    g.kind === 'whitebox' ? repoDefs.value.findIndex(r => g.key === `wb:${r.name}`)
-      : g.kind === 'blackbox' ? targetDefs.value.findIndex(t => g.key === `bb:${t.url}`)
-        : 0
-  return [...map.values()].sort((a, b) => rank(a) - rank(b) || pos(a) - pos(b))
-})
-
 function title(f: { title: string; title_zh: string }) { return showZh.value && f.title_zh ? f.title_zh : f.title }
-function desc(f: { description: string; description_zh: string }) { return showZh.value && f.description_zh ? f.description_zh : f.description }
-function fix(f: { remediation: string; remediation_zh: string }) { return showZh.value && f.remediation_zh ? f.remediation_zh : f.remediation }
-
-// poc_code 原样入库，可能带 ``` 围栏；裸代码补一层围栏，避免 # 注释等被当成 markdown 渲染
-function pocMd(code: string): string {
-  const t = code.trim()
-  return t.includes('```') ? t : `\`\`\`\n${t}\n\`\`\``
-}
 
 async function refresh() {
   try {
@@ -411,7 +314,7 @@ onUnmounted(() => { clearInterval(timer); themeObserver?.disconnect() })
           （已修复 {{ statusCounts.fixed }} / 已忽略 {{ statusCounts.ignored }} / 误报 {{ statusCounts.false_positive }}）</template>。AI 辅助测试结果，建议人工复核。
       </p>
       <p v-else-if="running" class="mb-[18px] text-[13px] text-muted">
-        任务{{ taskStatusLabel[task.status] || task.status }}中，页面每 5 秒自动刷新，可先查看执行日志。
+        任务{{ taskStatusLabel[task.status] || task.status }}中，页面每 5 秒自动刷新；「智能体」页可实时跟拍执行回放，执行日志持续追加。
       </p>
       <p v-else-if="task.status === 'cancelled'" class="mb-[18px] text-[13px] text-muted">
         任务已被取消：扫描引擎在执行中终止，未解析/保留部分结果。可重新发起任务。
@@ -424,7 +327,9 @@ onUnmounted(() => { clearInterval(timer); themeObserver?.disconnect() })
           <TabsTrigger
             v-for="t in [
               { value: 'findings', label: `漏洞明细（${task.findings.length}）` },
-              ...(task.agents.length ? [{ value: 'agents', label: `智能体（${task.agents.length}）` }] : []),
+              ...((task.agents.length || running)
+                ? [{ value: 'agents', label: task.agents.length ? `智能体（${task.agents.length}）` : '智能体（实时）' }]
+                : []),
               ...(task.has_report_md ? [{ value: 'summary', label: '执行摘要报告' }] : []),
               { value: 'log', label: '执行日志' },
             ]"
@@ -474,10 +379,6 @@ onUnmounted(() => { clearInterval(timer); themeObserver?.disconnect() })
               </CheckboxRoot>
               仅看待处理
             </label>
-            <button
-              class="cursor-pointer rounded-md border border-border bg-transparent px-2.5 py-1 text-xs font-semibold text-muted transition-colors hover:border-accent hover:text-accent"
-              @click="expandAll(!allExpanded)"
-            >{{ allExpanded ? '收起全部' : '展开全部' }}</button>
           </div>
 
           <div v-if="task.zh_status === 'pending'" :class="hint">
@@ -493,105 +394,33 @@ onUnmounted(() => { clearInterval(timer); themeObserver?.disconnect() })
             当前筛选条件下没有漏洞，试试切换严重度或取消「仅看有 PoC」。
           </div>
 
-          <div v-for="g in findingGroups" :key="g.key" class="mb-5">
-            <div class="mb-2.5 flex flex-wrap items-center gap-2 border-b border-border pb-2">
-              <span
-                class="shrink-0 rounded-full px-2.5 py-0.5 text-[11px] font-bold"
-                :class="g.kind === 'whitebox' ? 'bg-accent/15 text-accent' : g.kind === 'blackbox' ? 'bg-high/15 text-high' : g.kind === 'agentlocal' ? 'bg-med/15 text-med' : 'bg-panel2 text-muted'"
-                :title="g.kind === 'agentlocal' ? '任务未配置黑盒地址，该结果由智能体在扫描沙箱内自建本地实例（自备数据库）实测得出，非真实环境响应' : undefined"
-              >{{ g.kind === 'whitebox' ? '白盒' : g.kind === 'blackbox' ? '黑盒' : g.kind === 'agentlocal' ? '智能体自建靶场' : '其他' }}</span>
-              <span class="min-w-0 break-all text-[13.5px] font-semibold text-text">{{ g.name }}</span>
-              <span class="shrink-0 text-xs text-muted">{{ g.findings.length }} 条</span>
-            </div>
-            <div v-for="f in g.findings" :key="f.id"
-              class="mb-2.5 overflow-hidden rounded-xl border border-border border-l-4" :class="findingBarClass(f.severity)">
+          <!-- 漏洞列表（按严重度排序的扁平列表，点击进入独立详情页） -->
+          <div v-for="f in filteredFindings" :key="f.id"
+            class="mb-2.5 overflow-hidden rounded-xl border border-border border-l-4" :class="findingBarClass(f.severity)">
             <button
               class="flex w-full cursor-pointer items-center gap-2.5 bg-panel2/60 px-3.5 py-2.5 text-left transition-colors hover:bg-panel2"
-              @click="toggleExpand(f)"
+              :title="'点击查看完整明细'"
+              @click="openFinding(f)"
             >
               <span :class="sevBadgeClass(f.severity)">{{ (sevLabel[f.severity] || f.severity).toUpperCase() }}</span>
+              <span
+                v-if="f.finding_class === 'dynamic'"
+                class="shrink-0 rounded-full bg-ok/15 px-2 py-0.5 text-[10.5px] font-bold text-ok"
+                title="引擎已在运行环境中实测验证（PoC 动态验证）"
+              >已验证</span>
               <span v-if="f.status && f.status !== 'open'" :class="findingStatusBadgeClass(f.status)">{{ findingStatusLabels[f.status] || f.status }}</span>
               <span class="min-w-0 flex-1 truncate text-[14px] font-semibold text-text" :class="f.status === 'ignored' || f.status === 'false_positive' ? 'opacity-60' : ''">{{ title(f) }}</span>
               <span class="hidden shrink-0 text-xs text-muted sm:inline">
-                CVSS {{ f.cvss ?? '-' }} · {{ f.cwe || '-' }} · {{ f.has_poc ? '有 PoC' : '无 PoC' }}
+                <template v-if="f.method">{{ f.method }} </template>{{ f.endpoint || f.target || '-' }} · CVSS {{ f.cvss ?? '-' }} · {{ f.cwe || '-' }} · {{ f.has_poc ? '有 PoC' : '无 PoC' }}
               </span>
-              <span
-                class="shrink-0 text-xs text-muted transition-transform duration-200"
-                :class="expanded[f.id] ? 'rotate-180' : ''"
-              >▼</span>
+              <span class="shrink-0 text-xs text-muted" title="进入详情页">›</span>
             </button>
-            <div v-if="expanded[f.id]" class="px-4 pt-1 pb-4 text-[13.5px] leading-relaxed text-body">
-              <!-- 处置状态（人工维护：待处理/已修复/已忽略/误报 + 备注） -->
-              <div v-if="editState[f.id]" class="mt-3 rounded-lg border border-border bg-panel2/40 px-3.5 py-2.5">
-                <div class="flex flex-wrap items-center gap-2.5">
-                  <span class="shrink-0 text-xs font-semibold tracking-wide text-muted">处置状态</span>
-                  <div class="w-32">
-                    <SelectRoot v-model="editState[f.id]!.status">
-                      <SelectTrigger class="flex w-full items-center justify-between rounded-md border border-border bg-panel2 px-2.5 py-1.5 text-[13px] text-text outline-none focus:border-accent">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectPortal>
-                        <SelectContent class="z-50 max-h-72 min-w-[var(--reka-select-trigger-width)] overflow-hidden rounded-md border border-border bg-panel2 py-1 shadow-lg" position="popper">
-                          <SelectViewport>
-                            <SelectItem
-                              v-for="s in FINDING_STATUS_OPTIONS" :key="s" :value="s"
-                              class="cursor-pointer rounded-md px-2.5 py-1.5 text-[13px] text-text data-highlighted:bg-accent/15 data-highlighted:outline-none"
-                            >
-                              <SelectItemText>{{ findingStatusLabels[s] }}</SelectItemText>
-                            </SelectItem>
-                          </SelectViewport>
-                        </SelectContent>
-                      </SelectPortal>
-                    </SelectRoot>
-                  </div>
-                  <div class="flex-1"></div>
-                  <span v-if="f.status_updated_at" class="text-[11px] text-muted">上次更新 {{ fmtTime(f.status_updated_at) }}</span>
-                  <button
-                    class="cursor-pointer rounded-md border border-accent bg-accent/10 px-3 py-1 text-xs font-semibold text-accent transition-colors hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-50"
-                    :disabled="savingFinding === f.id"
-                    @click="saveFindingStatus(f)"
-                  >{{ savingFinding === f.id ? '保存中…' : '保存' }}</button>
-                </div>
-                <textarea
-                  v-model="editState[f.id]!.note"
-                  rows="2"
-                  placeholder="备注（可选）：修复说明 / 忽略原因 / 复测结论等，最长 2000 字"
-                  class="mt-2 w-full resize-y rounded-md border border-border bg-panel2 px-2.5 py-1.5 text-xs text-text outline-none focus:border-accent"
-                ></textarea>
-              </div>
-              <h4 class="mt-3 mb-1.5 text-xs font-semibold tracking-wide text-muted">端点 / 目标</h4>
-              <div class="break-all rounded-lg bg-panel2 px-3 py-2 font-mono text-xs">
-                <template v-if="f.target">{{ f.target }}<br /></template>{{ f.endpoint || '-' }}
-              </div>
-              <template v-if="desc(f)">
-                <h4 class="mt-3.5 mb-1.5 text-xs font-semibold tracking-wide text-muted">描述</h4>
-                <MarkdownRender mode="docs" :content="desc(f)" :final="true" :is-dark="isDark" />
-              </template>
-              <template v-if="f.poc_description">
-                <h4 class="mt-3.5 mb-1.5 text-xs font-semibold tracking-wide text-muted">PoC 说明</h4>
-                <MarkdownRender mode="docs" :content="f.poc_description" :final="true" :is-dark="isDark" />
-              </template>
-              <template v-if="f.poc_code">
-                <h4 class="mt-3.5 mb-1.5 text-xs font-semibold tracking-wide text-muted">PoC 脚本</h4>
-                <MarkdownRender mode="docs" :content="pocMd(f.poc_code)" :final="true" :is-dark="isDark" />
-              </template>
-              <template v-if="fix(f)">
-                <h4 class="mt-3.5 mb-1.5 text-xs font-semibold tracking-wide text-muted">修复建议</h4>
-                <div class="rounded-lg border border-ok/25 bg-ok/10 px-3.5 py-2.5">
-                  <MarkdownRender mode="docs" :content="fix(f)" :final="true" :is-dark="isDark" />
-                </div>
-              </template>
-              <template v-if="showZh && f.title_zh">
-                <h4 class="mt-3.5 mb-1.5 text-xs font-semibold tracking-wide text-muted">原文</h4>
-                <MarkdownRender mode="docs" :content="`**${f.title}**\n\n${f.description}`" :final="true" :is-dark="isDark" />
-              </template>
-            </div>
-            </div>
           </div>
         </TabsContent>
 
-        <!-- 智能体：token 消耗 + 各智能体执行过程（run.json 用量 + strix.log 生命周期合并） -->
-        <TabsContent v-if="task.agents.length" value="agents" :class="card" class="mt-3.5">
+        <!-- 智能体：token 消耗 + 各智能体执行过程（run.json 用量 + strix.log 生命周期合并）；运行中仅展示实时回放 -->
+        <TabsContent v-if="task.agents.length || running" value="agents" :class="card" class="mt-3.5">
+          <template v-if="task.agents.length">
           <!-- token 消耗概览 -->
           <div class="grid grid-cols-2 gap-3.5 sm:grid-cols-4">
             <div class="rounded-xl bg-panel2 px-3.5 py-3">
@@ -657,9 +486,15 @@ onUnmounted(() => { clearInterval(timer); themeObserver?.disconnect() })
           <div :class="hint" class="mt-2.5">
             智能体按启动时间排序；Root Agent 负责调度，各专项智能体（SQLi / XSS / SSRF 等）由其按需派生，token 为该智能体全部 LLM 请求的累计值。
           </div>
+          </template>
 
-          <!-- 执行过程回放：解析 strix.log 事件时间线，虚拟时钟重演（含拖动定位 / 倍速 / 泳道） -->
-          <ReplayPlayer v-if="['done', 'failed'].includes(task.status) && task.run_dir_name" :task-id="task.id" />
+          <!-- 执行过程回放：时间轴（密度图 / 泳道 / 里程碑）+ 执行步骤（思考 / 命令 / 工具调用）
+               一体化播放，运行中实时跟拍 -->
+          <ReplayPlayer
+            v-if="running || (['done', 'failed', 'cancelled'].includes(task.status) && task.run_dir_name)"
+            :task-id="task.id"
+            :live="running"
+          />
         </TabsContent>
 
         <!-- 官方执行摘要报告（strix view 同款 penetration_test_report.md），markstream-vue 渲染 -->
