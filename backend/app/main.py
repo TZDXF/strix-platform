@@ -31,7 +31,7 @@ from .auth import (
     require_user,
     verify_password,
 )
-from .cancel import clear_cancel, clear_steer, request_cancel, request_steer
+from .cancel import clear_cancel, clear_steer, has_heartbeat, request_cancel, request_steer
 from .config import get_settings
 from .db import get_db, init_db
 from .gitproviders import (
@@ -86,7 +86,7 @@ from .targets import (
     probe_target,
 )
 from .tasklog import append_log as _append_task_log
-from .tasks import get_scan_concurrency, new_task_id, run_scan, set_scan_concurrency
+from .tasks import finish_as_cancelled, get_scan_concurrency, new_task_id, run_scan, set_scan_concurrency
 from .translate import translate_findings_task
 from .celery_app import WORKER_POOL_SIZE
 
@@ -1940,17 +1940,26 @@ def task_report_md(task_id: str, request: Request, db: Session = Depends(get_db)
 
 @app.post("/api/tasks/{task_id}/cancel", dependencies=[Depends(require_user)])
 def cancel_task(task_id: str, request: Request, db: Session = Depends(get_db), user: User = Depends(require_user)):
-    """请求取消运行中的任务：写 Redis 标记，worker 轮询到后终止引擎并落「已取消」终态。
+    """请求取消任务：写 Redis 标记，执行中的 worker 轮询到后终止引擎并落「已取消」终态。
 
-    排队（pending）中的任务同样可取消：run_scan 启动时先查标记，未开工直接收尾。
+    无执行者的任务由本接口直接落终态，取消立即生效：排队（pending）任务还没开工；
+    运行态但执行心跳已消失的任务是 worker 重启等意外留下的僵尸——其 Celery 消息
+    要等 broker visibility_timeout（默认 1 小时）才重投递，被动等 worker 处理形同虚设。
+    两种直接收尾均保留取消标记（clear_marks=False），防与 worker 侧准入/重投递竞争；
+    残留标记对终态任务无副作用，续扫时由 resume 接口清除。
     """
     task = _get_task_checked(db, task_id, user)
     if task.status not in ("pending", "fetching", "scanning", "parsing"):
         raise HTTPException(400, "任务已结束，无需取消")
     if not request_cancel(task_id):
         raise HTTPException(503, "Redis 暂不可用，取消请求下达失败；请稍后重试")
-    _append_task_log(task, "[cancel] 收到取消请求，正在终止任务（通常几秒内生效）")
-    db.commit()
+    if task.status == "pending":
+        finish_as_cancelled(db, task, task_id, "任务在排队等待期间被取消", clear_marks=False)
+    elif not has_heartbeat(task_id):
+        finish_as_cancelled(db, task, task_id, "未检测到执行中的 worker（可能发生过容器重启），已直接标记取消", clear_marks=False)
+    else:
+        _append_task_log(task, "[cancel] 收到取消请求，正在终止任务（通常几秒内生效）")
+        db.commit()
     _audit(db, request, "task.cancel_request", f"id={task_id} status={task.status}", user=user)
     return {"ok": True, "status": task.status}
 

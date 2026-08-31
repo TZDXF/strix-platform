@@ -13,7 +13,14 @@ from pathlib import Path
 from sqlalchemy import delete, func, select
 
 from .artifacts import archive_run
-from .cancel import cancel_requested, clear_cancel, clear_steer, pop_steer
+from .cancel import (
+    HB_TOUCH_INTERVAL,
+    cancel_requested,
+    clear_cancel,
+    clear_steer,
+    pop_steer,
+    touch_heartbeat,
+)
 from .celery_app import WORKER_POOL_SIZE, celery_app
 from .config import get_settings
 from .db import SessionLocal
@@ -69,6 +76,16 @@ def web_search_guide(mcp_url: str) -> str:
     return build_web_search_content(mcp_url)
 
 
+def _heartbeat_loop(task_id: str, stop: threading.Event) -> None:
+    """执行心跳线程：任务执行期间周期刷新 Redis 心跳，向取消接口与定时回收证明
+    「该任务有活着的执行者」。worker 意外死亡（如容器重启）后标记随 TTL 消失，
+    僵尸任务因此可被识别并直接收尾，而不用等消息重投递（broker 默认 1 小时）。
+    """
+    touch_heartbeat(task_id)
+    while not stop.wait(HB_TOUCH_INTERVAL):
+        touch_heartbeat(task_id)
+
+
 def _parse_api_specs(raw) -> list[dict]:
     """解析任务的 API 规范目标 JSON（[{"name","stored_path"}]，路径相对 workspace）；坏数据返回 []。"""
     if isinstance(raw, str):
@@ -93,10 +110,15 @@ def _set_status(db, task, status: str) -> None:
     db.commit()
 
 
-def _finish_as_cancelled(db, task, task_id: str, detail: str = "") -> dict:
-    """任务以「已取消」收尾：终态时间/时长/日志，不解析产物、不翻译、不发提醒邮件。"""
-    clear_cancel(task_id)
-    clear_steer(task_id)
+def finish_as_cancelled(db, task, task_id: str, detail: str = "", clear_marks: bool = True) -> dict:
+    """任务以「已取消」收尾：终态时间/时长/日志，不解析产物、不翻译、不发提醒邮件。
+
+    clear_marks=False 供 API/定时回收直接落终态的场景：保留取消标记，防与 worker
+    侧的准入检查、消息重投递竞争（见 main.cancel_task 与 schedules.reclaim_zombie_tasks）。
+    """
+    if clear_marks:
+        clear_cancel(task_id)
+        clear_steer(task_id)
     task.error = ""
     task.finished_at = datetime.now(timezone.utc)
     if task.started_at:
@@ -296,7 +318,7 @@ def run_scan(self, task_id: str) -> dict:
         return {"task_id": task_id, "skipped": task.status}
     if cancel_requested(task_id):
         # 排队期间（pending）被取消：还没动过任何资源，直接落终态
-        result = _finish_as_cancelled(db, task, task_id, "任务在排队等待期间被取消")
+        result = finish_as_cancelled(db, task, task_id, "任务在排队等待期间被取消")
         db.close()
         return result
     if not _admit_scan_slot(db, task):
@@ -305,6 +327,12 @@ def run_scan(self, task_id: str) -> dict:
         run_scan.apply_async(args=[task_id], countdown=SCAN_QUEUE_RETRY_SEC)
         return {"task_id": task_id, "queued": True}
     clear_steer(task_id)  # 防御：清理上次运行未消费的转向标记，避免新任务被旧指令误转向
+    # 执行心跳：占槽成功即启动，全程覆盖取源码/扫描/解析各阶段，finally 统一停止
+    hb_stop = threading.Event()
+    hb_thread = threading.Thread(
+        target=_heartbeat_loop, args=(task_id, hb_stop), name=f"hb-{task_id[:8]}", daemon=True
+    )
+    hb_thread.start()
 
     project = db.get(Project, task.project_id) if task.project_id else None
     creator = db.get(User, task.created_by) if task.created_by else None
@@ -416,7 +444,7 @@ def run_scan(self, task_id: str) -> dict:
 
         # ---- Stage 2: strix 扫描（用户自定义指令 + 目标说明 + 中文报告提示词均通过 --instruction 注入）----
         if cancel_requested(task_id):
-            result = _finish_as_cancelled(db, task, task_id, "源码获取完成后、扫描启动前被取消")
+            result = finish_as_cancelled(db, task, task_id, "源码获取完成后、扫描启动前被取消")
             db.close()
             return result
         _set_status(db, task, "scanning")
@@ -507,7 +535,7 @@ def run_scan(self, task_id: str) -> dict:
 
         if result.get("cancelled"):
             # 用户取消：不解析半成品产物、不归档、不翻译，直接落终态
-            result = _finish_as_cancelled(db, task, task_id, "引擎进程已被终止")
+            result = finish_as_cancelled(db, task, task_id, "引擎进程已被终止")
             db.close()
             return result
 
@@ -607,6 +635,8 @@ def run_scan(self, task_id: str) -> dict:
         _notify(db, task, task_id)
         return {"task_id": task_id, "error": task.error}
     finally:
+        hb_stop.set()
+        hb_thread.join(timeout=10)
         db.close()
 
 

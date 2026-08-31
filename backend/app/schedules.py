@@ -18,13 +18,14 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
+from .cancel import has_heartbeat
 from .celery_app import celery_app
 from .db import SessionLocal
 from .llm_models import default_model, platform_models
 from .models import Project, ProjectUpload, Schedule, Task, User
 from .sources import effective_repo_branches, effective_repos
 from .targets import effective_targets
-from .tasks import new_task_id, run_scan
+from .tasks import _ACTIVE_SCAN_STATUSES, finish_as_cancelled, new_task_id, run_scan
 from .tasklog import append_log as _log
 
 BJT = timezone(timedelta(hours=8))  # 北京时间（cron 解释时区）
@@ -300,3 +301,53 @@ def dispatch_due_schedules() -> dict:
 
 def new_schedule_id() -> str:
     return uuid.uuid4().hex
+
+
+# ===================== 僵尸任务回收 =====================
+
+# worker 容器重启等意外会留下状态卡在运行态、实际无人执行的任务，其 Celery 消息要等
+# broker visibility_timeout（Redis 默认 1 小时）才重投递，期间取消也不生效。beat 每分钟
+# 回收：运行态、执行心跳已消失、且 updated_at 停更超过宽限期的任务直接落「已取消」。
+# 宽限期的作用是防误杀：活任务每次写日志/状态变更都会刷新 updated_at（列上有
+# onupdate），而心跳标记在 Redis 重启后会短暂全灭、由心跳线程数秒内重建——
+# 宽限期远大于重建间隙，覆盖这段窗口；刚准入的任务 updated_at 也足够新。
+RECLAIM_GRACE_SEC = 120
+
+
+def _aware(dt: datetime | None) -> datetime | None:
+    """统一为带时区时间再比较（sqlite 等方言可能返回 naive UTC）。"""
+    if dt is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+@celery_app.task(name="reclaim_zombie_tasks")
+def reclaim_zombie_tasks() -> dict:
+    """每分钟由 beat 敲一次：回收无执行者的运行态任务（详见上方 RECLAIM_GRACE_SEC 注释）。"""
+    db = SessionLocal()
+    reclaimed: list[str] = []
+    try:
+        now = datetime.now(timezone.utc)
+        rows = db.execute(
+            select(Task).where(Task.status.in_(_ACTIVE_SCAN_STATUSES))
+        ).scalars().all()
+        for task in rows:
+            ref = _aware(task.updated_at) or _aware(task.started_at)
+            if ref is not None and (now - ref).total_seconds() < RECLAIM_GRACE_SEC:
+                continue  # 最近仍有活动/刚准入：不是僵尸，交给执行者或取消接口收尾
+            if has_heartbeat(task.id):
+                continue  # 有执行心跳：worker 正在执行
+            try:
+                finish_as_cancelled(
+                    db, task, task.id,
+                    "worker 未在执行该任务（执行心跳消失，可能发生过容器重启），已自动回收",
+                    clear_marks=False,
+                )
+                reclaimed.append(task.id)
+            except Exception:  # noqa: BLE001 —— 单个任务收尾失败不阻断整轮回收
+                db.rollback()
+    finally:
+        db.close()
+    if reclaimed:
+        return {"reclaimed": len(reclaimed), "task_ids": reclaimed}
+    return {"reclaimed": 0}

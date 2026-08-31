@@ -22,10 +22,15 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,
     task_time_limit=0,  # 超时由 runner 内部按模式控制并优雅回收
     # 定时扫描：beat 每分钟敲一次轮询任务（worker 以 --beat 内嵌启动，见 compose），
-    # 到期判断与补跑逻辑见 app.schedules.dispatch_due_schedules
+    # 到期判断与补跑逻辑见 app.schedules.dispatch_due_schedules；
+    # 僵尸任务回收见 app.schedules.reclaim_zombie_tasks
     beat_schedule={
         "dispatch-due-schedules": {
             "task": "dispatch_due_schedules",
+            "schedule": 60.0,
+        },
+        "reclaim-zombie-tasks": {
+            "task": "reclaim_zombie_tasks",
             "schedule": 60.0,
         },
     },
