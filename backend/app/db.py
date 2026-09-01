@@ -40,6 +40,7 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         ("diff_base", "VARCHAR(255) DEFAULT ''"),
         ("api_specs", "TEXT DEFAULT ''"),
         ("resume_count", "INTEGER DEFAULT 0"),
+        ("sandbox_container_ids", "TEXT DEFAULT ''"),
     ],
     "findings": [
         ("poc_description", "TEXT DEFAULT ''"),

@@ -110,6 +110,29 @@ def _set_status(db, task, status: str) -> None:
     db.commit()
 
 
+def _remember_sandbox_container(task_id: str, container_id: str) -> None:
+    """扫描运行期间增量登记沙箱容器 ID（runner 尾随线程回调，跨线程用独立短会话）。
+
+    兜底清扫要区分「运行中任务的容器」（绝不回收）与孤儿容器；worker 中途崩溃时
+    任务收尾代码不会执行，只有边创建边登记才保证运行中超长扫描（timeout_disabled
+    不限时）的容器不因扫描时长超过清扫阈值而被误杀。
+    """
+    db = SessionLocal()
+    try:
+        task = db.get(Task, task_id)
+        if task is None:
+            return
+        ids = json.loads(task.sandbox_container_ids or "[]")
+        if container_id not in ids:
+            ids.append(container_id)
+            task.sandbox_container_ids = json.dumps(ids[-32:], ensure_ascii=False)
+            db.commit()
+    except Exception:  # noqa: BLE001 —— 登记失败不影响扫描
+        db.rollback()
+    finally:
+        db.close()
+
+
 def finish_as_cancelled(db, task, task_id: str, detail: str = "", clear_marks: bool = True) -> dict:
     """任务以「已取消」收尾：终态时间/时长/日志，不解析产物、不翻译、不发提醒邮件。
 
@@ -529,6 +552,7 @@ def run_scan(self, task_id: str) -> dict:
             spec_files=spec_files,
             skills_dir=skills_dir,
             steer_check=lambda: pop_steer(task_id),
+            on_sandbox_id=lambda cid: _remember_sandbox_container(task_id, cid),
         )
         task.exit_code = result["exit_code"]
         task.attempts = result["attempts"]

@@ -402,16 +402,18 @@ onUnmounted(() => { clearInterval(timer); themeObserver?.disconnect() })
               :title="'点击查看完整明细'"
               @click="openFinding(f)"
             >
-              <span :class="sevBadgeClass(f.severity)">{{ (sevLabel[f.severity] || f.severity).toUpperCase() }}</span>
+              <span class="shrink-0 whitespace-nowrap" :class="sevBadgeClass(f.severity)">{{ (sevLabel[f.severity] || f.severity).toUpperCase() }}</span>
               <span
                 v-if="f.finding_class === 'dynamic'"
-                class="shrink-0 rounded-full bg-ok/15 px-2 py-0.5 text-[10.5px] font-bold text-ok"
+                class="shrink-0 whitespace-nowrap rounded-full bg-ok/15 px-2 py-0.5 text-[10.5px] font-bold text-ok"
                 title="引擎已在运行环境中实测验证（PoC 动态验证）"
               >已验证</span>
-              <span v-if="f.status && f.status !== 'open'" :class="findingStatusBadgeClass(f.status)">{{ findingStatusLabels[f.status] || f.status }}</span>
-              <span class="min-w-0 flex-1 truncate text-[14px] font-semibold text-text" :class="f.status === 'ignored' || f.status === 'false_positive' ? 'opacity-60' : ''">{{ title(f) }}</span>
-              <span class="hidden shrink-0 text-xs text-muted sm:inline">
-                <template v-if="f.method">{{ f.method }} </template>{{ f.endpoint || f.target || '-' }} · CVSS {{ f.cvss ?? '-' }} · {{ f.cwe || '-' }} · {{ f.has_poc ? '有 PoC' : '无 PoC' }}
+              <span v-if="f.status && f.status !== 'open'" class="shrink-0 whitespace-nowrap" :class="findingStatusBadgeClass(f.status)">{{ findingStatusLabels[f.status] || f.status }}</span>
+              <span class="min-w-0 flex-1">
+                <span class="line-clamp-2 break-words text-[14px] leading-snug font-semibold text-text" :class="f.status === 'ignored' || f.status === 'false_positive' ? 'opacity-60' : ''">{{ title(f) }}</span>
+                <span class="mt-0.5 block break-all text-xs text-muted">
+                  <template v-if="f.method">{{ f.method }} </template>{{ f.endpoint || f.target || '-' }} · CVSS {{ f.cvss ?? '-' }} · {{ f.cwe || '-' }} · {{ f.has_poc ? '有 PoC' : '无 PoC' }}
+                </span>
               </span>
               <span class="shrink-0 text-xs text-muted" title="进入详情页">›</span>
             </button>

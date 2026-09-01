@@ -149,6 +149,9 @@ class Task(Base):
     exit_code = Column(Integer, nullable=True)
     attempts = Column(Integer, default=0)
     timed_out = Column(Boolean, default=False)
+    # JSON [容器 id]：本任务历次 run 创建的沙箱容器。扫描期间增量登记（兜底清扫据此
+    # 保护运行中任务的容器不被回收），任务结束时 runner 会逐一强制移除
+    sandbox_container_ids = Column(Text, default="")
     duration_sec = Column(Integer, nullable=True)
     total_tokens = Column(BigInteger, nullable=True)
     input_tokens = Column(BigInteger, nullable=True)

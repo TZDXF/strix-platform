@@ -13,7 +13,7 @@ WORKER_POOL_SIZE = 8
 
 celery_app = Celery("strix_platform", broker=settings.redis_url, backend=settings.redis_url)
 celery_app.conf.update(
-    include=["app.tasks", "app.translate", "app.schedules"],
+    include=["app.tasks", "app.translate", "app.schedules", "app.sandbox"],
     task_serializer="json",
     accept_content=["json"],
     worker_pool="threads",
@@ -23,7 +23,8 @@ celery_app.conf.update(
     task_time_limit=0,  # 超时由 runner 内部按模式控制并优雅回收
     # 定时扫描：beat 每分钟敲一次轮询任务（worker 以 --beat 内嵌启动，见 compose），
     # 到期判断与补跑逻辑见 app.schedules.dispatch_due_schedules；
-    # 僵尸任务回收见 app.schedules.reclaim_zombie_tasks
+    # 僵尸任务回收见 app.schedules.reclaim_zombie_tasks；
+    # 沙箱容器兜底清扫见 app.sandbox.cleanup_stale_sandboxes
     beat_schedule={
         "dispatch-due-schedules": {
             "task": "dispatch_due_schedules",
@@ -32,6 +33,10 @@ celery_app.conf.update(
         "reclaim-zombie-tasks": {
             "task": "reclaim_zombie_tasks",
             "schedule": 60.0,
+        },
+        "cleanup-stale-sandboxes": {
+            "task": "cleanup_stale_sandboxes",
+            "schedule": 1800.0,
         },
     },
 )

@@ -9,6 +9,8 @@
 - --resume <run_name> 从 run 目录恢复根/子智能体完整 LLM 历史；恢复时传新 --instruction
   会被引擎注入根智能体会话（runner.resume_instruction），平台用它实现运行中转向
 - 无头子进程默认无自定义技能通道：经 python -c 引导段先 register_skill_dir 再进引擎主入口
+- 正常结束（退出码 0）但登记漏洞为 0 时，平台自动 --resume 追问根智能体一轮（0 漏洞核实轮）：
+  弱模型可能把发现只写进报告文本而不调登记工具，这轮让它补登记或说明空结果原因
 """
 
 from __future__ import annotations
@@ -27,6 +29,25 @@ from .config import get_settings
 from .tasklog import now_bj
 
 RETRY_MARKER = "LLM CONNECTION FAILED"
+
+# 0 漏洞核实轮：只是收尾追问（补登记/说明原因），不应跑成第二次完整扫描，固定 20 分钟上限
+_VERIFY_TIMEOUT_SEC = 20 * 60
+
+# 核实轮注入根智能体的追问指令（英文与平台其他注入指令一致，回复要求中文）
+_VERIFY_INSTRUCTION = (
+    "POST-SCAN VERIFICATION (final wrap-up round; do NOT start a broad new scan):\n"
+    "The scan has ended with 0 registered vulnerabilities. Registered findings are the ONLY "
+    "thing the platform imports — security issues described only in your executive summary "
+    "or report prose are NOT counted. Now:\n"
+    "1. Re-check the issues you investigated during this run (your todo list, notes and the "
+    "summary you wrote).\n"
+    "2. For each real, confirmed security issue you found but did NOT register, register it "
+    "NOW via the vulnerability reporting tool (target/severity/description/PoC as required, "
+    "following the target mapping rules given earlier).\n"
+    "3. If you genuinely found no issues, reply with a short explanation in Simplified "
+    "Chinese (简体中文) of why the result is 0 (e.g. scope/mode limits, target unreachable, "
+    "code clean in the areas examined)."
+)
 
 # strix 对这些前缀有专门路由，不加 openai/ 前缀
 _PASSTHROUGH_PREFIXES = ("openai/", "litellm/", "any-llm/", "ollama/")
@@ -99,7 +120,17 @@ def _summarize_strix_line(line: str, state: dict) -> str | None:
         return f"[scan] 模型解析: {m.group(1)}"
     m = re.search(r"Sandbox container created: id=(\w+)", line)
     if m:
-        return f"[scan] 沙箱容器已创建（id {m.group(1)}）"
+        cid = m.group(1)
+        ids = state.setdefault("sandbox_ids", [])
+        if cid not in ids:
+            ids.append(cid)
+            cb = state.get("on_sandbox_id")
+            if cb:  # 增量外报：兜底清扫需在扫描进行中就知道哪些容器属运行中任务
+                try:
+                    cb(cid)
+                except Exception:  # noqa: BLE001 —— 登记失败不影响扫描
+                    pass
+        return f"[scan] 沙箱容器已创建（id {cid}）"
     if "Sandbox ready for scan" in line or "ready and cached" in line:
         return "[scan] 沙箱就绪（Docker 沙箱 + Caido 代理）"
     m = re.search(r"Built root agent '([^']+)' \(skills=\d+, tools=(\d+), scan_mode=(\w+), whitebox=(\w+)\)", line)
@@ -171,15 +202,24 @@ def _scan_log_tail(work_dir: Path, limit: int = 300) -> str:
     return re.sub(r"\S*strix_runs/\S*", "<run目录>", tail)
 
 
-def _tail_strix_log(work_dir: Path, log: Callable[[str], None], stop: threading.Event) -> None:
+def _tail_strix_log(
+    work_dir: Path,
+    log: Callable[[str], None],
+    stop: threading.Event,
+    sandbox_ids: list[str] | None = None,
+    on_sandbox_id: Callable[[str], None] | None = None,
+) -> None:
     """后台 tail 最新 strix_runs/*/strix.log，把关键事件转发进任务日志。
 
     仅在 execute_scan 等待子进程期间运行（wait 返回即被 join），log 回调
-    不会与主线程并发使用 DB 会话。
+    不会与主线程并发使用 DB 会话。sandbox_ids 为调用方持有的共享列表，解析到
+    「Sandbox container created」就追加并触发 on_sandbox_id（增量登记用）。
     """
     state: dict = {
         "agents": {}, "results": -1, "turn": None,
         "llm_calls": 0, "tool_calls": 0, "last_tool": "", "last_action": "",
+        "sandbox_ids": sandbox_ids if sandbox_ids is not None else [],
+        "on_sandbox_id": on_sandbox_id,
     }
     offsets: dict[Path, int] = {}
     current: Path | None = None
@@ -276,6 +316,23 @@ def _run_resumable(work_dir: Path, run_name: str) -> bool:
     return bool(run_name) and (work_dir / "strix_runs" / run_name / "agents.json").is_file()
 
 
+def _registered_findings(work_dir: Path, run_name: str) -> int:
+    """run 目录已登记漏洞数（vulnerabilities.json；缺失/损坏按 0）。
+
+    平台导入漏洞的唯一来源就是这份文件（read_run_artifacts 同源），
+    “是否为 0”以它为准，而不是报告文本。
+    """
+    import json
+
+    try:
+        data = json.loads(
+            (work_dir / "strix_runs" / run_name / "vulnerabilities.json").read_text(encoding="utf-8")
+        )
+        return len(data) if isinstance(data, list) else 0
+    except (OSError, ValueError):
+        return 0
+
+
 def _kill_tree(proc: subprocess.Popen) -> None:
     """终止子进程及其全部子孙（strix CLI 自身会派生 docker 等子进程）。
 
@@ -308,6 +365,36 @@ def _kill_tree(proc: subprocess.Popen) -> None:
             pass
 
 
+def _remove_sandbox_containers(ids: list[str], log: Callable[[str], None]) -> None:
+    """任务结束后回收本次 run 创建的沙箱容器（docker rm -f，尽力而为）。
+
+    杀掉 CLI 进程树不会停掉 daemon 上已启动的容器（强杀 docker 客户端，容器照跑），
+    取消/超时/转向/重试耗尽等强杀出口都会泄漏沙箱，故在 execute_scan 的收尾处显式
+    移除；引擎正常退出已自行清理的容器按 NotFound 忽略。docker 不可用（如本机直跑
+    无 sock）时静默跳过，残留容器交由兜底清扫回收。
+    """
+    if not ids:
+        return
+    try:
+        import docker
+        from docker.errors import NotFound
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        client = docker.from_env(timeout=15)
+    except Exception:  # noqa: BLE001
+        return
+    for cid in dict.fromkeys(ids):  # 去重保序：多路并行/续扫可能登记同一容器
+        try:
+            client.containers.get(cid).remove(force=True)
+            log(f"[scan] 沙箱容器已回收（id {cid}）")
+        except NotFound:
+            pass
+        except Exception as exc:  # noqa: BLE001 —— 单个容器失败不阻断收尾
+            log(f"[scan][警告] 沙箱容器回收失败（id {cid}）: {exc}")
+    client.close()
+
+
 def execute_scan(
     work_dir: Path,
     src_dirs: list[Path],
@@ -325,8 +412,9 @@ def execute_scan(
     spec_files: list[Path] | None = None,
     skills_dir: Path | None = None,
     steer_check: Callable[[], str] | None = None,
+    on_sandbox_id: Callable[[str], None] | None = None,
 ) -> dict:
-    """运行 strix，返回 {exit_code, timed_out, cancelled, run_dir_name, attempts, resume_used}。
+    """运行 strix，返回 {exit_code, timed_out, cancelled, run_dir_name, attempts, resume_used, sandbox_ids}。
 
     src_dirs 为白盒源码目录列表（多仓库任务每仓库一个目录）：strix 的 -t 可重复
     传多个目标，每个目录各占一个 -t，引擎为每个目标分配独立的 /workspace/<目录名>
@@ -341,8 +429,14 @@ def execute_scan(
     instruction → --resume 立即续扫（引擎把新指令注入根智能体会话），不占用重试次数；
     run 目录尚不可恢复时退化为带新指令的全量重启。skills_dir 非空时注入平台技能目录。
     cancel_check 返回 True 时终止进程树并放弃后续重试（结果 cancelled=True）。
+    on_sandbox_id 在解析到沙箱容器创建时即时回调（跨线程，须自行保证可重入），
+    供调用方在扫描进行中增量登记容器；返回值 sandbox_ids 为本次全部容器 ID。
+    任务结束（含取消/超时/转向等强杀出口）时逐一 docker rm -f 回收这些容器。
     timeout_disabled=True 时不限时运行：跳过档位默认时长的超时回收（多仓库/大型
     项目扫描常超出档位上限），仅保留用户取消/转向通道。
+    正常结束（退出码 0）但登记漏洞为 0 时追加一轮“0 漏洞核实轮”（strix_verify_zero_findings
+    开关，默认开）：--resume 追问根智能体一次，补登记漏报的发现或说明空结果原因；
+    核实轮固定 20 分钟上限、不占用重试次数，其取消/超时不改变主扫描的结果状态。
     """
     s = get_settings()
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -395,6 +489,7 @@ def execute_scan(
     timed_out = False
     cancelled = False
     attempts = 0
+    sandbox_ids: list[str] = []  # 本次任务历次 run 创建的沙箱容器，结束（含强杀出口）统一回收
 
     while True:
         if cancel_check and cancel_check():
@@ -425,7 +520,10 @@ def execute_scan(
         # tail 线程只在 proc 存活期间运行，wait 返回（含超时/取消/转向）即 join，
         # 保证 log 回调（写 DB）不与主线程并发
         stop_evt = threading.Event()
-        mon = threading.Thread(target=_tail_strix_log, args=(work_dir, log, stop_evt), daemon=True)
+        mon = threading.Thread(
+            target=_tail_strix_log, args=(work_dir, log, stop_evt, sandbox_ids, on_sandbox_id),
+            daemon=True,
+        )
         mon.start()
         try:
             with scan_log.open("ab") as out:
@@ -516,6 +614,70 @@ def execute_scan(
     if run_dir_name:
         log(f"[scan] run 目录: {run_dir_name}")
 
+    # ---- 0 漏洞核实轮：正常结束但登记漏洞为 0，--resume 追问根智能体一次 ----
+    # 弱模型可能把发现只写进报告文本而不调登记工具（平台只导入 vulnerabilities.json），
+    # 页面就显示 0。这轮让它补登记或确认空结果；只追问一次，不占用重试次数，
+    # 核实轮的取消/超时不改变主扫描的结果状态（cancelled/timed_out/exit_code 保持原值）。
+    if (
+        s.strix_verify_zero_findings
+        and not cancelled
+        and not timed_out
+        and exit_code == 0
+        and run_dir_name
+        and _run_resumable(work_dir, run_dir_name)
+        and _registered_findings(work_dir, run_dir_name) == 0
+    ):
+        log("[scan] 扫描正常结束但登记漏洞为 0，追加核实轮：追问根智能体是否有漏登记的发现")
+        instruction = f"{instruction}\n\n{_VERIFY_INSTRUCTION}".strip()
+        cmd = _build_cmd()
+        log(f"[scan] 命令: {_display_cmd(cmd, work_dir)}")
+        stop_evt = threading.Event()
+        mon = threading.Thread(
+            target=_tail_strix_log, args=(work_dir, log, stop_evt, sandbox_ids, on_sandbox_id),
+            daemon=True,
+        )
+        mon.start()
+        verify_exit: int | None = None
+        try:
+            with scan_log.open("ab") as out:
+                out.write(f"\n===== verify {now_bj().strftime('%Y-%m-%dT%H:%M:%S')} =====\n".encode())
+                proc = subprocess.Popen(
+                    cmd, cwd=str(work_dir), stdout=out, stderr=subprocess.STDOUT, env=env,
+                    start_new_session=(os.name != "nt"),
+                )
+                started = time.monotonic()
+                while True:
+                    try:
+                        verify_exit = proc.wait(timeout=2)
+                        break
+                    except subprocess.TimeoutExpired:
+                        if cancel_check and cancel_check():
+                            log("[scan] 核实轮收到取消请求，终止引擎进程")
+                            _kill_tree(proc)
+                            proc.wait(timeout=60)
+                            break
+                        if time.monotonic() - started >= _VERIFY_TIMEOUT_SEC:
+                            log("[scan] 核实轮超时（20 分钟上限），终止引擎进程；主扫描结果不受影响")
+                            _kill_tree(proc)
+                            proc.wait(timeout=60)
+                            break
+        finally:
+            stop_evt.set()
+            mon.join(timeout=10)
+
+        registered = _registered_findings(work_dir, run_dir_name)
+        if registered > 0:
+            log(f"[scan] 核实轮生效：智能体补登记了 {registered} 个漏洞，产物解析按新结果入库")
+        else:
+            log(
+                f"[scan] 核实轮结束（退出码 {verify_exit}）：登记漏洞仍为 0，"
+                "智能体的空结果说明见执行摘要报告与智能体执行记录"
+            )
+
+    # 沙箱回收必须放在 while 循环之后：取消/超时/转向/重试耗尽都经 break 走到这里，
+    # 只有引擎进程本身的未捕获异常才绕过（残留容器由兜底清扫按 12 小时无主回收）
+    _remove_sandbox_containers(sandbox_ids, log)
+
     return {
         "exit_code": exit_code,
         "timed_out": timed_out,
@@ -524,6 +686,7 @@ def execute_scan(
         "attempts": attempts,
         "resume_used": resume_used,
         "steered": len(steered_msgs),
+        "sandbox_ids": list(sandbox_ids),
     }
 
 

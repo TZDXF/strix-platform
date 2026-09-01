@@ -62,6 +62,10 @@ class Settings(BaseSettings):
     # 原样追加的额外 CLI 参数（shlex 切分，如 "--scope-mode diff --config /path.json"）
     strix_extra_args: str = ""
 
+    # 0 漏洞核实轮：任务正常结束但登记漏洞为 0 时，自动 --resume 追问根智能体一次，
+    # 让其补登记漏报的发现或说明空结果原因（弱模型常把发现只写进报告文本而不调登记工具）
+    strix_verify_zero_findings: bool = True
+
     # 联网搜索（可选）：内网 MCP 搜索端点（Streamable HTTP，JSON-RPC 直调）。
     # 配置后自动生成/刷新技能库中的「联网搜索」内置技能（custom/web_search_internal），
     # 任务勾选「联网搜索」时指令仅注入技能加载指引，调用方法沉淀在技能正文；留空 = 功能关闭
