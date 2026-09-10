@@ -65,7 +65,7 @@ onUnmounted(() => clearInterval(timer))
           <td :class="tableTd">{{ t.project_name }}</td>
           <td :class="tableTd">
             <span :class="statusBadgeClass(t.status)" :title="t.status">{{ taskStatusLabel[t.status] || t.status }}</span>
-            <span v-if="t.timed_out" :class="[statusBadgeClass('failed'), 'ml-1']" title="扫描达到档位默认时长被超时回收">超时终止</span>
+            <span v-if="t.timed_out && t.status !== 'done'" :class="[statusBadgeClass('failed'), 'ml-1']" title="扫描达到档位默认时长被超时回收">超时终止</span>
             <span v-if="t.schedule_id" :class="badge" class="ml-1 bg-accent/15 text-accent" title="由定时计划自动发起">定时</span>
             <span v-if="t.zh_status === 'pending'" :class="badge" class="ml-1 bg-[#9b7bff]/15 text-[#a78bfa]">翻译中</span>
           </td>
