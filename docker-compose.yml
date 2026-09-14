@@ -17,6 +17,11 @@ services:
 
   redis:
     image: redis:7.2
+    # broker 持久化（AOF）：pending 排队消息、槽位满时的 30 秒重排队消息落盘，
+    # 重部署重建 redis 容器不再丢队列；worker 启动恢复（app.tasks）为兜底
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - ./docker/data/redis:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s

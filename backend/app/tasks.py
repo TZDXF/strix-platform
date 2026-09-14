@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from celery.signals import worker_ready as celery_worker_ready
 from sqlalchemy import delete, func, select
 
 from .artifacts import archive_run
@@ -294,7 +295,6 @@ def _exec_channel_error_count(scan_dir: Path, run_dir_name: str) -> int:
 
 K_SCAN_CONCURRENCY = "scan_concurrency"  # system_settings 键：最大并行扫描数
 SCAN_CONCURRENCY_DEFAULT = 2             # 未配置时的默认并行扫描数
-SCAN_QUEUE_RETRY_SEC = 30                # 槽位满时的重排队间隔（秒）
 _ACTIVE_SCAN_STATUSES = ("fetching", "scanning", "parsing")
 # 单 worker 内并发线程取任务的准入串行化；多 worker 副本间仅由 DB 计数兜底，可能偶发超 1
 _SCAN_ADMISSION_LOCK = threading.Lock()
@@ -326,8 +326,9 @@ def set_scan_concurrency(db, value: int, user_id: int | None) -> None:
 def _admit_scan_slot(db, task) -> bool:
     """并行扫描闸门：占用一个扫描槽位返回 True；槽位满返回 False（任务保持排队）。
 
-    排队任务状态保持 pending、不占用 worker 线程，由调用方定时重排队；
-    重投递的运行态消息（如 worker 重启后的 acks_late 重投递、续扫）视为已占槽直接放行。
+    排队任务状态保持 pending、不占用 worker 线程，由 beat 每分钟重投递等空位
+    （redispatch_pending_tasks）；重投递的运行态消息（如 worker 重启后的
+    acks_late 重投递、续扫）视为已占槽直接放行。
     """
     if task.status in _ACTIVE_SCAN_STATUSES:
         return True
@@ -369,9 +370,10 @@ def run_scan(self, task_id: str) -> dict:
         db.close()
         return result
     if not _admit_scan_slot(db, task):
-        # 槽位满：状态保持 pending、不占 worker 线程，稍后自动重排队等空位
+        # 槽位满：状态保持 pending、不占 worker 线程。不在这里自排队（消息链会随
+        # 卡队时长无限累积，且任何一条丢失就没人再驱动），统一由 beat 每分钟的
+        # redispatch_pending_tasks 重新投递，最多 1 分钟后自然重试
         db.close()
-        run_scan.apply_async(args=[task_id], countdown=SCAN_QUEUE_RETRY_SEC)
         return {"task_id": task_id, "queued": True}
     if has_heartbeat(task_id):
         # 重入防护：任务仍处运行态且已有活着的执行者（心跳存在），本次必是重复
@@ -740,3 +742,49 @@ def run_scan(self, task_id: str) -> dict:
 
 def new_task_id() -> str:
     return uuid.uuid4().hex
+
+
+# ---- 等待中任务重投递：beat 每分钟 + worker 启动时各触发一次 ----
+
+def _redispatch_pending() -> list[str]:
+    """把 DB 里仍处 pending 的任务全部重新投递，返回补投的任务 id 列表。
+
+    pending 任务靠 broker 消息驱动，而消息可能丢失（redis 容器重建、队列清理），
+    也没有别的机制会再驱动它们——僵尸回收只管运行态，任务就会永远停在「等待中」。
+    以 DB 状态为准周期性补投是自愈层：消息尚在时重复投递无害（run_scan 的取消
+    检查/准入闸门/心跳重入防护保证单执行者，重复消息被跳过或等空位后自然重试）。
+    """
+    db = SessionLocal()
+    try:
+        ids = db.execute(
+            select(Task.id).where(Task.status == "pending").order_by(Task.created_at)
+        ).scalars().all()
+    finally:
+        db.close()
+    for task_id in ids:
+        run_scan.delay(task_id)
+    return list(ids)
+
+
+@celery_app.task(name="redispatch_pending_tasks")
+def redispatch_pending_tasks() -> dict:
+    """每分钟由 beat 敲一次：补投等待中任务。消息丢失/消费中断的最终兜底，
+    与槽位排队共用同一条路径（槽位满时 run_scan 直接返回，下分钟再来）。"""
+    ids = _redispatch_pending()
+    if ids:
+        print(f"[queue] 补投 {len(ids)} 个等待中任务", flush=True)
+    return {"redispatched": len(ids), "task_ids": ids}
+
+
+@celery_worker_ready.connect
+def _redispatch_pending_on_boot(**_: object) -> None:
+    """worker 启动时立即补投一轮（beat 内嵌时 60 秒内也会跑到，这里只是不等）。
+
+    恢复失败不阻断 worker 启动（下一分钟 beat 会再试）。
+    """
+    try:
+        ids = _redispatch_pending()
+        if ids:
+            print(f"[recover] worker 启动：重新派发 {len(ids)} 个等待中任务", flush=True)
+    except Exception as exc:  # noqa: BLE001 —— 启动恢复尽力而为，不影响 worker 就绪
+        print(f"[recover] worker 启动恢复失败（等待中任务未被重新派发）: {exc}", flush=True)

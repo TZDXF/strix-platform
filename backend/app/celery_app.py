@@ -35,6 +35,8 @@ celery_app.conf.update(
     # 定时扫描：beat 每分钟敲一次轮询任务（worker 以 --beat 内嵌启动，见 compose），
     # 到期判断与补跑逻辑见 app.schedules.dispatch_due_schedules；
     # 僵尸任务回收见 app.schedules.reclaim_zombie_tasks；
+    # 等待中任务重投递见 app.tasks.redispatch_pending_tasks（槽位排队与消息丢失
+    # 的统一自愈：pending 任务不依赖任何单条消息存活，每分钟以 DB 状态为准补投）；
     # 沙箱容器兜底清扫见 app.sandbox.cleanup_stale_sandboxes
     beat_schedule={
         "dispatch-due-schedules": {
@@ -43,6 +45,10 @@ celery_app.conf.update(
         },
         "reclaim-zombie-tasks": {
             "task": "reclaim_zombie_tasks",
+            "schedule": 60.0,
+        },
+        "redispatch-pending-tasks": {
+            "task": "redispatch_pending_tasks",
             "schedule": 60.0,
         },
         "cleanup-stale-sandboxes": {

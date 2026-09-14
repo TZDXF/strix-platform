@@ -2142,6 +2142,10 @@ def resume_task(task_id: str, request: Request, db: Session = Depends(get_db), u
     task.status = "pending"
     task.error = ""
     task.finished_at = None
+    # 耗时按本轮重新起算：started_at 由准入闸门置位，不清会把历史轮次的时长
+    # 累加进下次终态的 duration_sec（页面上出现按天计的耗时）
+    task.started_at = None
+    task.duration_sec = None
     task.updated_at = datetime.now(timezone.utc)
     clear_cancel(task_id)
     clear_steer(task_id)

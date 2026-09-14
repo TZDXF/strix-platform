@@ -160,6 +160,7 @@ docker compose up -d --build    # 仅重建有变化的镜像，数据卷（pg/�
 | 归档阶段 `NoSuchBucket` | 正常部署不会出现（api 启动与上传时均自动建桶）；若出现多为 RustFS 密钥与 `.env` 不一致，或 api 启动日志中有 `[startup] S3 归档桶不可用`，检查 `RUSTFS_*` 配置后重启 api |
 | 首个任务卡在 scanning 很久 | 首次扫描需拉取沙箱镜像，可在宿主机预拉取：`docker pull ghcr.io/usestrix/strix-sandbox:<tag>` |
 | 任务日志含 `invalid mount config ... bind source path does not exist`，秒退退出码 1 | 沙箱容器的 bind mount 由宿主 daemon 解析路径且 strix 内部会做 realpath，工作区在容器内挂载点与 daemon 可见路径不一致。默认具名卷部署不会出现；若自行覆盖过 `WORKSPACE_ROOT` 或改回宿主目录 bind 挂载，请恢复 compose 默认（容器 api/worker 启动日志中 entrypoint 诊断会打印对齐指引） |
+| 重新部署后任务停在「等待中」不动；之前运行中的任务变「已取消」 | 后者是设计内行为：worker 重启后原执行者心跳消失，僵尸回收（`reclaim_zombie_tasks`）约 2 分钟内自动落「已取消」，需要时点「续扫」恢复。前者是 pending 任务的消息丢了（旧版 redis 无持久化，队列随容器重建清空）。现已三重保险：redis AOF 落盘（`./docker/data/redis`）、beat 每分钟以 DB 状态为准补投全部 pending 任务（`redispatch_pending_tasks`，槽位排队也走这条路）、worker 启动时立即补投一轮；等待中任务最长 1 分钟内自愈，无需人工干预 |
 | `SECRET_KEY` / `LLM_API_BASE` 启动报错 | `.env` 未填写必填项，对照 `.env.deploy.example` |
 
 > Worker 挂载了 `/var/run/docker.sock`（strix 沙箱通过宿主机 Docker 启动分析容器，镜像内已安装 docker-cli）。
