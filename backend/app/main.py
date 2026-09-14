@@ -87,7 +87,15 @@ from .targets import (
     probe_target,
 )
 from .tasklog import append_log as _append_task_log
-from .tasks import finish_as_cancelled, get_scan_concurrency, new_task_id, run_scan, set_scan_concurrency
+from .tasks import (
+    finish_as_cancelled,
+    get_scan_concurrency,
+    get_workspace_keep_tasks,
+    new_task_id,
+    run_scan,
+    set_scan_concurrency,
+    set_workspace_keep_tasks,
+)
 from .translate import translate_findings_task
 from .celery_app import WORKER_POOL_SIZE
 
@@ -735,6 +743,7 @@ def admin_test_mail_settings(
 
 class ScanSettingsBody(BaseModel):
     scan_concurrency: int
+    workspace_keep_tasks: int
 
 
 @app.get("/api/admin/scan-settings", dependencies=[Depends(require_admin)])
@@ -742,6 +751,7 @@ def admin_get_scan_settings(db: Session = Depends(get_db)):
     return {
         "scan_concurrency": get_scan_concurrency(db),
         "max_concurrency": WORKER_POOL_SIZE,  # worker 线程池硬顶，设置不得超过
+        "workspace_keep_tasks": get_workspace_keep_tasks(db),
     }
 
 
@@ -752,9 +762,17 @@ def admin_save_scan_settings(
 ):
     if not 1 <= body.scan_concurrency <= WORKER_POOL_SIZE:
         raise HTTPException(400, f"并行扫描数需在 1-{WORKER_POOL_SIZE} 之间")
+    if not 0 <= body.workspace_keep_tasks <= 500:
+        raise HTTPException(400, "工作区保留任务数需在 0-500 之间（0 = 不清理）")
     set_scan_concurrency(db, body.scan_concurrency, user_id=admin.id)
-    _audit(db, request, "scan.settings_save", f"scan_concurrency={body.scan_concurrency}", user=admin)
-    return {"scan_concurrency": body.scan_concurrency, "max_concurrency": WORKER_POOL_SIZE}
+    set_workspace_keep_tasks(db, body.workspace_keep_tasks, user_id=admin.id)
+    _audit(db, request, "scan.settings_save",
+           f"scan_concurrency={body.scan_concurrency} workspace_keep_tasks={body.workspace_keep_tasks}", user=admin)
+    return {
+        "scan_concurrency": get_scan_concurrency(db),
+        "max_concurrency": WORKER_POOL_SIZE,
+        "workspace_keep_tasks": get_workspace_keep_tasks(db),
+    }
 
 
 # ===================== 个人 Git 配置（GitLab / GitHub / Gitee） =====================

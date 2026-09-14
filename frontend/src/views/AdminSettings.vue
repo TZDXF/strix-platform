@@ -9,6 +9,7 @@ function fmtTime(iso: string | null) { return iso ? new Date(iso).toLocaleString
 // ---- 扫描并发 ----
 const scanSettings = ref<ScanSettings | null>(null)
 const scanConcurrency = ref(2)
+const workspaceKeepTasks = ref(20)
 const savingScan = ref(false)
 
 async function loadScanSettings() {
@@ -16,6 +17,7 @@ async function loadScanSettings() {
     const s = await api.getScanSettings()
     scanSettings.value = s
     scanConcurrency.value = s.scan_concurrency
+    workspaceKeepTasks.value = s.workspace_keep_tasks
   } catch (e) { toast.error((e as Error).message) }
 }
 
@@ -25,11 +27,16 @@ async function saveScanSettings() {
   if (!Number.isInteger(n) || n < 1 || n > max) {
     toast.error(`并行扫描数需为 1-${max} 之间的整数`); return
   }
+  const keep = Number(workspaceKeepTasks.value)
+  if (!Number.isInteger(keep) || keep < 0 || keep > 500) {
+    toast.error('工作区保留任务数需为 0-500 之间的整数（0 = 不清理）'); return
+  }
   savingScan.value = true
   try {
-    const s = await api.saveScanSettings({ scan_concurrency: n })
+    const s = await api.saveScanSettings({ scan_concurrency: n, workspace_keep_tasks: keep })
     scanSettings.value = s
     scanConcurrency.value = s.scan_concurrency
+    workspaceKeepTasks.value = s.workspace_keep_tasks
     toast.success('扫描并发已保存，立即生效。')
   } catch (e) { toast.error((e as Error).message) } finally { savingScan.value = false }
 }
@@ -248,11 +255,16 @@ onMounted(() => {
   <div class="grid gap-4">
     <!-- 扫描并发 -->
     <div :class="card">
-      <h3 :class="h3">扫描并发</h3>
+      <h3 :class="h3">扫描并发与工作区保留</h3>
       <p :class="hint">
         允许同时执行的扫描任务数（默认 2）。排队超出的任务自动等待空位（列表中保持「排队中」，
         任务日志会提示槽位占用），调整立即生效，无需重启 worker。上限为 worker 线程池硬顶
         {{ scanSettings?.max_concurrency ?? 8 }}；并发越高，宿主机 CPU/内存与 LLM 网关压力越大。
+      </p>
+      <p :class="hint">
+        工作区保留任务数：平台每 6 小时回收较旧任务工作区里的源码副本（git 克隆、zip 解压、
+        API 规范拷贝），只保留最近 N 个任务的源码；漏洞、转录、报告等产物与续扫能力不受影响，
+        续扫/重跑时会自动重新拉取源码。0 = 不清理。
       </p>
       <div class="mt-3 flex flex-wrap items-end gap-2.5">
         <div class="w-[220px]">
@@ -261,6 +273,10 @@ onMounted(() => {
             v-model.number="scanConcurrency" type="number" min="1"
             :max="scanSettings?.max_concurrency ?? 8" :class="input"
           />
+        </div>
+        <div class="w-[220px]">
+          <label :class="label">工作区保留任务数（0 = 不清理）</label>
+          <input v-model.number="workspaceKeepTasks" type="number" min="0" max="500" :class="input" />
         </div>
         <button :class="btn" :disabled="savingScan" @click="saveScanSettings">{{ savingScan ? '保存中…' : '保存' }}</button>
       </div>

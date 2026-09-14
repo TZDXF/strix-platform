@@ -541,6 +541,7 @@ export interface MailSettingsPayload {
 export interface ScanSettings {
   scan_concurrency: number
   max_concurrency: number
+  workspace_keep_tasks: number
 }
 
 export interface GitNamespace {
@@ -622,7 +623,8 @@ export const api = {
   getMailSettings: () => request<MailSettings>('GET', '/api/admin/mail-settings'),
   saveMailSettings: (s: MailSettingsPayload) => request<MailSettings>('PUT', '/api/admin/mail-settings', { json: s }),
   getScanSettings: () => request<ScanSettings>('GET', '/api/admin/scan-settings'),
-  saveScanSettings: (s: { scan_concurrency: number }) => request<ScanSettings>('PUT', '/api/admin/scan-settings', { json: s }),
+  saveScanSettings: (s: { scan_concurrency: number; workspace_keep_tasks: number }) =>
+    request<ScanSettings>('PUT', '/api/admin/scan-settings', { json: s }),
   testMailSettings: (to: string) =>
     request<{ ok: boolean; detail: string }>('POST', '/api/admin/mail-settings/test', { json: { to } }),
 

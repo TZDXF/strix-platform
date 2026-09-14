@@ -22,7 +22,7 @@ celery_app = Celery("strix_platform", broker=settings.redis_url, backend=setting
 _REDIS_VISIBILITY_TIMEOUT = 24 * 3600
 
 celery_app.conf.update(
-    include=["app.tasks", "app.translate", "app.schedules", "app.sandbox"],
+    include=["app.tasks", "app.translate", "app.schedules", "app.sandbox", "app.retention"],
     task_serializer="json",
     accept_content=["json"],
     worker_pool="threads",
@@ -37,7 +37,8 @@ celery_app.conf.update(
     # 僵尸任务回收见 app.schedules.reclaim_zombie_tasks；
     # 等待中任务重投递见 app.tasks.redispatch_pending_tasks（槽位排队与消息丢失
     # 的统一自愈：pending 任务不依赖任何单条消息存活，每分钟以 DB 状态为准补投）；
-    # 沙箱容器兜底清扫见 app.sandbox.cleanup_stale_sandboxes
+    # 沙箱容器兜底清扫见 app.sandbox.cleanup_stale_sandboxes；
+    # 历史任务工作区源码回收见 app.retention.cleanup_task_workspaces（scan/ 产物永不清理）
     beat_schedule={
         "dispatch-due-schedules": {
             "task": "dispatch_due_schedules",
@@ -54,6 +55,10 @@ celery_app.conf.update(
         "cleanup-stale-sandboxes": {
             "task": "cleanup_stale_sandboxes",
             "schedule": 1800.0,
+        },
+        "cleanup-task-workspaces": {
+            "task": "cleanup_task_workspaces",
+            "schedule": 21600.0,  # 每 6 小时
         },
     },
 )

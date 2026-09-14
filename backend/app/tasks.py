@@ -295,7 +295,11 @@ def _exec_channel_error_count(scan_dir: Path, run_dir_name: str) -> int:
 
 K_SCAN_CONCURRENCY = "scan_concurrency"  # system_settings 键：最大并行扫描数
 SCAN_CONCURRENCY_DEFAULT = 2             # 未配置时的默认并行扫描数
+K_WORKSPACE_KEEP_TASKS = "workspace_keep_tasks"  # system_settings 键：工作区源码保留的最近任务数
+WORKSPACE_KEEP_TASKS_DEFAULT = 20                # 未配置时的默认保留数
 _ACTIVE_SCAN_STATUSES = ("fetching", "scanning", "parsing")
+# 终态：工作区源码仅对终态任务可回收（retention.py，运行中任务绝不触碰）
+_TERMINAL_TASK_STATUSES = ("done", "failed", "cancelled")
 # 单 worker 内并发线程取任务的准入串行化；多 worker 副本间仅由 DB 计数兜底，可能偶发超 1
 _SCAN_ADMISSION_LOCK = threading.Lock()
 
@@ -316,6 +320,29 @@ def set_scan_concurrency(db, value: int, user_id: int | None) -> None:
     row = db.get(SystemSetting, K_SCAN_CONCURRENCY)
     if row is None:
         row = SystemSetting(key=K_SCAN_CONCURRENCY, value=str(value), updated_by=user_id)
+        db.add(row)
+    else:
+        row.value = str(value)
+        row.updated_by = user_id
+    db.commit()
+
+
+def get_workspace_keep_tasks(db) -> int:
+    """工作区源码保留的最近任务数（超管在系统设置页维护；0 = 不清理）。"""
+    row = db.get(SystemSetting, K_WORKSPACE_KEEP_TASKS)
+    try:
+        value = int((row.value or "").strip()) if row is not None else -1
+    except ValueError:
+        value = -1
+    if value < 0:
+        return WORKSPACE_KEEP_TASKS_DEFAULT
+    return value
+
+
+def set_workspace_keep_tasks(db, value: int, user_id: int | None) -> None:
+    row = db.get(SystemSetting, K_WORKSPACE_KEEP_TASKS)
+    if row is None:
+        row = SystemSetting(key=K_WORKSPACE_KEEP_TASKS, value=str(value), updated_by=user_id)
         db.add(row)
     else:
         row.value = str(value)
