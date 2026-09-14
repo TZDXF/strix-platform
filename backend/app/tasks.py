@@ -323,17 +323,18 @@ def set_scan_concurrency(db, value: int, user_id: int | None) -> None:
     db.commit()
 
 
-def _admit_scan_slot(db, task) -> bool:
-    """并行扫描闸门：占用一个扫描槽位返回 True；槽位满返回 False（任务保持排队）。
-
-    排队任务状态保持 pending、不占用 worker 线程，由 beat 每分钟重投递等空位
-    （redispatch_pending_tasks）；重投递的运行态消息（如 worker 重启后的
-    acks_late 重投递、续扫）视为已占槽直接放行。
+def _admit_scan_slot(db, task) -> str:
+    """并行扫描闸门，三态返回：
+    - "admitted"：本次调用占位成功（pending → fetching），调用方即是执行者；
+    - "active"：任务已处运行态（重复投递、消息重投递或断点接手），是否放行由
+      调用方结合心跳重入防护决定；
+    - "full"：槽位满，任务保持 pending 排队，由 beat 每分钟重投递等空位
+      （redispatch_pending_tasks）。
     """
-    if task.status in _ACTIVE_SCAN_STATUSES:
-        return True
     limit = get_scan_concurrency(db)
     with _SCAN_ADMISSION_LOCK:
+        if task.status in _ACTIVE_SCAN_STATUSES:
+            return "active"
         active = db.execute(
             select(func.count(Task.id)).where(
                 Task.status.in_(_ACTIVE_SCAN_STATUSES), Task.id != task.id,
@@ -344,13 +345,14 @@ def _admit_scan_slot(db, task) -> bool:
             if not (task.log or "").rstrip().endswith(wait_line):  # 末行相同不重复记，避免刷屏
                 _log(task, wait_line)
                 db.commit()
-            return False
-        # 占位瞬间先触达心跳再置运行态：后续任何并发投递在心跳重入防护处必然
-        # 观察到「已有执行者」，不会有两套执行流水线同时开跑的窗口
+            return "full"
+        # 占位瞬间先触达心跳再置运行态：并发的重复投递在心跳重入防护处必然观察到
+        # 「已有执行者」，不会有两套执行流水线同时开跑的窗口。调用方凭 "admitted"
+        # 返回值知道自己刚触达过心跳，不得再拿它当「他人存在」的证据
         touch_heartbeat(task.id)
         task.started_at = datetime.now(timezone.utc)
         _set_status(db, task, "fetching")  # 占位即置运行态，其他准入线程的计数立即可见
-        return True
+        return "admitted"
 
 
 @celery_app.task(name="run_scan", bind=True, max_retries=1)
@@ -369,17 +371,21 @@ def run_scan(self, task_id: str) -> dict:
         result = finish_as_cancelled(db, task, task_id, "任务在排队等待期间被取消")
         db.close()
         return result
-    if not _admit_scan_slot(db, task):
+    admitted = _admit_scan_slot(db, task)
+    if admitted == "full":
         # 槽位满：状态保持 pending、不占 worker 线程。不在这里自排队（消息链会随
         # 卡队时长无限累积，且任何一条丢失就没人再驱动），统一由 beat 每分钟的
         # redispatch_pending_tasks 重新投递，最多 1 分钟后自然重试
         db.close()
         return {"task_id": task_id, "queued": True}
-    if has_heartbeat(task_id):
-        # 重入防护：任务仍处运行态且已有活着的执行者（心跳存在），本次必是重复
-        # 投递（broker 重投递/重复派发）。放行会与原执行者叠加：Stage 1 清掉对方
-        # 正在扫描的源码、收尾时误删对方沙箱容器（运行中容器被删 → 引擎 404 崩溃）。
-        # 不写任务日志（避免与原执行者并发写同一行）；任务状态由原执行者继续推进。
+    if admitted == "active" and has_heartbeat(task_id):
+        # 重入防护：任务已处运行态且心跳还在（他人占位时触达或其心跳线程在刷新），
+        # 本次必是重复投递（broker 重投递/重复派发）。放行会与原执行者叠加：Stage 1
+        # 清掉对方正在扫描的源码、收尾时误删对方沙箱容器（运行中容器被删 → 引擎
+        # 404 崩溃）。不写任务日志（避免与原执行者并发写同一行）；任务状态由原执行
+        # 者继续推进。"admitted"（刚占位成功）不走这里——闸门刚触达的心跳是自己的，
+        # 拿它当「他人存在」会自己跳过自己，任务永远停在运行态无人执行；心跳已
+        # 消失的运行态（如 worker 崩溃后的消息重投递）由本次调用接手执行。
         print(f"[run_scan] {task_id} 已有活跃执行者（心跳存在），跳过本次重复投递", flush=True)
         db.close()
         return {"task_id": task_id, "skipped": "duplicate_delivery"}
