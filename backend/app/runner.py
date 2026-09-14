@@ -8,6 +8,10 @@
   等待子进程期间由 tail 线程把关键事件翻译后转投任务日志，避免长扫描期间日志空白
 - --resume <run_name> 从 run 目录恢复根/子智能体完整 LLM 历史；恢复时传新 --instruction
   会被引擎注入根智能体会话（runner.resume_instruction），平台用它实现运行中转向
+- 每次 CLI 子进程启动都新建沙箱容器（进程内缓存，引擎不重连旧容器）；反之任何
+  运行中的容器被外部 docker rm 都会让该进程后续的会话操作全线 404 并把智能体
+  逐个标成 crashed——平台绝不能删一个仍有活跃执行者的任务的容器
+  （run_scan 心跳重入防护 + broker visibility_timeout 共同保证单执行者）
 - 无头子进程默认无自定义技能通道：经 python -c 引导段先 register_skill_dir 再进引擎主入口
 - 正常结束（退出码 0）但登记漏洞为 0 时，平台自动 --resume 追问根智能体一轮（0 漏洞核实轮）：
   弱模型可能把发现只写进报告文本而不调登记工具，这轮让它补登记或说明空结果原因
@@ -221,6 +225,17 @@ def _tail_strix_log(
         "sandbox_ids": sandbox_ids if sandbox_ids is not None else [],
         "on_sandbox_id": on_sandbox_id,
     }
+    # 基线快照：本调用启动前已存在的引擎日志只从快照大小起读（只消费本次运行
+    # 追加的内容）。若并发存在另一个调用（重投递残留等），它新建的容器 ID 写在
+    # 它自己的新文件里会被我们当新文件从头消费——但同任务并发本身已被 run_scan
+    # 重入防护排除；基线保证至少"同 run 目录追加"场景不会把旧容器 ID 登记进
+    # 本次 sandbox_ids 而在收尾时误删。
+    baseline: dict[Path, int] = {}
+    try:
+        for p in (work_dir / "strix_runs").glob("*/strix.log"):
+            baseline[p] = p.stat().st_size
+    except OSError:
+        baseline = {}
     offsets: dict[Path, int] = {}
     current: Path | None = None
     buf = b""
@@ -241,7 +256,11 @@ def _tail_strix_log(
                 size = current.stat().st_size
                 off = offsets.get(current)
                 if off is None:
-                    off = 0 if time.time() - current.stat().st_mtime < _TAIL_FRESH_WIN else size
+                    base = baseline.get(current)
+                    if base is not None:
+                        off = base  # 启动前已存在：只读本次运行追加的部分
+                    else:
+                        off = 0 if time.time() - current.stat().st_mtime < _TAIL_FRESH_WIN else size
                 if size < off:  # 文件被截断/轮转，重头跟踪
                     off, buf = 0, b""
                 if size > off:

@@ -18,6 +18,7 @@ from .cancel import (
     cancel_requested,
     clear_cancel,
     clear_steer,
+    has_heartbeat,
     pop_steer,
     touch_heartbeat,
 )
@@ -269,6 +270,26 @@ def _scan_error_detail(scan_dir: Path) -> str:
     return ""
 
 
+# 沙箱执行通道故障判定阈值：引擎日志里 ExecTransportError 出现次数。
+# 容器在扫描中被外部删除/沙箱损坏时，智能体每次 exec_command 都失败（事故中
+# 重试 110+ 次），引擎最终"正常完成"却 0 发现——环境故障伪装成扫描完成。
+# 超过阈值且登记漏洞为 0 时按执行失败处理，而不是"无漏洞完成"。
+_EXEC_ERROR_THRESHOLD = 20
+
+
+def _exec_channel_error_count(scan_dir: Path, run_dir_name: str) -> int:
+    """统计本次 run 的引擎日志里沙箱命令执行失败（ExecTransportError）次数。"""
+    if not run_dir_name:
+        return 0
+    try:
+        text = (scan_dir / "strix_runs" / run_dir_name / "strix.log").read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        return 0
+    return text.count("ExecTransportError")
+
+
 # ---- 并行扫描闸门 ----
 
 K_SCAN_CONCURRENCY = "scan_concurrency"  # system_settings 键：最大并行扫描数
@@ -323,6 +344,9 @@ def _admit_scan_slot(db, task) -> bool:
                 _log(task, wait_line)
                 db.commit()
             return False
+        # 占位瞬间先触达心跳再置运行态：后续任何并发投递在心跳重入防护处必然
+        # 观察到「已有执行者」，不会有两套执行流水线同时开跑的窗口
+        touch_heartbeat(task_id)
         task.started_at = datetime.now(timezone.utc)
         _set_status(db, task, "fetching")  # 占位即置运行态，其他准入线程的计数立即可见
         return True
@@ -349,6 +373,14 @@ def run_scan(self, task_id: str) -> dict:
         db.close()
         run_scan.apply_async(args=[task_id], countdown=SCAN_QUEUE_RETRY_SEC)
         return {"task_id": task_id, "queued": True}
+    if has_heartbeat(task_id):
+        # 重入防护：任务仍处运行态且已有活着的执行者（心跳存在），本次必是重复
+        # 投递（broker 重投递/重复派发）。放行会与原执行者叠加：Stage 1 清掉对方
+        # 正在扫描的源码、收尾时误删对方沙箱容器（运行中容器被删 → 引擎 404 崩溃）。
+        # 不写任务日志（避免与原执行者并发写同一行）；任务状态由原执行者继续推进。
+        print(f"[run_scan] {task_id} 已有活跃执行者（心跳存在），跳过本次重复投递", flush=True)
+        db.close()
+        return {"task_id": task_id, "skipped": "duplicate_delivery"}
     clear_steer(task_id)  # 防御：清理上次运行未消费的转向标记，避免新任务被旧指令误转向
     # 执行心跳：占槽成功即启动，全程覆盖取源码/扫描/解析各阶段，finally 统一停止
     hb_stop = threading.Event()
@@ -378,10 +410,10 @@ def run_scan(self, task_id: str) -> dict:
     task.strix_version = s.strix_version
     resume_run = ""
     if task.resume_count and task.resume_count > 0 and task.run_dir_name:
-        # 手动续扫：以任务记录的 run 目录为断点（run 目录被清理时 execute_scan 会自动退化为重跑）
+        # 手动续扫：以任务记录的 run 目录为断点（run 目录被清理时 execute_scan 会自动退化为重跑）。
+        # 不预先清空上一轮的转录/回放缓存：收尾成功会按新日志重解析覆盖，失败则保留旧值
+        #（否则续扫失败会把上一轮成功的执行过程一起毁掉）。
         resume_run = task.run_dir_name
-        task.execution_events = ""  # 上一轮回放缓存作废，收尾后按新日志重解析
-        task.transcript = ""  # 执行步骤转录同样作废
         _log(task, f"[task] 第 {task.resume_count} 次续扫：从 run「{resume_run}」断点恢复（--resume）")
     task.attempts = 0
 
@@ -568,6 +600,39 @@ def run_scan(self, task_id: str) -> dict:
         # ---- Stage 3: 产物解析入库 ----
         _set_status(db, task, "parsing")
         run_record, vulns = read_run_artifacts(scan_dir, result["run_dir_name"])
+        # 失败保留：本轮引擎报错（退出码 1），或沙箱执行通道整体故障（大量
+        # exec 失败 + 0 登记，环境故障伪装成"无漏洞完成"）时，不删旧 findings、
+        # 不覆盖转录/报告/用量——尤其续扫失败不应毁掉此前成功的扫描结果。
+        run_failed = task.exit_code == 1 and not task.timed_out
+        exec_error_count = _exec_channel_error_count(scan_dir, result["run_dir_name"])
+        env_broken = not vulns and exec_error_count >= _EXEC_ERROR_THRESHOLD
+        if run_failed or env_broken:
+            if run_failed:
+                detail = _scan_error_detail(scan_dir)
+                task.error = f"strix 执行失败（退出码 1）：{detail or '详见任务日志与归档产物'}"
+            else:
+                task.error = (
+                    f"沙箱命令执行通道故障（exec transport error ×{exec_error_count}），"
+                    "引擎未能实际执行扫描，本轮未产出有效结果"
+                )
+            _log(
+                task,
+                "[parse] " + ("本轮执行失败" if run_failed else "沙箱执行通道故障")
+                + (f"（原结果 {task.findings_count} 条保留）" if task.findings_count else "，本轮无有效结果"),
+            )
+            try:
+                task.artifacts_ref = archive_run(scan_dir, result["run_dir_name"], task_id, artifacts_dir)
+                _log(task, f"[archive] 失败轮产物已归档: {task.artifacts_ref}")
+            except Exception as exc:  # 归档失败不影响结果
+                _log(task, f"[archive] 归档失败（不影响结果）: {exc}")
+            task.finished_at = datetime.now(timezone.utc)
+            if task.started_at:
+                task.duration_sec = int((task.finished_at - task.started_at).total_seconds())
+            _log(task, f"[done] 状态: 失败，耗时 {task.duration_sec} 秒，{task.error}")
+            _set_status(db, task, "failed")
+            _notify(db, task, task_id)
+            db.close()
+            return {"task_id": task_id, "error": task.error}
         usage = run_record.get("llm_usage") or {}
         task.total_tokens = usage.get("total_tokens")
         task.input_tokens = usage.get("input_tokens")
@@ -641,15 +706,8 @@ def run_scan(self, task_id: str) -> dict:
         task.finished_at = datetime.now(timezone.utc)
         if task.started_at:
             task.duration_sec = int((task.finished_at - task.started_at).total_seconds())
-        if task.exit_code == 1 and not task.timed_out:
-            # 退出码契约（runner.py）：0 无发现 / 1 执行错误 / 2 发现漏洞。
-            # 1 是沙箱/代理/LLM 网关等执行错误，不是"扫描完成无发现"，须标记失败
-            detail = _scan_error_detail(scan_dir)
-            task.error = f"strix 执行失败（退出码 1）：{detail or '详见任务日志与归档产物'}"
-            _log(task, f"[done] 状态: 失败，耗时 {task.duration_sec} 秒，{task.error}")
-            _set_status(db, task, "failed")
-            _notify(db, task, task_id)
-            return {"task_id": task_id, "error": task.error}
+        # 退出码 1 / 沙箱通道故障已在 Stage 3 开头的「失败保留」分支提前返回；
+        # 走到这里说明本轮有效：0 无发现 / 2 发现漏洞，均按完成处理
         _log(
             task,
             f"[done] 状态: {'超时终止' if task.timed_out else '完成'}，"

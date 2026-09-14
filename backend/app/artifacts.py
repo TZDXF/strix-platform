@@ -11,10 +11,16 @@ from .config import get_settings
 
 
 def archive_run(work_dir: Path, run_dir_name: str, task_id: str, artifacts_dir: Path) -> str:
-    """打包 run 目录为 zip，返回 artifacts_ref（本地路径或 s3://key）。"""
+    """打包 run 目录为 zip，返回 artifacts_ref（本地路径或 s3://key）。
+
+    zip 名带 run 目录后缀做版本化：同一任务多次扫描（续扫/重跑/失败轮）的归档
+    互不覆盖，artifacts_ref 指向最新一次，此前的归档保留可追溯（run 目录名由
+    _list_runs 产出的目录名，仅含字母数字与 -_，可安全用于文件名）。
+    """
     run_dir = work_dir / "strix_runs" / run_dir_name
     artifacts_dir.mkdir(parents=True, exist_ok=True)
-    zip_path = artifacts_dir / f"{task_id}.zip"
+    suffix = f"_{run_dir_name}" if run_dir_name else ""
+    zip_path = artifacts_dir / f"{task_id}{suffix}.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         if run_dir.is_dir():
             for p in sorted(run_dir.rglob("*")):
@@ -27,7 +33,7 @@ def archive_run(work_dir: Path, run_dir_name: str, task_id: str, artifacts_dir: 
 
     s = get_settings()
     if s.s3_enabled:
-        key = f"runs/{task_id}.zip"
+        key = f"runs/{task_id}{suffix}.zip"
         _upload_s3(zip_path, key)
         return f"s3://{s.s3_bucket}/{key}"
     return str(zip_path)

@@ -12,6 +12,15 @@ settings = get_settings()
 WORKER_POOL_SIZE = 8
 
 celery_app = Celery("strix_platform", broker=settings.redis_url, backend=settings.redis_url)
+
+# Redis broker 可见性超时：acks_late 下任务执行超过它会被重新投递（默认 1 小时），
+# 而扫描普遍超 1 小时 → 同一任务被第二个 run_scan 并发重复执行：Stage 1 会清掉
+# 正在扫描的源码目录，旧调用收尾还会经尾随线程误登记并 docker rm -f 新调用的
+# 沙箱容器（运行中容器被删 → 引擎全智能体 404 "No such container" 崩溃）。
+# 设为 24h 覆盖最长扫描；重投递的残余风险由 run_scan 的执行心跳重入防护兜底。
+# broker 与 result backend 须取同值（Celery 对 Redis 的官方要求）。
+_REDIS_VISIBILITY_TIMEOUT = 24 * 3600
+
 celery_app.conf.update(
     include=["app.tasks", "app.translate", "app.schedules", "app.sandbox"],
     task_serializer="json",
@@ -21,6 +30,8 @@ celery_app.conf.update(
     task_acks_late=True,
     worker_prefetch_multiplier=1,
     task_time_limit=0,  # 超时由 runner 内部按模式控制并优雅回收
+    broker_transport_options={"visibility_timeout": _REDIS_VISIBILITY_TIMEOUT},
+    result_backend_transport_options={"visibility_timeout": _REDIS_VISIBILITY_TIMEOUT},
     # 定时扫描：beat 每分钟敲一次轮询任务（worker 以 --beat 内嵌启动，见 compose），
     # 到期判断与补跑逻辑见 app.schedules.dispatch_due_schedules；
     # 僵尸任务回收见 app.schedules.reclaim_zombie_tasks；
