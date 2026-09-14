@@ -1,22 +1,72 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { api, type TaskSummary, type User } from '../api'
 import { toast } from '../toast'
 import {
-  badge, card, hint, h3, sevBarCls, sevDistTitle, sevOrder, statusBadgeClass, tableTd, tableTh, taskStatusLabel,
+  badge, btn, btnGhost, card, hint, h3, input, sevBarCls, sevDistTitle, sevOrder, statusBadgeClass, tableTd, tableTh, taskStatusLabel,
 } from '../ui'
 
 const props = defineProps<{ user: User | null }>()
+
+const PAGE_SIZE = 50
 const tasks = ref<TaskSummary[]>([])
+const total = ref(0)
+const initialLoading = ref(true)
+const loadingMore = ref(false)
+const searchInput = ref('')
+const search = ref('') // 已应用的搜索词（回车/点搜索生效）
 const cancelling = ref('')
+const sentinel = ref<HTMLElement | null>(null)
 let timer: number | undefined
+let seq = 0 // 请求序号：搜索/刷新切换后丢弃过期响应
+let observer: IntersectionObserver | undefined
 
 const RUNNING = ['pending', 'fetching', 'scanning', 'parsing']
+const hasMore = computed(() => tasks.value.length < total.value)
+
+// append=false 时按已加载数量整窗刷新（新任务、状态变化都能看到）；append=true 追加下一页
+async function fetchPage(offset: number, append: boolean) {
+  const mySeq = ++seq
+  try {
+    const r = await api.listTasks({
+      limit: append ? PAGE_SIZE : Math.max(tasks.value.length, PAGE_SIZE),
+      offset, search: search.value,
+    })
+    if (mySeq !== seq) return
+    tasks.value = append ? tasks.value.concat(r.items) : r.items
+    total.value = r.total
+    if (append && !r.items.length) total.value = tasks.value.length // 防御：空页时终止续拉
+  } catch (e) {
+    if (mySeq === seq) toast.error((e as Error).message)
+  } finally {
+    if (mySeq === seq) initialLoading.value = false
+  }
+}
 
 async function refresh() {
-  try {
-    tasks.value = (await api.listTasks()).items
-  } catch (e) { toast.error((e as Error).message) }
+  if (loadingMore.value) return
+  await fetchPage(0, false)
+}
+
+function sentinelNear(): boolean {
+  const el = sentinel.value
+  return !!el && el.getBoundingClientRect().top < window.innerHeight + 300
+}
+
+async function loadMore() {
+  if (loadingMore.value || !hasMore.value || !sentinelNear()) return
+  loadingMore.value = true
+  try { await fetchPage(tasks.value.length, true) } finally { loadingMore.value = false }
+  await loadMore() // 一页填不满视口时继续补，直到哨兵离开触发区
+}
+
+function applySearch() {
+  search.value = searchInput.value.trim()
+  fetchPage(0, false).then(loadMore)
+}
+function clearSearch() {
+  searchInput.value = ''
+  applySearch()
 }
 
 async function cancelTask(t: TaskSummary, ev: Event) {
@@ -42,13 +92,40 @@ function fmtTokens(t: TaskSummary) {
 }
 function open(id: string) { location.hash = `#/task/${id}` }
 
-onMounted(() => { refresh(); timer = window.setInterval(refresh, 5000) })
-onUnmounted(() => clearInterval(timer))
+onMounted(async () => {
+  await fetchPage(0, false)
+  await loadMore() // 首页填不满视口时主动补页（IntersectionObserver 对持续相交不会再触发）
+  timer = window.setInterval(refresh, 5000)
+  observer = new IntersectionObserver(
+    entries => { if (entries.some(e => e.isIntersecting)) loadMore() },
+    { rootMargin: '300px' },
+  )
+  if (sentinel.value) observer.observe(sentinel.value)
+})
+onUnmounted(() => {
+  clearInterval(timer)
+  observer?.disconnect()
+})
 </script>
 
 <template>
   <div :class="card">
-    <h3 :class="h3">任务列表（{{ props.user?.role === 'admin' ? '全部用户任务' : '我发起的及我项目下的任务' }}），每 5 秒自动刷新）</h3>
+    <div class="mb-3.5 flex flex-wrap items-center gap-2.5">
+      <h3 class="mb-0 text-sm font-semibold text-muted">
+        任务列表（已加载 {{ tasks.length }} / 共 {{ total }}，每 5 秒自动刷新；
+        {{ props.user?.role === 'admin' ? '全部用户任务' : '我发起的及我项目下的任务' }}）
+      </h3>
+      <div class="flex-1"></div>
+      <div class="flex items-center gap-1.5">
+        <input
+          v-model="searchInput" type="text" placeholder="搜索 ID / 项目 / 分支 / 模型 / 提交人"
+          :class="[input, '!w-64']" @keyup.enter="applySearch"
+        />
+        <button v-if="search" :class="btnGhost" @click="clearSearch">清除</button>
+        <button :class="btn" @click="applySearch">搜索</button>
+      </div>
+    </div>
+
     <table v-if="tasks.length" class="w-full border-collapse">
       <thead>
         <tr>
@@ -99,7 +176,19 @@ onUnmounted(() => clearInterval(timer))
           </td>
         </tr>
       </tbody>
+      <tfoot>
+        <tr>
+          <td :colspan="12" class="py-2.5 text-center text-xs text-muted">
+            <span v-if="loadingMore">加载中…</span>
+            <span v-else-if="hasMore">下滑加载更多</span>
+            <span v-else>已全部加载（{{ tasks.length }} 条{{ search ? '，含搜索过滤' : '' }}）</span>
+          </td>
+        </tr>
+      </tfoot>
     </table>
-    <p v-else :class="hint">暂无任务。到「项目」页选择项目并发起扫描。</p>
+    <p v-else :class="hint">
+      {{ initialLoading ? '加载中…' : search ? '没有匹配的任务，换个关键词试试。' : '暂无任务。到「项目」页选择项目并发起扫描。' }}
+    </p>
+    <div ref="sentinel" class="h-px"></div>
   </div>
 </template>

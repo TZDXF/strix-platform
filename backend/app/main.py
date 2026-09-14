@@ -1568,6 +1568,7 @@ def list_tasks(
     status: str = "",
     project_id: str = "",
     created_by: int = 0,
+    search: str = "",
 ):
     q = select(Task).order_by(desc(Task.created_at))
     count_q = select(func.count(Task.id))
@@ -1587,7 +1588,23 @@ def list_tasks(
     if status:
         q = q.where(Task.status == status)
         count_q = count_q.where(Task.status == status)
-    rows = db.execute(q.offset(offset).limit(min(limit, 200))).scalars().all()
+    if search:
+        # 模糊匹配：任务 ID（支持列表里的前缀片段）、项目名、分支/来源、模型、提交人、测试指令
+        like = f"%{search.strip()}%"
+        matched = or_(
+            Task.id.ilike(like),
+            Task.source_ref.ilike(like),
+            Task.branch.ilike(like),
+            Task.model.ilike(like),
+            Task.instruction.ilike(like),
+            Task.project_id.in_(select(Project.id).where(Project.name.ilike(like))),
+            Task.created_by.in_(
+                select(User.id).where(or_(User.username.ilike(like), User.display_name.ilike(like)))
+            ),
+        )
+        q = q.where(matched)
+        count_q = count_q.where(matched)
+    rows = db.execute(q.offset(offset).limit(min(limit, 500))).scalars().all()
     total = db.execute(count_q).scalar() or 0
     return {"total": total, "items": [_task_summary(t, db) for t in rows]}
 

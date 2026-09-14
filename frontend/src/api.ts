@@ -668,7 +668,13 @@ export const api = {
     if (p.file) form.append('file', p.file)
     return request<{ id: string; status: string }>('POST', `/api/projects/${projectId}/tasks`, { form })
   },
-  listTasks: (params = '') => request<{ total: number; items: TaskSummary[] }>('GET', '/api/tasks?limit=100' + (params ? '&' + params : '')),
+  listTasks: (params: { limit?: number; offset?: number; search?: string } = {}) => {
+    const qs = new URLSearchParams()
+    qs.set('limit', String(params.limit ?? 50))
+    if (params.offset) qs.set('offset', String(params.offset))
+    if (params.search) qs.set('search', params.search)
+    return request<{ total: number; items: TaskSummary[] }>('GET', '/api/tasks?' + qs)
+  },
   stats: () => request<StatsData>('GET', '/api/stats'),
   listModels: () => request<{ default: string; items: string[] }>('GET', '/api/models'),
   checkTarget: (url: string) =>
