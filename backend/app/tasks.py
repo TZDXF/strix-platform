@@ -347,7 +347,7 @@ def _admit_scan_slot(db, task) -> bool:
             return False
         # 占位瞬间先触达心跳再置运行态：后续任何并发投递在心跳重入防护处必然
         # 观察到「已有执行者」，不会有两套执行流水线同时开跑的窗口
-        touch_heartbeat(task_id)
+        touch_heartbeat(task.id)
         task.started_at = datetime.now(timezone.utc)
         _set_status(db, task, "fetching")  # 占位即置运行态，其他准入线程的计数立即可见
         return True
